@@ -2,21 +2,30 @@
   {
     "id": "open-floor-hole",
     "name": "Open floor hole",
+    "source": "preloaded_checklist",
+    "category": "fall_prevention",
     "location": "Level 3 core opening",
+    "riskLevel": "high",
     "risk": "Fall-through hazard near active work area.",
     "action": "Cover, barricade, or mark the opening before work continues."
   },
   {
     "id": "missing-guardrail",
     "name": "Missing guardrail",
+    "source": "preloaded_checklist",
+    "category": "fall_prevention",
     "location": "North scaffold edge",
+    "riskLevel": "high",
     "risk": "Unprotected edge exposed to crew traffic.",
     "action": "Install guardrail or restrict access until fixed."
   },
   {
     "id": "loose-power-cable",
     "name": "Loose power cable",
+    "source": "preloaded_checklist",
+    "category": "electrical_housekeeping",
     "location": "Temporary walkway to hoist",
+    "riskLevel": "medium",
     "risk": "Trip and electrical damage hazard across the walkway.",
     "action": "Route overhead, tape down, or remove from the path."
   }

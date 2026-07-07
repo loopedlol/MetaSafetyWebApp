@@ -36,6 +36,7 @@ body {
 
 button,
 input,
+select,
 textarea {
   font: inherit;
 }
@@ -49,7 +50,7 @@ textarea {
   min-height: 0;
   padding: var(--space-lg);
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr) auto auto auto;
+  grid-template-rows: auto minmax(0, 1fr) auto auto auto auto;
   gap: var(--space-md);
   overflow: hidden;
   background: #07100f;
@@ -297,7 +298,8 @@ button:hover {
   overflow-wrap: anywhere;
 }
 
-input {
+input,
+select {
   min-width: 0;
   width: 100%;
   min-height: 48px;
@@ -309,6 +311,10 @@ input {
   font-size: 20px;
   line-height: 1.2;
   overflow-wrap: anywhere;
+}
+
+select {
+  appearance: none;
 }
 
 .readonly-field strong {
@@ -392,6 +398,35 @@ input {
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
 }
 
+.manual-entry-screen {
+  grid-template-rows: auto minmax(0, 1fr) auto;
+}
+
+.manual-entry-form {
+  scrollbar-width: thin;
+}
+
+.manual-entry-form .helper-text {
+  font-size: 18px;
+}
+
+.flexible-memo {
+  height: 88px;
+  min-height: 88px;
+  max-height: 88px;
+}
+
+.manual-entry-actions {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+}
+
+.log-hazard-button {
+  min-height: 50px;
+  max-height: 58px;
+  border-color: #86fff2;
+  color: #86fff2;
+}
+
 .summary {
   grid-row: 1 / -1;
   min-height: 0;
@@ -461,8 +496,84 @@ input {
   font-weight: 800;
 }
 
+.report-preview {
+  min-height: 0;
+  overflow: auto;
+  display: grid;
+  align-content: start;
+  gap: var(--space-md);
+  padding: var(--space-md);
+  border: 2px solid var(--border-soft);
+  background: var(--panel-bg);
+  scrollbar-width: thin;
+}
+
+.report-preview h2,
+.report-preview h3,
+.report-preview dl,
+.report-preview dd,
+.report-preview ul {
+  margin: 0;
+  min-width: 0;
+}
+
+.report-preview h2 {
+  color: #ffffff;
+  font-size: 24px;
+  line-height: 1.15;
+}
+
+.report-preview h3 {
+  color: #86fff2;
+  font-size: 18px;
+  line-height: 1.2;
+}
+
+.report-preview section {
+  min-width: 0;
+  display: grid;
+  gap: var(--space-xs);
+}
+
+.report-meta {
+  display: grid;
+  gap: var(--space-sm);
+}
+
+.report-meta div {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.report-preview dt {
+  color: #86fff2;
+  font-size: 15px;
+  font-weight: 900;
+  line-height: 1.15;
+}
+
+.report-preview dd,
+.report-preview li {
+  color: #f5fbff;
+  font-size: 18px;
+  line-height: 1.32;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.report-preview ul {
+  display: grid;
+  gap: var(--space-xs);
+  padding-left: 20px;
+}
+
 .summary-actions {
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.wide-button {
+  grid-column: 1 / -1;
 }
 
 @media (max-width: 420px), (max-height: 560px) {
@@ -489,11 +600,22 @@ input {
   .location,
   .memo,
   input,
+  select,
   .worker-check,
   .readonly-field strong,
   .helper-text,
+  .report-preview dd,
+  .report-preview li,
   button {
     font-size: 17px;
+  }
+
+  .report-preview h2 {
+    font-size: 21px;
+  }
+
+  .report-preview h3 {
+    font-size: 16px;
   }
 
   .compact-header .mode {
@@ -511,5 +633,9 @@ input {
 
   button {
     min-height: 50px;
+  }
+
+  .log-hazard-button {
+    min-height: 46px;
   }
 }

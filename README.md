@@ -36,7 +36,8 @@ The production files will be written to `dist/`.
 1. Start TBM: enter site name, task name, supervisor name, and review the auto-filled date/time.
 2. Worker Participation: add/remove workers, mark attendance, or mark all workers present.
 3. TBM Checklist: review one hazard card at a time, add a memo, and mark each item Confirmed or Fix Ordered.
-4. Summary: review counts and copy the completed session JSON.
+4. Log New Hazard: add a manual hazard or near-miss record from the checklist or summary screen.
+5. Summary: review counts, read the Korean report preview, and copy the completed session JSON.
 
 Mock hazards are loaded asynchronously from:
 
@@ -44,7 +45,7 @@ Mock hazards are loaded asynchronously from:
 public/hazards.json
 ```
 
-The copied JSON includes site, task, supervisor, session start time, worker attendance, hazard statuses, and memos.
+The copied JSON uses `schemaVersion: 1.0.0` and includes session metadata, site, work, supervisor, workers, hazards with human review decisions, manual hazards, near-miss records, worker feedback, sharing state, and device metadata.
 
 ## Test Controls
 
