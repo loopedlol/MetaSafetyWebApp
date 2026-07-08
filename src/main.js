@@ -105,13 +105,75 @@ function getApiErrorMessage(error, fallback) {
   return error.message || fallback;
 }
 
+function v2Icon() {
+  return '<span class="v2-icon-box" aria-hidden="true"></span>';
+}
+
+function v2Logo() {
+  return `
+    <div class="v2-brand">
+      <span class="v2-lens-mark" aria-hidden="true"></span>
+      <span class="v2-brand-text">Safety <strong>Lens</strong></span>
+      <span class="v2-version">V2</span>
+    </div>
+  `;
+}
+
+function v2Progress(current, total, label = '') {
+  return `
+    <div class="v2-progress">
+      <div class="v2-progress-text">
+        <strong>${current}</strong><span>/ ${total}</span>
+        ${label ? `<em>${escapeHtml(label)}</em>` : ''}
+      </div>
+      <div class="v2-progress-steps" aria-hidden="true">
+        ${Array.from({ length: total })
+          .map((_, index) => `<i class="${index < current ? 'is-active' : ''}"></i>`)
+          .join('')}
+      </div>
+    </div>
+  `;
+}
+
+function getV2Step() {
+  if (state.phase === 'start') return 1;
+  if (state.phase === 'participation') return 3;
+  if (state.phase === 'checklist') return state.index + 1;
+  if (state.phase === 'summary') return state.hazards.length || 8;
+  if (state.phase === 'saved-sessions') return 2;
+  return 1;
+}
+
+function v2Header(title, currentStep = getV2Step(), totalSteps = Math.max(state.hazards.length || 8, currentStep), label = '') {
+  return `
+    <header class="v2-header">
+      ${v2Logo()}
+      <div class="v2-header-title"><h1>${escapeHtml(title)}</h1></div>
+      <div class="v2-header-right">
+        ${v2Progress(currentStep, totalSteps, label)}
+        ${buildUserBadge()}
+      </div>
+    </header>
+  `;
+}
+
+function v2StatusChip(label, value, tone = 'neutral') {
+  return `
+    <div class="v2-status-chip is-${tone}">
+      <span>${escapeHtml(label)}</span>
+      <strong>${escapeHtml(value)}</strong>
+    </div>
+  `;
+}
+
 function buildUserBadge() {
   if (!state.currentUser) return '';
 
   return `
-    <section class="user-badge" aria-label="Logged in user">
-      <span>${escapeHtml(state.currentUser.name)} / ${escapeHtml(state.currentUser.role)}</span>
-      <button class="focusable small-button" data-action="logout">Logout</button>
+    <section class="v2-user-badge user-badge" aria-label="Logged in user">
+      ${v2Icon()}
+      <span>${escapeHtml(state.currentUser.name)}</span>
+      <button class="focusable v2-user-logout" data-action="logout" aria-label="Logout">Logout</button>
     </section>
   `;
 }
@@ -474,21 +536,26 @@ function renderAiSuggestion() {
   const confidencePercent = `${Math.round(suggestion.confidence * 100)}%`;
 
   container.innerHTML = `
-    <section class="ai-suggestion-card ${state.manualAiDecision ? `is-${state.manualAiDecision}` : ''}" aria-label="Mock AI Suggestion">
-      <p class="eyebrow">Mock AI Suggestion</p>
-      <h2>${escapeHtml(suggestion.title)}</h2>
-      <dl>
+    <section class="v2-card v2-ai-card ai-suggestion-card ${state.manualAiDecision ? `is-${state.manualAiDecision}` : ''}" aria-label="Mock AI Suggestion">
+      <div class="v2-ai-header"><h3>AI Suggestion</h3><span>Beta</span></div>
+      <div class="v2-ai-hero">
+        <div class="v2-warning-tile">!</div>
+        <div>
+          <h2>${escapeHtml(suggestion.title)}</h2>
+          <p>${escapeHtml(suggestion.description)}</p>
+        </div>
+      </div>
+      <dl class="v2-ai-facts">
         <div><dt>Category</dt><dd>${escapeHtml(suggestion.category)}</dd></div>
-        <div><dt>Risk</dt><dd>${escapeHtml(suggestion.riskLevel)}</dd></div>
+        <div><dt>Risk Level</dt><dd>${escapeHtml(suggestion.riskLevel)}</dd></div>
         <div><dt>Confidence</dt><dd>${confidencePercent}</dd></div>
         <div><dt>Status</dt><dd>${decisionText}</dd></div>
       </dl>
-      <p class="ai-review-note">Human review required before this suggestion can affect the saved TBM record.</p>
-      <p>${escapeHtml(suggestion.description)}</p>
-      <p>${escapeHtml(suggestion.recommendedAction)}</p>
-      <section class="button-grid ai-suggestion-actions">
-        <button class="focusable small-button" type="button" data-action="accept-ai">Accept Suggestion</button>
-        <button class="focusable small-button" type="button" data-action="reject-ai">Reject Suggestion</button>
+      <p class="v2-ai-note">Human review required before this suggestion can affect the saved TBM record.</p>
+      <p class="v2-ai-note">${escapeHtml(suggestion.recommendedAction)}</p>
+      <section class="v2-ai-actions">
+        <button class="focusable v2-key-button v2-key-primary v2-key-small" type="button" data-action="accept-ai">Accept Suggestion</button>
+        <button class="focusable v2-key-button v2-key-small" type="button" data-action="reject-ai">Reject Suggestion</button>
       </section>
     </section>
   `;
@@ -937,10 +1004,16 @@ function buildSessionLog() {
 
 function renderAuthChecking() {
   app.innerHTML = `
-    <section class="flow-screen center-screen">
-      <p class="eyebrow">Safety Lens</p>
-      <h1>Checking Login</h1>
-      <p class="helper-text">Preparing protected local access...</p>
+    <section class="v2-screen is-auth auth-shell">
+      <div class="auth-brand-large">
+        ${v2Logo()}
+        <p>Worksite Awareness. Safer Outcomes.</p>
+      </div>
+      <section class="v2-card v2-loading-card">
+        ${v2Icon()}
+        <h2>Checking Login</h2>
+        <p>Preparing protected local access...</p>
+      </section>
     </section>
   `;
 }
@@ -950,58 +1023,74 @@ function renderAuth() {
   const submitText = state.isAuthSubmitting ? 'Please wait...' : isRegister ? 'Register' : 'Login';
 
   app.innerHTML = `
-    <section class="flow-screen auth-screen">
-      <header class="flow-header compact-header">
-        <p class="eyebrow">Safety Lens</p>
-        <p class="mode">${isRegister ? 'Register' : 'Login'}</p>
-      </header>
+    <section class="v2-screen is-auth auth-shell">
+      <div class="auth-brand-large">
+        ${v2Logo()}
+        <p>Worksite Awareness. Safer Outcomes.</p>
+      </div>
 
-      <section class="button-grid auth-tabs" aria-label="Authentication mode">
-        <button class="focusable ${!isRegister ? 'primary' : ''}" data-action="auth-login">Login</button>
-        <button class="focusable ${isRegister ? 'primary' : ''}" data-action="auth-register">Register</button>
+      <section class="auth-tabs" aria-label="Authentication mode">
+        <button class="focusable ${!isRegister ? 'is-active' : ''}" data-action="auth-login" type="button">${v2Icon()} Login</button>
+        <button class="focusable ${isRegister ? 'is-active' : ''}" data-action="auth-register" type="button">${v2Icon()} Register</button>
       </section>
 
-      <form class="form-panel auth-form" id="auth-form">
+      <form class="v2-card auth-form" id="auth-form">
         ${
           isRegister
             ? `
-              <label>
-                <span>Name</span>
-                <input class="focusable" name="name" autocomplete="name" />
-              </label>
+              <div class="auth-field">
+                ${v2Icon()}
+                <label>
+                  <span>Name</span>
+                  <input class="focusable" name="name" autocomplete="name" placeholder="Your name" />
+                </label>
+              </div>
             `
             : ''
         }
-        <label>
-          <span>Email</span>
-          <input class="focusable" name="email" type="email" autocomplete="email" required />
-        </label>
-        <label>
-          <span>Password</span>
-          <input class="focusable" name="password" type="password" autocomplete="${
-            isRegister ? 'new-password' : 'current-password'
-          }" minlength="8" required />
-        </label>
+        <div class="auth-field">
+          ${v2Icon()}
+          <label>
+            <span>Email</span>
+            <input class="focusable" name="email" type="email" autocomplete="email" placeholder="name@company.com" required />
+          </label>
+        </div>
+        <div class="auth-field">
+          ${v2Icon()}
+          <label>
+            <span>Password</span>
+            <input class="focusable" name="password" type="password" autocomplete="${
+              isRegister ? 'new-password' : 'current-password'
+            }" placeholder="Enter your password" minlength="8" required />
+          </label>
+        </div>
         ${
           isRegister
             ? `
-              <label>
-                <span>Role</span>
-                <input class="focusable" name="role" value="supervisor" />
-              </label>
-              <label>
-                <span>Registration key</span>
-                <input class="focusable" name="registrationKey" type="password" required />
-              </label>
+              <div class="auth-field">
+                ${v2Icon()}
+                <label>
+                  <span>Role</span>
+                  <input class="focusable" name="role" value="supervisor" />
+                </label>
+              </div>
+              <div class="auth-field">
+                ${v2Icon()}
+                <label>
+                  <span>Registration key</span>
+                  <input class="focusable" name="registrationKey" type="password" required />
+                </label>
+              </div>
             `
             : ''
         }
         <p class="save-feedback">${escapeHtml(state.authFeedback)}</p>
+        <button class="focusable v2-key-button v2-key-primary v2-full-button" type="submit" ${
+          state.isAuthSubmitting ? 'disabled' : ''
+        }>${submitText}</button>
       </form>
 
-      <button class="focusable primary full-action" form="auth-form" type="submit" ${
-        state.isAuthSubmitting ? 'disabled' : ''
-      }>${submitText}</button>
+      <footer class="auth-footer"><span>Your safety data is protected.</span><span>Need help? <strong>Contact support</strong></span></footer>
     </section>
   `;
 
@@ -1014,21 +1103,33 @@ function renderAuth() {
 
 function renderLoading() {
   app.innerHTML = `
-    <section class="flow-screen center-screen">
-      <p class="eyebrow">Safety Lens</p>
-      <h1>Loading TBM</h1>
-      <p class="helper-text">Loading hazard controls...</p>
+    <section class="v2-screen is-auth auth-shell">
+      <div class="auth-brand-large">
+        ${v2Logo()}
+        <p>Worksite Awareness. Safer Outcomes.</p>
+      </div>
+      <section class="v2-card v2-loading-card">
+        ${v2Icon()}
+        <h2>Loading TBM</h2>
+        <p>Loading hazard controls...</p>
+      </section>
     </section>
   `;
 }
 
 function renderError() {
   app.innerHTML = `
-    <section class="flow-screen center-screen">
-      <p class="eyebrow">Safety Lens</p>
-      <h1>Hazards unavailable</h1>
-      <p class="helper-text">${escapeHtml(state.error)}</p>
-      <button class="focusable primary" data-action="retry">Retry</button>
+    <section class="v2-screen is-auth auth-shell">
+      <div class="auth-brand-large">
+        ${v2Logo()}
+        <p>Worksite Awareness. Safer Outcomes.</p>
+      </div>
+      <section class="v2-card v2-loading-card">
+        <div class="v2-warning-tile">!</div>
+        <h2>Hazards unavailable</h2>
+        <p>${escapeHtml(state.error)}</p>
+        <button class="focusable v2-key-button v2-key-primary" data-action="retry">Retry</button>
+      </section>
     </section>
   `;
   bindButtons();
@@ -1036,33 +1137,46 @@ function renderError() {
 
 function renderStart() {
   app.innerHTML = `
-    <section class="flow-screen">
-      <header class="flow-header">
-        <p class="eyebrow">Safety Lens</p>
-        <h1>Start TBM</h1>
-      </header>
-      ${buildUserBadge()}
-
-      <section class="form-panel" aria-label="TBM session details">
-        <label>
-          <span>Site name</span>
-          <input class="focusable" name="siteName" value="${escapeHtml(state.session.siteName)}" />
-        </label>
-        <label>
-          <span>Task name</span>
-          <input class="focusable" name="taskName" value="${escapeHtml(state.session.taskName)}" />
-        </label>
-        <label>
-          <span>Supervisor</span>
-          <input class="focusable" name="supervisorName" value="${escapeHtml(state.session.supervisorName)}" />
-        </label>
-        <div class="readonly-field">
-          <span>Date / time</span>
-          <strong>${escapeHtml(formatDateTime(state.session.scheduledAt))}</strong>
+    <section class="v2-screen">
+      ${v2Header('Start TBM', 1, Math.max(state.hazards.length || 8, 1))}
+      <section class="v2-card v2-form-card" aria-label="TBM session details">
+        <div class="v2-screen-intro">
+          <div class="v2-warning-tile">▶</div>
+          <div>
+            <h2>Start TBM</h2>
+            <p>Kick off a Toolbox Meeting to promote safety and alignment.</p>
+          </div>
         </div>
+        <div class="v2-form-grid">
+          <label class="v2-field-row">
+            ${v2Icon()}
+            <span>Site name</span>
+            <input class="focusable" name="siteName" value="${escapeHtml(state.session.siteName)}" />
+          </label>
+          <label class="v2-field-row">
+            ${v2Icon()}
+            <span>Task name</span>
+            <input class="focusable" name="taskName" value="${escapeHtml(state.session.taskName)}" />
+          </label>
+          <label class="v2-field-row">
+            ${v2Icon()}
+            <span>Supervisor</span>
+            <input class="focusable" name="supervisorName" value="${escapeHtml(state.session.supervisorName)}" />
+          </label>
+          <div class="v2-field-row">
+            ${v2Icon()}
+            <span>Date / time</span>
+            <strong>${escapeHtml(formatDateTime(state.session.scheduledAt))}</strong>
+          </div>
+        </div>
+        <button class="focusable v2-key-button v2-key-primary v2-full-button" data-action="start">▶ Start TBM</button>
       </section>
 
-      <button class="focusable primary full-action" data-action="start">Start TBM</button>
+      <section class="v2-action-row v2-action-row-nav">
+        <button class="focusable v2-key-button" type="button" disabled>← Previous</button>
+        <button class="focusable v2-key-button" type="button" disabled>＋ Log New Hazard</button>
+        <button class="focusable v2-key-button v2-key-primary" data-action="start">Start TBM</button>
+      </section>
     </section>
   `;
 
@@ -1073,42 +1187,60 @@ function renderStart() {
 }
 
 function renderParticipation() {
+  const presentCount = state.workers.filter((worker) => worker.present).length;
+
   app.innerHTML = `
-    <section class="flow-screen participation-screen">
-      <header class="flow-header compact-header">
-        <p class="eyebrow">Worker Participation</p>
-        <p class="mode">${escapeHtml(state.session.taskName)}</p>
-      </header>
-      ${buildUserBadge()}
+    <section class="v2-screen">
+      ${v2Header('Worker Participation', 3, Math.max(state.hazards.length || 8, 3))}
+      <section class="v2-card v2-participation-card">
+        <div class="v2-section-heading">
+          <h2>Worker Attendance</h2>
+          <p>Add workers below and mark who is present for this briefing.</p>
+        </div>
 
-      <form class="add-worker" id="add-worker-form">
-        <input class="focusable" id="worker-name" autocomplete="off" placeholder="Add worker name" />
-        <button class="focusable" type="submit">Add</button>
-      </form>
+        <form class="v2-add-worker" id="add-worker-form">
+          <div class="v2-input-with-icon">
+            ${v2Icon()}
+            <input class="focusable" id="worker-name" autocomplete="off" placeholder="Add worker name..." />
+          </div>
+          <button class="focusable v2-key-button" type="submit">Add</button>
+        </form>
 
-      <section class="worker-list" aria-label="Attendance list">
-        ${state.workers
-          .map(
-            (worker) => `
-              <div class="worker-row">
-                <label class="worker-check">
-                  <input class="focusable" type="checkbox" data-worker="${escapeHtml(worker.id)}" ${
-                    worker.present ? 'checked' : ''
-                  } />
-                  <span>${escapeHtml(worker.name)}</span>
-                </label>
-                <button class="focusable small-button" data-action="remove-worker" data-worker="${escapeHtml(
-                  worker.id
-                )}">Remove</button>
-              </div>
-            `
-          )
-          .join('')}
+        <section class="v2-worker-list" aria-label="Attendance list">
+          ${state.workers
+            .map((worker) => {
+              const initials = worker.name
+                .split(' ')
+                .map((part) => part[0])
+                .join('')
+                .slice(0, 2)
+                .toUpperCase();
+
+              return `
+                <div class="v2-worker-row">
+                  <label class="v2-worker-check">
+                    <input class="focusable" type="checkbox" data-worker="${escapeHtml(worker.id)}" ${
+                      worker.present ? 'checked' : ''
+                    } />
+                    <span class="v2-avatar">${escapeHtml(initials)}</span>
+                    <strong>${escapeHtml(worker.name)}</strong>
+                    <em>${escapeHtml(worker.role)}</em>
+                  </label>
+                  <button class="focusable v2-key-button v2-key-small" data-action="remove-worker" data-worker="${escapeHtml(
+                    worker.id
+                  )}">Remove</button>
+                </div>
+              `;
+            })
+            .join('')}
+        </section>
+
+        <p class="v2-attendance-count"><strong>${presentCount}</strong> of ${state.workers.length} workers marked present</p>
       </section>
 
-      <section class="button-grid participation-actions">
-        <button class="focusable" data-action="mark-all">Mark All Present</button>
-        <button class="focusable primary" data-action="continue">Continue</button>
+      <section class="v2-action-row">
+        <button class="focusable v2-key-button" data-action="mark-all">Mark All Present</button>
+        <button class="focusable v2-key-button v2-key-primary" data-action="continue">Continue →</button>
       </section>
     </section>
   `;
@@ -1127,73 +1259,78 @@ function renderParticipation() {
 
 function renderManualEntry() {
   app.innerHTML = `
-    <section class="flow-screen manual-entry-screen">
-      <header class="flow-header compact-header">
-        <p class="eyebrow">Safety Lens</p>
-        <p class="mode">Log New Hazard</p>
-      </header>
-      ${buildUserBadge()}
+    <section class="v2-screen">
+      ${v2Header('Log New Hazard', 1, 3, 'Details')}
 
-      <form class="form-panel manual-entry-form" id="manual-entry-form">
-        <p class="helper-text">Browser prototype / voice transcript placeholder</p>
+      <form class="v2-manual-layout manual-entry-form" id="manual-entry-form">
+        <section class="v2-card v2-manual-main">
+          <div class="v2-two-col">
+            <label class="v2-field-block">
+              <span>Type *</span>
+              <select class="focusable" name="type">
+                <option value="new_hazard">new_hazard</option>
+                <option value="near_miss">near_miss</option>
+              </select>
+            </label>
 
-        <label>
-          <span>Type</span>
-          <select class="focusable" name="type">
-            <option value="new_hazard">new_hazard</option>
-            <option value="near_miss">near_miss</option>
-          </select>
-        </label>
+            <label class="v2-field-block">
+              <span>Category *</span>
+              <input class="focusable" name="category" maxlength="80" value="manual_entry" />
+            </label>
+          </div>
 
-        <label>
-          <span>Category</span>
-          <input class="focusable" name="category" maxlength="80" value="manual_entry" />
-        </label>
+          <label class="v2-field-block">
+            <span>Title *</span>
+            <input class="focusable" name="title" maxlength="120" placeholder="Example: Temporary ladder blocked" required />
+          </label>
 
-        <label>
-          <span>Title - browser prototype / voice transcript placeholder</span>
-          <input class="focusable" name="title" maxlength="120" placeholder="Example: Temporary ladder blocked" required />
-        </label>
+          <label class="v2-field-block">
+            <span>Location *</span>
+            <input class="focusable" name="location" maxlength="120" placeholder="Example: Level 2 west stair" required />
+          </label>
 
-        <label>
-          <span>Location - browser prototype / voice transcript placeholder</span>
-          <input class="focusable" name="location" maxlength="120" placeholder="Example: Level 2 west stair" required />
-        </label>
+          <label class="v2-field-block">
+            <span>Risk level *</span>
+            <select class="focusable" name="riskLevel">
+              <option value="low">low</option>
+              <option value="medium" selected>medium</option>
+              <option value="high">high</option>
+            </select>
+          </label>
 
-        <label>
-          <span>Risk level</span>
-          <select class="focusable" name="riskLevel">
-            <option value="low">low</option>
-            <option value="medium" selected>medium</option>
-            <option value="high">high</option>
-          </select>
-        </label>
+          <label class="v2-field-block">
+            <span>Description *</span>
+            <textarea class="v2-textarea focusable flexible-memo" name="description" maxlength="260" placeholder="Describe what was observed"></textarea>
+          </label>
 
-        <label>
-          <span>Description - browser prototype / voice transcript placeholder</span>
-          <textarea class="memo focusable flexible-memo" name="description" maxlength="260" placeholder="Describe what was observed"></textarea>
-        </label>
+          <label class="v2-field-block">
+            <span>Action Taken / Recommended Action *</span>
+            <textarea class="v2-textarea focusable flexible-memo" name="actionText" maxlength="260" placeholder="Action taken or recommended action"></textarea>
+          </label>
+        </section>
 
-        <label>
-          <span>Action taken / recommended action - browser prototype / voice transcript placeholder</span>
-          <textarea class="memo focusable flexible-memo" name="actionText" maxlength="260" placeholder="Action taken or recommended action"></textarea>
-        </label>
-
-        <label>
-          <span>Attach Photo</span>
-          <input class="focusable" name="evidencePhotos" type="file" accept="image/jpeg,image/png,image/webp" multiple />
-        </label>
-        <p class="photo-preview" id="photo-preview">No photo selected</p>
-        <button class="focusable small-button" id="analyze-photo-button" data-action="analyze-photo" type="button" hidden disabled>
-          Analyze Photo
-        </button>
-        <div id="ai-suggestion-panel"></div>
-        <p class="save-feedback" id="manual-entry-feedback">${escapeHtml(state.manualEntryFeedback)}</p>
+        <aside class="v2-manual-side">
+          <section class="v2-card v2-upload-card">
+            <h3>Attach Photo</h3>
+            <label class="v2-upload-zone">
+              ${v2Icon()}
+              <span id="photo-preview">No photo selected</span>
+              <input class="focusable" name="evidencePhotos" type="file" accept="image/jpeg,image/png,image/webp" multiple />
+            </label>
+            <p class="photo-preview">JPG, PNG, WEBP evidence photos</p>
+            <button class="focusable v2-key-button v2-key-primary" id="analyze-photo-button" data-action="analyze-photo" type="button" hidden disabled>
+              Analyze Photo
+            </button>
+          </section>
+          <div id="ai-suggestion-panel"></div>
+          <p class="save-feedback" id="manual-entry-feedback">${escapeHtml(state.manualEntryFeedback)}</p>
+        </aside>
       </form>
 
-      <section class="button-grid manual-entry-actions">
-        <button class="focusable" data-action="cancel-manual">Cancel</button>
-        <button class="focusable primary" form="manual-entry-form" type="submit">Save</button>
+      <section class="v2-action-row v2-action-row-nav">
+        <button class="focusable v2-key-button" data-action="cancel-manual">← Cancel</button>
+        <button class="focusable v2-key-button" type="button" disabled>Save Draft</button>
+        <button class="focusable v2-key-button v2-key-primary" form="manual-entry-form" type="submit">Save</button>
       </section>
     </section>
   `;
@@ -1233,46 +1370,48 @@ function renderManualEntry() {
 function renderChecklist() {
   const hazard = currentHazard();
   const response = currentResponse();
+  const statusTone = response.status === 'Fix Ordered' ? 'warning' : response.status ? 'danger' : 'neutral';
 
   app.innerHTML = `
-    <section class="topbar">
-      <div>
-        <p class="eyebrow">Safety Lens</p>
-        <p class="mode">Current mode: TBM Checklist</p>
-        ${buildUserBadge()}
-      </div>
-      <p class="progress">${state.index + 1} / ${state.hazards.length}</p>
-    </section>
+    <section class="v2-screen">
+      ${v2Header('TBM Checklist', state.index + 1, state.hazards.length)}
+      <section class="v2-card v2-hazard-card" aria-label="Current hazard">
+        <div class="v2-hazard-hero">
+          <div class="v2-warning-tile">!</div>
+          <div class="v2-hazard-title">
+            <p class="v2-kicker">Hazard</p>
+            <h2>${escapeHtml(hazard.name)}</h2>
+          </div>
+          ${v2StatusChip('Status', response.status ?? 'Not Marked', statusTone)}
+        </div>
 
-    <section class="hazard-region" aria-label="Current hazard">
-      <div class="hazard-card">
-        <p class="label">Hazard</p>
-        <h2>${escapeHtml(hazard.name)}</h2>
-        <p class="location">${escapeHtml(hazard.location)}</p>
-        <p class="risk">${escapeHtml(hazard.risk)}</p>
-        <p class="action">${escapeHtml(hazard.action)}</p>
-        ${response.status ? `<p class="status">Marked: ${escapeHtml(response.status)}</p>` : ''}
-      </div>
-    </section>
+        <div class="v2-detail-list">
+          <div class="v2-detail-row">${v2Icon()}<p>Location</p><strong>${escapeHtml(hazard.location)}</strong></div>
+          <div class="v2-detail-row">${v2Icon()}<p>Risk Level</p><strong>${escapeHtml(hazard.riskLevel ?? response.riskLevel ?? 'medium')}</strong></div>
+          <div class="v2-detail-row">${v2Icon()}<p>Category</p><strong>${escapeHtml(hazard.category ?? response.category ?? 'general')}</strong></div>
+          <div class="v2-detail-row">${v2Icon()}<p>Risk</p><strong>${escapeHtml(hazard.risk)}</strong></div>
+          <div class="v2-detail-row">${v2Icon()}<p>Recommended Action</p><strong>${escapeHtml(hazard.action)}</strong></div>
+        </div>
+      </section>
 
-    <section class="memo-region">
-      <label class="memo-label" for="memo">Memo</label>
-      <textarea id="memo" class="memo focusable" rows="2" maxlength="220" placeholder="Short note...">${escapeHtml(
+      <section class="v2-card v2-memo-card">
+        <label for="memo">Memo <span>Optional</span></label>
+        <textarea id="memo" class="v2-textarea focusable" rows="2" maxlength="220" placeholder="Add notes, details, or follow-up actions...">${escapeHtml(
         state.memo
       )}</textarea>
-    </section>
+      </section>
 
-    <section class="button-grid action-grid" aria-label="Checklist actions">
-      <button class="focusable primary" data-action="confirmed">Confirmed</button>
-      <button class="focusable warning" data-action="fix">Fix Ordered</button>
-    </section>
+      <section class="v2-action-row" aria-label="Checklist actions">
+        <button class="focusable v2-key-button v2-key-primary" data-action="confirmed">✓ Confirmed</button>
+        <button class="focusable v2-key-button" data-action="fix">Fix Ordered</button>
+      </section>
 
-    <section class="button-grid nav-grid" aria-label="Navigation">
-      <button class="focusable" data-action="prev">Previous</button>
-      <button class="focusable" data-action="next">Next</button>
+      <section class="v2-action-row v2-action-row-nav" aria-label="Navigation">
+        <button class="focusable v2-key-button" data-action="prev">← Previous</button>
+        <button class="focusable v2-key-button" data-action="log-new">＋ Log New Hazard</button>
+        <button class="focusable v2-key-button" data-action="next">Next →</button>
+      </section>
     </section>
-
-    <button class="focusable log-hazard-button" data-action="log-new">Log New Hazard</button>
   `;
 
   app.querySelector('#memo').addEventListener('input', (event) => saveMemo(event.target.value));
@@ -1285,30 +1424,47 @@ function renderSummary() {
   const saveButtonText = state.isSavingSession ? 'Saving...' : 'Save Session';
 
   app.innerHTML = `
-    <section class="summary">
-      <p class="eyebrow">Safety Lens</p>
-      ${buildUserBadge()}
-      <h1>TBM Complete</h1>
-      <div class="summary-grid">
-        <div>
-          <span>${confirmed}</span>
-          <p>Confirmed</p>
+    <section class="v2-screen">
+      ${v2Header('TBM Complete', state.hazards.length, state.hazards.length)}
+      <section class="v2-card v2-summary-card">
+        <div class="v2-summary-hero">
+          <div class="v2-success-tile">✓</div>
+          <div>
+            <h2>TBM Complete</h2>
+            <p>Great work. Your TBM has been completed.</p>
+          </div>
+          ${v2StatusChip('Status', getSessionStatus(), 'success')}
         </div>
-        <div>
-          <span>${fixOrdered}</span>
-          <p>Fix Ordered</p>
+
+        <div class="v2-summary-stats">
+          <div class="v2-stat-card">
+            <div class="v2-warning-tile">✓</div>
+            <p>Confirmed</p>
+            <strong>${confirmed}</strong>
+            <span>Hazards confirmed</span>
+          </div>
+          <div class="v2-stat-card">
+            <div class="v2-warning-tile">□</div>
+            <p>Fix Ordered</p>
+            <strong>${fixOrdered}</strong>
+            <span>Hazards to be fixed</span>
+          </div>
         </div>
-      </div>
-      ${buildKoreanReportHtml()}
+
+        <section class="v2-report-preview">
+          <h3>Report Preview</h3>
+          ${buildKoreanReportHtml()}
+        </section>
+      </section>
       ${state.saveFeedback ? `<p class="save-feedback">${escapeHtml(state.saveFeedback)}</p>` : ''}
-      <div class="button-grid summary-actions">
-        <button class="focusable" data-action="review">Review</button>
-        <button class="focusable" data-action="log-new">Log New Hazard</button>
-        <button class="focusable primary" data-action="save-session" ${
+      <div class="v2-action-grid">
+        <button class="focusable v2-key-button v2-key-primary" data-action="review">Review</button>
+        <button class="focusable v2-key-button" data-action="log-new">＋ Log New Hazard</button>
+        <button class="focusable v2-key-button" data-action="save-session" ${
           state.isSavingSession ? 'disabled' : ''
         }>${saveButtonText}</button>
-        <button class="focusable" data-action="saved-sessions">Saved Sessions</button>
-        <button class="focusable primary wide-button" data-action="copy">Copy JSON</button>
+        <button class="focusable v2-key-button" data-action="saved-sessions">Saved Sessions</button>
+        <button class="focusable v2-key-button" data-action="copy">Copy JSON</button>
       </div>
     </section>
   `;
@@ -1324,45 +1480,59 @@ function renderSavedSessions() {
     ? sortedSessions
         .map(
           (session) => `
-            <li>
-              <div>
+            <li class="v2-session-row">
+              ${v2Icon()}
+              <div class="v2-session-date">
                 <strong>${escapeHtml(formatSavedSessionDate(session))}</strong>
-                <span>${escapeHtml(getSavedSessionSiteName(session))}</span>
-                <em>${escapeHtml(session.status ?? 'unknown')}</em>
+                <span>${escapeHtml(session.status ?? 'unknown')}</span>
               </div>
-              <button class="focusable small-button" data-action="open-report" data-session="${escapeHtml(
+              <div class="v2-session-site">
+                ${v2Icon()}
+                <div>
+                  <strong>${escapeHtml(getSavedSessionSiteName(session))}</strong>
+                  <span>${escapeHtml(session.site?.siteArea ?? session.siteArea ?? 'Saved TBM session')}</span>
+                </div>
+              </div>
+              <div class="v2-session-status">
+                <span>Status</span>
+                <strong>${escapeHtml(session.status ?? 'unknown')}</strong>
+              </div>
+              <button class="focusable v2-key-button v2-key-small" data-action="open-report" data-session="${escapeHtml(
                 session.sessionId
               )}">Open Report</button>
             </li>
           `
         )
         .join('')
-    : '<li><strong>No saved sessions</strong><span>Start by saving a completed TBM.</span><em>empty</em></li>';
+    : '';
 
   app.innerHTML = `
-    <section class="flow-screen saved-sessions-screen">
-      <header class="flow-header compact-header">
-        <p class="eyebrow">Safety Lens</p>
-        <p class="mode">Saved Sessions</p>
-        <p class="helper-text">${state.savedSessions.length} saved session${
-          state.savedSessions.length === 1 ? '' : 's'
-        }</p>
-      </header>
-      ${buildUserBadge()}
-
-      <section class="saved-session-panel" aria-label="Saved TBM sessions">
+    <section class="v2-screen">
+      ${v2Header('Saved Sessions', 2, Math.max(state.hazards.length || 8, 2))}
+      <section class="v2-card v2-saved-card" aria-label="Saved TBM sessions">
+        <div class="v2-section-heading v2-section-heading-row">
+          <div>
+            <h2>Saved Sessions</h2>
+            <p>You have ${state.savedSessions.length} saved session${state.savedSessions.length === 1 ? '' : 's'}.</p>
+          </div>
+          <button class="focusable v2-key-button v2-key-small" data-action="refresh-saved">Newest First</button>
+        </div>
+        <section class="v2-saved-panel">
         ${
           state.savedSessionsStatus === 'loading'
-            ? '<p class="helper-text">Loading saved sessions...</p>'
+            ? '<div class="v2-empty-state">Loading saved sessions...</div>'
             : state.savedSessionsStatus === 'error'
-              ? `<p class="helper-text">${escapeHtml(state.savedSessionsError)}</p>`
-              : `<ul class="saved-session-list">${sessionsHtml}</ul>`
+              ? `<div class="v2-empty-state">${escapeHtml(state.savedSessionsError)}</div>`
+              : sortedSessions.length
+                ? `<ul class="saved-session-list">${sessionsHtml}</ul>`
+                : '<div class="v2-empty-state">No saved sessions. Start by saving a completed TBM.</div>'
         }
+        </section>
       </section>
 
-      <section class="button-grid saved-session-actions">
-        <button class="focusable" data-action="back-from-saved">Back</button>
-        <button class="focusable primary" data-action="refresh-saved">Refresh</button>
+      <section class="v2-action-row">
+        <button class="focusable v2-key-button" data-action="back-from-saved">← Back</button>
+        <button class="focusable v2-key-button" data-action="refresh-saved">Refresh</button>
       </section>
     </section>
   `;
