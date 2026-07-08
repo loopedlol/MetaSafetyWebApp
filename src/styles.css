@@ -234,6 +234,11 @@ button.warning {
   color: #ffc76b;
 }
 
+button:disabled {
+  cursor: progress;
+  opacity: 0.62;
+}
+
 .focusable:focus-visible,
 button:hover {
   outline: 3px solid #ffffff;
@@ -410,6 +415,81 @@ select {
   font-size: 18px;
 }
 
+.photo-preview {
+  min-width: 0;
+  color: #d8f8f4;
+  font-size: 16px;
+  font-weight: 800;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.ai-suggestion-card {
+  min-width: 0;
+  display: grid;
+  gap: var(--space-xs);
+  padding: var(--space-sm);
+  border: 2px solid rgba(134, 255, 242, 0.42);
+  background: rgba(134, 255, 242, 0.08);
+}
+
+.ai-suggestion-card.is-accepted {
+  border-color: #86fff2;
+}
+
+.ai-suggestion-card.is-rejected {
+  border-color: #ffc76b;
+  background: rgba(255, 199, 107, 0.08);
+}
+
+.ai-suggestion-card h2 {
+  color: #ffffff;
+  font-size: 20px;
+  line-height: 1.18;
+}
+
+.ai-suggestion-card dl {
+  margin: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-xs);
+}
+
+.ai-suggestion-card div {
+  min-width: 0;
+}
+
+.ai-suggestion-card dt,
+.ai-suggestion-card dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.ai-suggestion-card dt {
+  color: #86fff2;
+  font-size: 13px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.ai-suggestion-card dd,
+.ai-suggestion-card p {
+  color: #d8f8f4;
+  font-size: 15px;
+  line-height: 1.25;
+}
+
+.ai-suggestion-card .ai-review-note {
+  color: #ffc76b;
+  font-weight: 900;
+}
+
+.ai-suggestion-actions {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
 .flexible-memo {
   height: 88px;
   min-height: 88px;
@@ -576,6 +656,90 @@ select {
   grid-column: 1 / -1;
 }
 
+.save-feedback {
+  margin-top: calc(var(--space-sm) * -1);
+  color: #86fff2;
+  font-size: 17px;
+  font-weight: 800;
+  line-height: 1.2;
+}
+
+.save-feedback:empty {
+  display: none;
+}
+
+.saved-sessions-screen {
+  grid-template-rows: auto minmax(0, 1fr) auto;
+}
+
+.saved-session-panel {
+  min-height: 0;
+  overflow: auto;
+  padding: var(--space-sm);
+  border: 2px solid var(--border-soft);
+  background: var(--panel-bg);
+}
+
+.saved-session-list {
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  align-content: start;
+  gap: var(--space-sm);
+  list-style: none;
+}
+
+.saved-session-list li {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(108px, 0.38fr);
+  align-items: center;
+  gap: var(--space-sm);
+  padding: var(--space-sm);
+  border-left: 4px solid #86fff2;
+  background: rgba(255, 255, 255, 0.07);
+}
+
+.saved-session-list li > div {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.saved-session-list strong,
+.saved-session-list span,
+.saved-session-list em {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.saved-session-list strong {
+  color: #ffffff;
+  font-size: 19px;
+  line-height: 1.2;
+}
+
+.saved-session-list span {
+  color: #d8f8f4;
+  font-size: 20px;
+  font-weight: 900;
+  line-height: 1.2;
+}
+
+.saved-session-list em {
+  color: #ffc76b;
+  font-size: 17px;
+  font-style: normal;
+  font-weight: 800;
+  line-height: 1.2;
+}
+
+.saved-session-actions {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
 @media (max-width: 420px), (max-height: 560px) {
   .hud-shell {
     padding: var(--space-md);
@@ -623,7 +787,8 @@ select {
   }
 
   .add-worker,
-  .worker-row {
+  .worker-row,
+  .saved-session-list li {
     grid-template-columns: minmax(0, 1fr) 86px;
   }
 

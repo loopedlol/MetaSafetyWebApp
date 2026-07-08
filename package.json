@@ -5,9 +5,15 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 0.0.0.0",
+    "server": "node server.js",
+    "dev:all": "npm run server & npm run dev",
     "build": "vite build"
   },
   "devDependencies": {
     "vite": "^7.0.0"
+  },
+  "dependencies": {
+    "express": "^5.2.1",
+    "multer": "^2.2.0"
   }
 }

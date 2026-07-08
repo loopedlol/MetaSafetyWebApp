@@ -49,6 +49,13 @@ const state = {
   ],
   responses: [],
   nearMisses: [],
+  savedSessions: [],
+  savedSessionsStatus: 'idle',
+  saveFeedback: '',
+  isSavingSession: false,
+  manualEntryFeedback: '',
+  manualAiSuggestion: null,
+  manualAiDecision: null,
   returnPhase: 'checklist'
 };
 
@@ -73,6 +80,14 @@ function escapeHtml(value) {
     .replaceAll("'", '&#039;');
 }
 
+function getApiErrorMessage(error, fallback) {
+  if (error instanceof TypeError) {
+    return `${fallback} Make sure the backend server is running with npm run server.`;
+  }
+
+  return error.message || fallback;
+}
+
 function currentHazard() {
   return state.hazards[state.index];
 }
@@ -91,6 +106,7 @@ function createResponses(hazards) {
     riskLevel: hazard.riskLevel ?? 'medium',
     riskDescription: hazard.risk,
     recommendedAction: hazard.recommendedAction ?? hazard.action,
+    evidencePhotos: hazard.evidencePhotos ?? [],
     status: null,
     memo: isStressTest ? stressMemo : '',
     updatedAt: null,
@@ -108,11 +124,13 @@ function createManualHazardResponse(entry) {
     id: entry.id,
     source: 'manual_entry',
     title: entry.title,
-    category: 'manual_entry',
+    category: entry.category ?? 'manual_entry',
     location: entry.location,
     riskLevel: entry.riskLevel,
     riskDescription: entry.description,
     recommendedAction: entry.recommendedAction,
+    evidencePhotos: entry.evidencePhotos ?? [],
+    aiSuggestion: entry.aiSuggestion ?? null,
     status: null,
     memo: '',
     updatedAt: null,
@@ -138,7 +156,7 @@ async function loadHazards() {
     state.phase = 'start';
   } catch (error) {
     state.phase = 'error';
-    state.error = error.message;
+    state.error = error.message || 'Could not load hazards.json. Check that the frontend server can serve public assets.';
   }
 
   render();
@@ -298,6 +316,9 @@ function getCorrectiveAction(item) {
 
 function openManualEntry() {
   state.returnPhase = state.phase === 'summary' ? 'summary' : 'checklist';
+  state.manualEntryFeedback = '';
+  state.manualAiSuggestion = null;
+  state.manualAiDecision = null;
   state.phase = 'manual-entry';
   render();
 }
@@ -307,27 +328,204 @@ function cancelManualEntry() {
   render();
 }
 
-function saveManualEntry(form) {
+async function uploadEvidencePhotos(files) {
+  if (!files.length) return [];
+
+  const formData = new FormData();
+  files.forEach((file) => formData.append('photos', file));
+
+  const response = await fetch('/api/uploads', {
+    method: 'POST',
+    body: formData
+  });
+  const payload = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    throw new Error(payload.error ?? `Photo upload failed (${response.status})`);
+  }
+
+  return Array.isArray(payload) ? payload : [];
+}
+
+function createMockAiSuggestion(type) {
+  const suggestedAt = new Date().toISOString();
+
+  if (type === 'near_miss') {
+    return {
+      title: 'Near miss: struck-by risk observed',
+      category: 'near_miss_observation',
+      riskLevel: 'high',
+      description:
+        'Photo evidence may indicate a near-miss condition with workers or materials exposed to moving equipment or falling objects.',
+      recommendedAction:
+        'Pause related work, confirm exclusion zones, brief nearby workers, and document corrective action before restart.',
+      confidence: 0.78,
+      suggestedAt
+    };
+  }
+
+  return {
+    title: 'Potential blocked access or housekeeping hazard',
+    category: 'site_housekeeping',
+    riskLevel: 'medium',
+    description:
+      'Photo evidence may indicate clutter, blocked access, or an unsecured work area that should be reviewed before work continues.',
+    recommendedAction:
+      'Clear the access path, secure loose materials, add signage or barricades if needed, and verify the area with the supervisor.',
+    confidence: 0.74,
+    suggestedAt
+  };
+}
+
+function renderAiSuggestion() {
+  const container = app.querySelector('#ai-suggestion-panel');
+  if (!container) return;
+
+  if (!state.manualAiSuggestion) {
+    container.innerHTML = '';
+    return;
+  }
+
+  const suggestion = state.manualAiSuggestion;
+  const decisionText =
+    state.manualAiDecision === 'accepted'
+      ? 'Accepted'
+      : state.manualAiDecision === 'rejected'
+        ? 'Rejected'
+        : 'Human review required';
+  const confidencePercent = `${Math.round(suggestion.confidence * 100)}%`;
+
+  container.innerHTML = `
+    <section class="ai-suggestion-card ${state.manualAiDecision ? `is-${state.manualAiDecision}` : ''}" aria-label="Mock AI Suggestion">
+      <p class="eyebrow">Mock AI Suggestion</p>
+      <h2>${escapeHtml(suggestion.title)}</h2>
+      <dl>
+        <div><dt>Category</dt><dd>${escapeHtml(suggestion.category)}</dd></div>
+        <div><dt>Risk</dt><dd>${escapeHtml(suggestion.riskLevel)}</dd></div>
+        <div><dt>Confidence</dt><dd>${confidencePercent}</dd></div>
+        <div><dt>Status</dt><dd>${decisionText}</dd></div>
+      </dl>
+      <p class="ai-review-note">Human review required before this suggestion can affect the saved TBM record.</p>
+      <p>${escapeHtml(suggestion.description)}</p>
+      <p>${escapeHtml(suggestion.recommendedAction)}</p>
+      <section class="button-grid ai-suggestion-actions">
+        <button class="focusable small-button" type="button" data-action="accept-ai">Accept Suggestion</button>
+        <button class="focusable small-button" type="button" data-action="reject-ai">Reject Suggestion</button>
+      </section>
+    </section>
+  `;
+
+  container.querySelector('button[data-action="accept-ai"]').addEventListener('click', () => {
+    acceptManualAiSuggestion(app.querySelector('#manual-entry-form'));
+  });
+  container.querySelector('button[data-action="reject-ai"]').addEventListener('click', () => {
+    rejectManualAiSuggestion();
+  });
+}
+
+function analyzeManualPhoto(form) {
+  const files = Array.from(form.elements.evidencePhotos?.files ?? []);
+  if (!files.length) {
+    state.manualEntryFeedback = 'Attach a photo before running mock analysis.';
+    app.querySelector('#manual-entry-feedback').textContent = state.manualEntryFeedback;
+    return;
+  }
+
+  state.manualAiSuggestion = createMockAiSuggestion(form.elements.type.value);
+  state.manualAiDecision = null;
+  state.manualEntryFeedback = 'Mock AI suggestion generated locally. Review before accepting.';
+  app.querySelector('#manual-entry-feedback').textContent = state.manualEntryFeedback;
+  renderAiSuggestion();
+}
+
+function getManualAiMetadata() {
+  if (!state.manualAiSuggestion || !state.manualAiDecision) return null;
+  const accepted = state.manualAiDecision === 'accepted';
+
+  return {
+    source: 'mock_ai',
+    accepted,
+    rejected: !accepted,
+    confidence: state.manualAiSuggestion.confidence,
+    suggestedAt: state.manualAiSuggestion.suggestedAt,
+    reviewedAt: new Date().toISOString()
+  };
+}
+
+function acceptManualAiSuggestion(form) {
+  if (!state.manualAiSuggestion) return;
+
+  const suggestion = state.manualAiSuggestion;
+  form.elements.title.value = suggestion.title;
+  form.elements.category.value = suggestion.category;
+  form.elements.riskLevel.value = suggestion.riskLevel;
+  form.elements.description.value = suggestion.description;
+  form.elements.actionText.value = suggestion.recommendedAction;
+  state.manualAiDecision = 'accepted';
+  state.manualEntryFeedback = 'Mock AI suggestion accepted. You can still edit before saving.';
+  app.querySelector('#manual-entry-feedback').textContent = state.manualEntryFeedback;
+  renderAiSuggestion();
+}
+
+function rejectManualAiSuggestion() {
+  if (!state.manualAiSuggestion) return;
+
+  state.manualAiDecision = 'rejected';
+  state.manualEntryFeedback = 'Mock AI suggestion rejected. Manual inputs were kept.';
+  app.querySelector('#manual-entry-feedback').textContent = state.manualEntryFeedback;
+  renderAiSuggestion();
+}
+
+async function saveManualEntry(form) {
   const formData = new FormData(form);
   const type = formData.get('type');
   const now = new Date().toISOString();
   const title = String(formData.get('title') ?? '').trim();
+  const category = String(formData.get('category') ?? 'manual_entry').trim() || 'manual_entry';
   const location = String(formData.get('location') ?? '').trim();
   const riskLevel = String(formData.get('riskLevel') ?? 'medium');
   const description = String(formData.get('description') ?? '').trim();
   const actionText = String(formData.get('actionText') ?? '').trim();
+  const photoInput = form.elements.evidencePhotos;
+  const evidencePhotoFiles = photoInput?.files ? Array.from(photoInput.files) : [];
+  const aiSuggestion = getManualAiMetadata();
 
   if (!title || !location) return;
+
+  let evidencePhotos = [];
+  const feedback = app.querySelector('#manual-entry-feedback');
+  const submitButton = app.querySelector('button[form="manual-entry-form"]');
+
+  try {
+    state.manualEntryFeedback = evidencePhotoFiles.length ? 'Uploading photo evidence...' : 'Saving entry...';
+    if (feedback) feedback.textContent = state.manualEntryFeedback;
+    if (submitButton) {
+      submitButton.disabled = true;
+      submitButton.textContent = evidencePhotoFiles.length ? 'Uploading...' : 'Saving...';
+    }
+    evidencePhotos = await uploadEvidencePhotos(evidencePhotoFiles);
+  } catch (error) {
+    state.manualEntryFeedback = getApiErrorMessage(error, 'Photo upload failed.');
+    if (feedback) feedback.textContent = state.manualEntryFeedback;
+    if (submitButton) {
+      submitButton.disabled = false;
+      submitButton.textContent = 'Save';
+    }
+    return;
+  }
 
   if (type === 'near_miss') {
     state.nearMisses.push({
       id: crypto.randomUUID(),
       source: 'near_miss',
       title,
+      category,
       location,
       riskLevel,
       description,
       actionTaken: actionText,
+      evidencePhotos,
+      aiSuggestion,
       reportedBy: state.session.supervisorName,
       reportedAt: now
     });
@@ -336,25 +534,33 @@ function saveManualEntry(form) {
       id: crypto.randomUUID(),
       name: title,
       source: 'manual_entry',
-      category: 'manual_entry',
+      category,
       location,
       riskLevel,
       risk: description,
-      action: actionText
+      action: actionText,
+      evidencePhotos,
+      aiSuggestion
     };
     state.hazards.push(hazard);
     state.responses.push(
       createManualHazardResponse({
         id: hazard.id,
         title,
+        category,
         location,
         riskLevel,
         description,
-        recommendedAction: actionText
+        recommendedAction: actionText,
+        evidencePhotos,
+        aiSuggestion
       })
     );
   }
 
+  state.manualEntryFeedback = '';
+  state.manualAiSuggestion = null;
+  state.manualAiDecision = null;
   state.phase = state.returnPhase;
   render();
 }
@@ -471,6 +677,87 @@ async function copySessionLog(button) {
   }, 1400);
 }
 
+function getSavedSessionDate(session) {
+  return session.savedAt ?? session.exportedAt ?? session.completedAt ?? session.createdAt;
+}
+
+function getSavedSessionSiteName(session) {
+  return session.site?.siteName ?? session.siteName ?? 'Unknown site';
+}
+
+function formatSavedSessionDate(session) {
+  const savedDate = new Date(getSavedSessionDate(session) ?? 0);
+  if (Number.isNaN(savedDate.getTime())) return 'Unknown date';
+  return formatDateTime(savedDate);
+}
+
+async function saveCurrentSession() {
+  if (state.isSavingSession) return;
+
+  state.isSavingSession = true;
+  state.saveFeedback = 'Saving session...';
+  render();
+
+  try {
+    const response = await fetch('/api/sessions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(buildSessionLog())
+    });
+    const payload = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      throw new Error(payload.error ?? `Save failed (${response.status})`);
+    }
+
+    state.saveFeedback = 'Session saved locally.';
+    await loadSavedSessions({ silent: true });
+  } catch (error) {
+    state.saveFeedback = getApiErrorMessage(error, 'Save session failed.');
+  } finally {
+    state.isSavingSession = false;
+    render();
+  }
+}
+
+async function loadSavedSessions({ silent = false } = {}) {
+  state.savedSessionsStatus = silent ? state.savedSessionsStatus : 'loading';
+  if (!silent) render();
+
+  try {
+    const response = await fetch('/api/sessions', { cache: 'no-store' });
+    const payload = await response.json().catch(() => []);
+
+    if (!response.ok) {
+      throw new Error(payload.error ?? `Could not load saved sessions (${response.status})`);
+    }
+
+    state.savedSessions = Array.isArray(payload) ? payload : [];
+    state.savedSessionsStatus = 'ready';
+  } catch (error) {
+    state.savedSessionsStatus = 'error';
+    state.savedSessionsError = getApiErrorMessage(error, 'Could not load saved sessions.');
+  }
+}
+
+async function openSavedSessions() {
+  state.phase = 'saved-sessions';
+  await loadSavedSessions();
+  render();
+}
+
+function closeSavedSessions() {
+  state.phase = state.session.completedAt ? 'summary' : 'start';
+  render();
+}
+
+function openSessionReport(sessionId) {
+  if (!sessionId) return;
+  window.open(`/api/sessions/${encodeURIComponent(sessionId)}/report`, '_blank', 'noopener');
+}
+
 function buildSessionLog() {
   const exportedAt = new Date().toISOString();
   const completedAt = state.session.completedAt ?? (state.phase === 'summary' ? exportedAt : null);
@@ -512,12 +799,17 @@ function buildSessionLog() {
       location: item.location,
       riskLevel: item.riskLevel,
       recommendedAction: item.recommendedAction,
+      evidencePhotos: item.evidencePhotos ?? [],
+      aiSuggestion: item.aiSuggestion ?? null,
       status: toExportHazardStatus(item.status),
       memo: item.memo,
       humanReview: getHumanReview(item),
       correctiveAction: getCorrectiveAction(item)
     })),
-    nearMisses: state.nearMisses,
+    nearMisses: state.nearMisses.map((item) => ({
+      ...item,
+      evidencePhotos: item.evidencePhotos ?? []
+    })),
     workerFeedback: [],
     sharing: state.session.sharing,
     device: state.session.device
@@ -655,6 +947,11 @@ function renderManualEntry() {
         </label>
 
         <label>
+          <span>Category</span>
+          <input class="focusable" name="category" maxlength="80" value="manual_entry" />
+        </label>
+
+        <label>
           <span>Title - browser prototype / voice transcript placeholder</span>
           <input class="focusable" name="title" maxlength="120" placeholder="Example: Temporary ladder blocked" required />
         </label>
@@ -682,6 +979,17 @@ function renderManualEntry() {
           <span>Action taken / recommended action - browser prototype / voice transcript placeholder</span>
           <textarea class="memo focusable flexible-memo" name="actionText" maxlength="260" placeholder="Action taken or recommended action"></textarea>
         </label>
+
+        <label>
+          <span>Attach Photo</span>
+          <input class="focusable" name="evidencePhotos" type="file" accept="image/jpeg,image/png,image/webp" multiple />
+        </label>
+        <p class="photo-preview" id="photo-preview">No photo selected</p>
+        <button class="focusable small-button" id="analyze-photo-button" data-action="analyze-photo" type="button" hidden disabled>
+          Analyze Photo
+        </button>
+        <div id="ai-suggestion-panel"></div>
+        <p class="save-feedback" id="manual-entry-feedback">${escapeHtml(state.manualEntryFeedback)}</p>
       </form>
 
       <section class="button-grid manual-entry-actions">
@@ -691,10 +999,35 @@ function renderManualEntry() {
     </section>
   `;
 
-  app.querySelector('#manual-entry-form').addEventListener('submit', (event) => {
-    event.preventDefault();
-    saveManualEntry(event.currentTarget);
+  app.querySelector('input[name="evidencePhotos"]').addEventListener('change', (event) => {
+    const files = Array.from(event.target.files ?? []);
+    const preview = app.querySelector('#photo-preview');
+    const analyzeButton = app.querySelector('#analyze-photo-button');
+    preview.textContent = files.length
+      ? files.map((file) => `${file.name} (${Math.ceil(file.size / 1024)} KB)`).join(', ')
+      : 'No photo selected';
+    analyzeButton.hidden = files.length === 0;
+    analyzeButton.disabled = files.length === 0;
+    state.manualAiSuggestion = null;
+    state.manualAiDecision = null;
+    state.manualEntryFeedback = files.length ? 'Photo changed. Run mock analysis again if needed.' : '';
+    app.querySelector('#manual-entry-feedback').textContent = state.manualEntryFeedback;
+    renderAiSuggestion();
   });
+
+  app.querySelector('select[name="type"]').addEventListener('change', () => {
+    state.manualAiSuggestion = null;
+    state.manualAiDecision = null;
+    state.manualEntryFeedback = '';
+    app.querySelector('#manual-entry-feedback').textContent = '';
+    renderAiSuggestion();
+  });
+
+  app.querySelector('#manual-entry-form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    await saveManualEntry(event.currentTarget);
+  });
+  renderAiSuggestion();
   bindButtons();
 }
 
@@ -749,6 +1082,7 @@ function renderChecklist() {
 function renderSummary() {
   const confirmed = state.responses.filter((item) => item.status === 'Confirmed').length;
   const fixOrdered = state.responses.filter((item) => item.status === 'Fix Ordered').length;
+  const saveButtonText = state.isSavingSession ? 'Saving...' : 'Save Session';
 
   app.innerHTML = `
     <section class="summary">
@@ -765,11 +1099,69 @@ function renderSummary() {
         </div>
       </div>
       ${buildKoreanReportHtml()}
+      ${state.saveFeedback ? `<p class="save-feedback">${escapeHtml(state.saveFeedback)}</p>` : ''}
       <div class="button-grid summary-actions">
         <button class="focusable" data-action="review">Review</button>
         <button class="focusable" data-action="log-new">Log New Hazard</button>
+        <button class="focusable primary" data-action="save-session" ${
+          state.isSavingSession ? 'disabled' : ''
+        }>${saveButtonText}</button>
+        <button class="focusable" data-action="saved-sessions">Saved Sessions</button>
         <button class="focusable primary wide-button" data-action="copy">Copy JSON</button>
       </div>
+    </section>
+  `;
+
+  bindButtons();
+}
+
+function renderSavedSessions() {
+  const sortedSessions = [...state.savedSessions].sort(
+    (first, second) => new Date(getSavedSessionDate(second) ?? 0) - new Date(getSavedSessionDate(first) ?? 0)
+  );
+  const sessionsHtml = sortedSessions.length
+    ? sortedSessions
+        .map(
+          (session) => `
+            <li>
+              <div>
+                <strong>${escapeHtml(formatSavedSessionDate(session))}</strong>
+                <span>${escapeHtml(getSavedSessionSiteName(session))}</span>
+                <em>${escapeHtml(session.status ?? 'unknown')}</em>
+              </div>
+              <button class="focusable small-button" data-action="open-report" data-session="${escapeHtml(
+                session.sessionId
+              )}">Open Report</button>
+            </li>
+          `
+        )
+        .join('')
+    : '<li><strong>No saved sessions</strong><span>Start by saving a completed TBM.</span><em>empty</em></li>';
+
+  app.innerHTML = `
+    <section class="flow-screen saved-sessions-screen">
+      <header class="flow-header compact-header">
+        <p class="eyebrow">Safety Lens</p>
+        <p class="mode">Saved Sessions</p>
+        <p class="helper-text">${state.savedSessions.length} saved session${
+          state.savedSessions.length === 1 ? '' : 's'
+        }</p>
+      </header>
+
+      <section class="saved-session-panel" aria-label="Saved TBM sessions">
+        ${
+          state.savedSessionsStatus === 'loading'
+            ? '<p class="helper-text">Loading saved sessions...</p>'
+            : state.savedSessionsStatus === 'error'
+              ? `<p class="helper-text">${escapeHtml(state.savedSessionsError)}</p>`
+              : `<ul class="saved-session-list">${sessionsHtml}</ul>`
+        }
+      </section>
+
+      <section class="button-grid saved-session-actions">
+        <button class="focusable" data-action="back-from-saved">Back</button>
+        <button class="focusable primary" data-action="refresh-saved">Refresh</button>
+      </section>
     </section>
   `;
 
@@ -794,6 +1186,12 @@ function bindButtons() {
       if (action === 'fix') setStatus('Fix Ordered');
       if (action === 'review') continueToChecklist();
       if (action === 'copy') copySessionLog(button);
+      if (action === 'save-session') saveCurrentSession();
+      if (action === 'saved-sessions') openSavedSessions();
+      if (action === 'back-from-saved') closeSavedSessions();
+      if (action === 'refresh-saved') loadSavedSessions().then(render);
+      if (action === 'open-report') openSessionReport(button.dataset.session);
+      if (action === 'analyze-photo') analyzeManualPhoto(app.querySelector('#manual-entry-form'));
     });
   });
 }
@@ -806,6 +1204,7 @@ function render() {
   if (state.phase === 'manual-entry') renderManualEntry();
   if (state.phase === 'checklist') renderChecklist();
   if (state.phase === 'summary') renderSummary();
+  if (state.phase === 'saved-sessions') renderSavedSessions();
 }
 
 window.addEventListener('keydown', (event) => {
