@@ -29,6 +29,15 @@ The frontend is still a Vite app. API calls to `/api/*` are proxied to the local
 
 In a second terminal:
 
+Create a local `.env` first:
+
+```text
+REGISTRATION_KEY=change-me-local-dev-key
+SESSION_SECRET=change-me-session-secret
+AI_MODE=mock
+AI_API_KEY=
+```
+
 ```bash
 npm run server
 ```
@@ -57,11 +66,16 @@ The production files will be written to `dist/`.
 
 The Express backend provides:
 
+- `POST /api/auth/register`: creates a local user when the registration key matches `REGISTRATION_KEY`.
+- `POST /api/auth/login`: logs in with email and password.
+- `POST /api/auth/logout`: clears the local auth cookie.
+- `GET /api/auth/me`: returns the logged-in user.
 - `POST /api/sessions`: validates and saves an exported TBM JSON session.
 - `GET /api/sessions`: returns all saved sessions.
 - `GET /api/sessions/:sessionId`: returns one saved session.
 - `GET /api/sessions/:sessionId/report`: returns a printable HTML TBM report for one saved session.
 - `POST /api/uploads`: accepts JPEG, PNG, and WebP image files up to 5MB each and returns local photo metadata.
+- `POST /api/ai/analyze-hazard`: accepts an entry type plus photo metadata or an image URL and returns a structured mock hazard suggestion.
 
 Saved sessions are written to:
 
@@ -79,17 +93,37 @@ The `data/` and `uploads/` folders are created automatically and ignored by git 
 
 Reports are generated from saved session JSON on demand. They are clean HTML pages with Korean labels, white background, black text, tabular sections, print-friendly CSS, and photo evidence thumbnails under related hazards and near-misses. PDF generation is intentionally not included yet.
 
+## Local Auth Prototype
+
+The app shows a login/register screen before the Safety Lens workflow. Registration requires `REGISTRATION_KEY`, which is checked only by the backend and is never exposed to frontend code. Passwords are hashed with bcryptjs and stored in:
+
+```text
+data/users.json
+```
+
+Logged-in access uses a signed HTTP-only cookie backed by `SESSION_SECRET`. Protected routes include saved sessions, uploads, reports, and mock AI analysis. Saved sessions include `createdBy` metadata for the logged-in user.
+
+This is local prototype authentication only. Before production, replace it with hardened session management, HTTPS-only secure cookies, stronger validation, rate limiting, password reset/account recovery, audit logging, and a real user database.
+
 ## Mock AI Prototype
 
-Photo analysis is currently mocked in the browser. No real AI API, API key, cloud service, or camera stream is used.
+Photo analysis is currently mocked by the local backend. No real AI API, API key, cloud service, or camera stream is used.
+
+The backend defaults to mock mode:
+
+```text
+AI_MODE=mock
+```
+
+Copy `.env.example` if you want a local environment file later. `AI_API_KEY` is included there as an empty placeholder for future real AI work, but it is not used yet.
 
 The intended future path is:
 
 ```text
-uploaded image -> AI model -> suggestion -> human review -> saved record -> report
+uploaded image -> backend AI endpoint -> AI model/API -> suggestion -> human review -> saved record -> report
 ```
 
-For now, attaching a photo enables Analyze Photo, which generates a local mock suggestion. A human must accept or reject it before AI metadata is saved.
+For now, attaching a photo enables Analyze Photo, which calls `POST /api/ai/analyze-hazard` and receives a deterministic mock suggestion from the backend. A human must accept or reject it before AI metadata is saved. This keeps the frontend/backend contract ready for a future real vision model while preserving the current local-only prototype.
 
 ## Flow
 

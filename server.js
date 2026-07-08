@@ -1,18 +1,25 @@
 import express from 'express';
+import bcrypt from 'bcryptjs';
 import multer from 'multer';
-import { randomUUID } from 'node:crypto';
-import { mkdirSync } from 'node:fs';
+import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+loadEnvFile();
+
 const PORT = process.env.PORT ?? 3001;
 const DATA_DIR = path.join(__dirname, 'data');
 const SESSIONS_FILE = path.join(DATA_DIR, 'sessions.json');
+const USERS_FILE = path.join(DATA_DIR, 'users.json');
 const UPLOADS_DIR = path.join(__dirname, 'uploads');
 const REQUIRED_FIELDS = ['sessionId', 'sessionType', 'site', 'work', 'supervisor', 'workers', 'hazards'];
+const REGISTRATION_KEY = process.env.REGISTRATION_KEY;
+const SESSION_SECRET = process.env.SESSION_SECRET ?? 'change-me-session-secret';
 const ALLOWED_IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp']);
 const IMAGE_EXTENSIONS = {
   'image/jpeg': '.jpg',
@@ -21,6 +28,7 @@ const IMAGE_EXTENSIONS = {
 };
 
 const app = express();
+const AI_MODE = process.env.AI_MODE ?? 'mock';
 
 mkdirSync(UPLOADS_DIR, { recursive: true });
 
@@ -52,6 +60,24 @@ const upload = multer({
 app.use(express.json({ limit: '1mb' }));
 app.use('/uploads', express.static(UPLOADS_DIR));
 
+function loadEnvFile() {
+  const envPath = path.join(__dirname, '.env');
+  if (!existsSync(envPath)) return;
+
+  const envLines = readFileSync(envPath, 'utf8').split(/\r?\n/);
+  envLines.forEach((line) => {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) return;
+
+    const separatorIndex = trimmed.indexOf('=');
+    if (separatorIndex === -1) return;
+
+    const key = trimmed.slice(0, separatorIndex).trim();
+    const value = trimmed.slice(separatorIndex + 1).trim().replace(/^["']|["']$/g, '');
+    if (key && process.env[key] == null) process.env[key] = value;
+  });
+}
+
 function escapeHtml(value) {
   return String(value ?? '')
     .replaceAll('&', '&amp;')
@@ -59,6 +85,83 @@ function escapeHtml(value) {
     .replaceAll('>', '&gt;')
     .replaceAll('"', '&quot;')
     .replaceAll("'", '&#039;');
+}
+
+function normalizeEmail(email) {
+  return String(email ?? '').trim().toLowerCase();
+}
+
+function toPublicUser(user) {
+  if (!user) return null;
+
+  return {
+    id: user.id,
+    name: user.name,
+    email: user.email,
+    role: user.role
+  };
+}
+
+function parseCookies(cookieHeader = '') {
+  return Object.fromEntries(
+    cookieHeader
+      .split(';')
+      .map((cookie) => cookie.trim())
+      .filter(Boolean)
+      .map((cookie) => {
+        const separatorIndex = cookie.indexOf('=');
+        if (separatorIndex === -1) return [cookie, ''];
+        return [cookie.slice(0, separatorIndex), decodeURIComponent(cookie.slice(separatorIndex + 1))];
+      })
+  );
+}
+
+function signValue(value) {
+  return createHmac('sha256', SESSION_SECRET).update(value).digest('base64url');
+}
+
+function verifySignature(value, signature) {
+  const expected = signValue(value);
+  const signatureBuffer = Buffer.from(signature);
+  const expectedBuffer = Buffer.from(expected);
+  return signatureBuffer.length === expectedBuffer.length && timingSafeEqual(signatureBuffer, expectedBuffer);
+}
+
+function createSessionCookie(userId) {
+  const payload = Buffer.from(JSON.stringify({ userId, createdAt: Date.now() })).toString('base64url');
+  return `${payload}.${signValue(payload)}`;
+}
+
+function getSessionUserId(request) {
+  const cookie = parseCookies(request.headers.cookie).safety_lens_session;
+  if (!cookie) return null;
+
+  const [payload, signature] = cookie.split('.');
+  if (!payload || !signature || !verifySignature(payload, signature)) return null;
+
+  try {
+    const session = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+    return typeof session.userId === 'string' ? session.userId : null;
+  } catch {
+    return null;
+  }
+}
+
+function setAuthCookie(response, userId) {
+  response.cookie('safety_lens_session', createSessionCookie(userId), {
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: false,
+    maxAge: 1000 * 60 * 60 * 12
+  });
+}
+
+function clearAuthCookie(response) {
+  response.clearCookie('safety_lens_session', {
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: false
+  });
 }
 
 function formatReportDate(value) {
@@ -168,6 +271,50 @@ function normalizeSession(session) {
       aiSuggestion: normalizeAiSuggestion(nearMiss.aiSuggestion)
     }))
   };
+}
+
+function createMockAiSuggestion(entryType) {
+  const suggestedAt = new Date().toISOString();
+
+  if (entryType === 'near_miss') {
+    return {
+      title: 'Near miss: struck-by risk observed',
+      category: 'near_miss_observation',
+      riskLevel: 'high',
+      description:
+        'Photo evidence may indicate a near-miss condition with workers or materials exposed to moving equipment or falling objects.',
+      recommendedAction:
+        'Pause related work, confirm exclusion zones, brief nearby workers, and document corrective action before restart.',
+      confidence: 0.78,
+      source: 'mock_ai',
+      suggestedAt
+    };
+  }
+
+  return {
+    title: 'Potential blocked access or housekeeping hazard',
+    category: 'site_housekeeping',
+    riskLevel: 'medium',
+    description:
+      'Photo evidence may indicate clutter, blocked access, or an unsecured work area that should be reviewed before work continues.',
+    recommendedAction:
+      'Clear the access path, secure loose materials, add signage or barricades if needed, and verify the area with the supervisor.',
+    confidence: 0.74,
+    source: 'mock_ai',
+    suggestedAt
+  };
+}
+
+async function analyzeHazardImage({ entryType, photo, photos, imageUrl }) {
+  if (AI_MODE === 'mock' || !AI_MODE) {
+    return createMockAiSuggestion(entryType);
+  }
+
+  // TODO: Wire real vision analysis here when AI_MODE supports a real provider.
+  // The future implementation should pass imageUrl or uploaded photo metadata to
+  // a vision model/API, validate the structured response, and preserve the same
+  // suggestion contract used by the mock response.
+  throw new Error(`Unsupported AI_MODE "${AI_MODE}". Set AI_MODE=mock until a real provider is implemented.`);
 }
 
 function renderSessionReport(session) {
@@ -485,9 +632,48 @@ async function readSessions() {
   }
 }
 
+async function readUsers() {
+  try {
+    const file = await readFile(USERS_FILE, 'utf8');
+    const users = JSON.parse(file);
+    return Array.isArray(users) ? users : [];
+  } catch (error) {
+    if (error.code === 'ENOENT') return [];
+    throw error;
+  }
+}
+
 async function writeSessions(sessions) {
   await mkdir(DATA_DIR, { recursive: true });
   await writeFile(SESSIONS_FILE, `${JSON.stringify(sessions, null, 2)}\n`);
+}
+
+async function writeUsers(users) {
+  await mkdir(DATA_DIR, { recursive: true });
+  await writeFile(USERS_FILE, `${JSON.stringify(users, null, 2)}\n`);
+}
+
+async function getAuthenticatedUser(request) {
+  const userId = getSessionUserId(request);
+  if (!userId) return null;
+
+  const users = await readUsers();
+  return users.find((user) => user.id === userId) ?? null;
+}
+
+async function requireAuth(request, response, next) {
+  try {
+    const user = await getAuthenticatedUser(request);
+    if (!user) {
+      response.status(401).json({ error: 'Please log in to continue.' });
+      return;
+    }
+
+    request.user = user;
+    next();
+  } catch (error) {
+    next(error);
+  }
 }
 
 function validateSession(session) {
@@ -511,7 +697,106 @@ function validateSession(session) {
   return null;
 }
 
-app.post('/api/sessions', async (request, response, next) => {
+app.post('/api/auth/register', async (request, response, next) => {
+  try {
+    const name = String(request.body?.name ?? '').trim();
+    const email = normalizeEmail(request.body?.email);
+    const password = String(request.body?.password ?? '');
+    const role = String(request.body?.role ?? 'supervisor').trim() || 'supervisor';
+    const registrationKey = String(request.body?.registrationKey ?? '');
+
+    if (!REGISTRATION_KEY) {
+      response.status(500).json({ error: 'Registration is not configured on this server.' });
+      return;
+    }
+    if (!email) {
+      response.status(400).json({ error: 'Email is required.' });
+      return;
+    }
+    if (!password) {
+      response.status(400).json({ error: 'Password is required.' });
+      return;
+    }
+    if (password.length < 8) {
+      response.status(400).json({ error: 'Password must be at least 8 characters.' });
+      return;
+    }
+    if (!registrationKey) {
+      response.status(400).json({ error: 'Registration key is required.' });
+      return;
+    }
+    if (registrationKey !== REGISTRATION_KEY) {
+      response.status(403).json({ error: 'Registration key is not authorized.' });
+      return;
+    }
+
+    const users = await readUsers();
+    if (users.some((user) => user.email === email)) {
+      response.status(409).json({ error: 'A user with this email already exists.' });
+      return;
+    }
+
+    const user = {
+      id: randomUUID(),
+      name: name || email,
+      email,
+      role,
+      passwordHash: await bcrypt.hash(password, 12),
+      createdAt: new Date().toISOString()
+    };
+    users.push(user);
+    await writeUsers(users);
+    setAuthCookie(response, user.id);
+    response.status(201).json({ user: toPublicUser(user) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/auth/login', async (request, response, next) => {
+  try {
+    const email = normalizeEmail(request.body?.email);
+    const password = String(request.body?.password ?? '');
+
+    if (!email || !password) {
+      response.status(400).json({ error: 'Email and password are required.' });
+      return;
+    }
+
+    const users = await readUsers();
+    const user = users.find((item) => item.email === email);
+    if (!user || !(await bcrypt.compare(password, user.passwordHash))) {
+      response.status(401).json({ error: 'Invalid email or password.' });
+      return;
+    }
+
+    setAuthCookie(response, user.id);
+    response.json({ user: toPublicUser(user) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/auth/logout', (_request, response) => {
+  clearAuthCookie(response);
+  response.json({ ok: true });
+});
+
+app.get('/api/auth/me', async (request, response, next) => {
+  try {
+    const user = await getAuthenticatedUser(request);
+    if (!user) {
+      response.status(401).json({ error: 'Not logged in.' });
+      return;
+    }
+
+    response.json({ user: toPublicUser(user) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/sessions', requireAuth, async (request, response, next) => {
   try {
     const validationError = validateSession(request.body);
     if (validationError) {
@@ -523,6 +808,7 @@ app.post('/api/sessions', async (request, response, next) => {
     const existingIndex = sessions.findIndex((session) => session.sessionId === request.body.sessionId);
     const savedSession = {
       ...normalizeSession(request.body),
+      createdBy: toPublicUser(request.user),
       savedAt: new Date().toISOString()
     };
 
@@ -539,7 +825,7 @@ app.post('/api/sessions', async (request, response, next) => {
   }
 });
 
-app.post('/api/uploads', (request, response, next) => {
+app.post('/api/uploads', requireAuth, (request, response, next) => {
   upload.array('photos', 10)(request, response, (error) => {
     if (error) {
       if (error instanceof multer.MulterError) {
@@ -568,7 +854,29 @@ app.post('/api/uploads', (request, response, next) => {
   });
 });
 
-app.get('/api/sessions', async (_request, response, next) => {
+app.post('/api/ai/analyze-hazard', requireAuth, async (request, response, next) => {
+  const { entryType, photo, photos, imageUrl } = request.body ?? {};
+  const hasPhotoMetadata = Boolean(photo) || (Array.isArray(photos) && photos.length > 0);
+  const hasImageUrl = typeof imageUrl === 'string' && imageUrl.trim();
+
+  if (!['new_hazard', 'near_miss'].includes(entryType)) {
+    response.status(400).json({ error: 'entryType must be new_hazard or near_miss.' });
+    return;
+  }
+
+  if (!hasPhotoMetadata && !hasImageUrl) {
+    response.status(400).json({ error: 'Photo metadata or imageUrl is required for analysis.' });
+    return;
+  }
+
+  try {
+    response.json(await analyzeHazardImage({ entryType, photo, photos, imageUrl }));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/api/sessions', requireAuth, async (_request, response, next) => {
   try {
     response.json(await readSessions());
   } catch (error) {
@@ -576,7 +884,7 @@ app.get('/api/sessions', async (_request, response, next) => {
   }
 });
 
-app.get('/api/sessions/:sessionId/report', async (request, response, next) => {
+app.get('/api/sessions/:sessionId/report', requireAuth, async (request, response, next) => {
   try {
     const sessions = await readSessions();
     const session = sessions.find((item) => item.sessionId === request.params.sessionId);
@@ -610,7 +918,7 @@ app.get('/api/sessions/:sessionId/report', async (request, response, next) => {
   }
 });
 
-app.get('/api/sessions/:sessionId', async (request, response, next) => {
+app.get('/api/sessions/:sessionId', requireAuth, async (request, response, next) => {
   try {
     const sessions = await readSessions();
     const session = sessions.find((item) => item.sessionId === request.params.sessionId);

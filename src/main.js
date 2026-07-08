@@ -9,7 +9,11 @@ const stressMemo =
 const isStressTest = new URLSearchParams(window.location.search).has('stress');
 
 const state = {
-  phase: 'loading',
+  phase: 'auth-check',
+  authMode: 'login',
+  authFeedback: '',
+  isAuthSubmitting: false,
+  currentUser: null,
   hazards: [],
   index: 0,
   memo: isStressTest ? stressMemo : '',
@@ -61,6 +65,19 @@ const state = {
 
 const app = document.querySelector('#app');
 
+async function apiFetch(url, options = {}) {
+  const response = await fetch(url, options);
+  if (response.status === 401) {
+    state.currentUser = null;
+    state.authMode = 'login';
+    state.authFeedback = 'Please log in to continue.';
+    state.phase = 'auth';
+    render();
+  }
+
+  return response;
+}
+
 function formatDateTime(date) {
   return new Intl.DateTimeFormat('en-US', {
     year: 'numeric',
@@ -86,6 +103,97 @@ function getApiErrorMessage(error, fallback) {
   }
 
   return error.message || fallback;
+}
+
+function buildUserBadge() {
+  if (!state.currentUser) return '';
+
+  return `
+    <section class="user-badge" aria-label="Logged in user">
+      <span>${escapeHtml(state.currentUser.name)} / ${escapeHtml(state.currentUser.role)}</span>
+      <button class="focusable small-button" data-action="logout">Logout</button>
+    </section>
+  `;
+}
+
+async function checkAuth() {
+  state.phase = 'auth-check';
+  render();
+
+  try {
+    const response = await fetch('/api/auth/me', { cache: 'no-store' });
+    const payload = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      state.currentUser = null;
+      state.phase = 'auth';
+      render();
+      return;
+    }
+
+    state.currentUser = payload.user;
+    await loadHazards();
+  } catch (error) {
+    state.currentUser = null;
+    state.authFeedback = getApiErrorMessage(error, 'Could not check login status.');
+    state.phase = 'auth';
+    render();
+  }
+}
+
+async function submitAuth(form) {
+  if (state.isAuthSubmitting) return;
+
+  const formData = new FormData(form);
+  const isRegister = state.authMode === 'register';
+  const payload = {
+    email: String(formData.get('email') ?? '').trim(),
+    password: String(formData.get('password') ?? '')
+  };
+
+  if (isRegister) {
+    payload.name = String(formData.get('name') ?? '').trim();
+    payload.role = String(formData.get('role') ?? 'supervisor').trim() || 'supervisor';
+    payload.registrationKey = String(formData.get('registrationKey') ?? '');
+  }
+
+  state.isAuthSubmitting = true;
+  state.authFeedback = isRegister ? 'Creating account...' : 'Logging in...';
+  render();
+
+  try {
+    const response = await fetch(isRegister ? '/api/auth/register' : '/api/auth/login', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(payload)
+    });
+    const result = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      throw new Error(result.error ?? 'Authentication failed.');
+    }
+
+    state.currentUser = result.user;
+    state.authFeedback = '';
+    await loadHazards();
+  } catch (error) {
+    state.authFeedback = getApiErrorMessage(error, 'Authentication failed.');
+    state.phase = 'auth';
+    render();
+  } finally {
+    state.isAuthSubmitting = false;
+  }
+}
+
+async function logout() {
+  await fetch('/api/auth/logout', { method: 'POST' }).catch(() => {});
+  state.currentUser = null;
+  state.authMode = 'login';
+  state.authFeedback = 'Logged out.';
+  state.phase = 'auth';
+  render();
 }
 
 function currentHazard() {
@@ -334,7 +442,7 @@ async function uploadEvidencePhotos(files) {
   const formData = new FormData();
   files.forEach((file) => formData.append('photos', file));
 
-  const response = await fetch('/api/uploads', {
+  const response = await apiFetch('/api/uploads', {
     method: 'POST',
     body: formData
   });
@@ -345,36 +453,6 @@ async function uploadEvidencePhotos(files) {
   }
 
   return Array.isArray(payload) ? payload : [];
-}
-
-function createMockAiSuggestion(type) {
-  const suggestedAt = new Date().toISOString();
-
-  if (type === 'near_miss') {
-    return {
-      title: 'Near miss: struck-by risk observed',
-      category: 'near_miss_observation',
-      riskLevel: 'high',
-      description:
-        'Photo evidence may indicate a near-miss condition with workers or materials exposed to moving equipment or falling objects.',
-      recommendedAction:
-        'Pause related work, confirm exclusion zones, brief nearby workers, and document corrective action before restart.',
-      confidence: 0.78,
-      suggestedAt
-    };
-  }
-
-  return {
-    title: 'Potential blocked access or housekeeping hazard',
-    category: 'site_housekeeping',
-    riskLevel: 'medium',
-    description:
-      'Photo evidence may indicate clutter, blocked access, or an unsecured work area that should be reviewed before work continues.',
-    recommendedAction:
-      'Clear the access path, secure loose materials, add signage or barricades if needed, and verify the area with the supervisor.',
-    confidence: 0.74,
-    suggestedAt
-  };
 }
 
 function renderAiSuggestion() {
@@ -423,7 +501,15 @@ function renderAiSuggestion() {
   });
 }
 
-function analyzeManualPhoto(form) {
+function getSelectedPhotoMetadata(files) {
+  return files.map((file) => ({
+    originalName: file.name,
+    size: file.size,
+    type: file.type
+  }));
+}
+
+async function analyzeManualPhoto(form) {
   const files = Array.from(form.elements.evidencePhotos?.files ?? []);
   if (!files.length) {
     state.manualEntryFeedback = 'Attach a photo before running mock analysis.';
@@ -431,11 +517,44 @@ function analyzeManualPhoto(form) {
     return;
   }
 
-  state.manualAiSuggestion = createMockAiSuggestion(form.elements.type.value);
-  state.manualAiDecision = null;
-  state.manualEntryFeedback = 'Mock AI suggestion generated locally. Review before accepting.';
+  const analyzeButton = app.querySelector('#analyze-photo-button');
+  state.manualEntryFeedback = 'Requesting mock backend AI analysis...';
   app.querySelector('#manual-entry-feedback').textContent = state.manualEntryFeedback;
-  renderAiSuggestion();
+  analyzeButton.disabled = true;
+  analyzeButton.textContent = 'Analyzing...';
+
+  try {
+    const response = await apiFetch('/api/ai/analyze-hazard', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        entryType: form.elements.type.value,
+        photos: getSelectedPhotoMetadata(files)
+      })
+    });
+    const payload = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      throw new Error(payload.error ?? `Mock AI analysis failed (${response.status})`);
+    }
+
+    state.manualAiSuggestion = payload;
+    state.manualAiDecision = null;
+    state.manualEntryFeedback = 'Mock backend AI suggestion generated. Human review required.';
+    app.querySelector('#manual-entry-feedback').textContent = state.manualEntryFeedback;
+    renderAiSuggestion();
+  } catch (error) {
+    state.manualAiSuggestion = null;
+    state.manualAiDecision = null;
+    state.manualEntryFeedback = getApiErrorMessage(error, 'Mock AI analysis failed.');
+    app.querySelector('#manual-entry-feedback').textContent = state.manualEntryFeedback;
+    renderAiSuggestion();
+  } finally {
+    analyzeButton.disabled = false;
+    analyzeButton.textContent = 'Analyze Photo';
+  }
 }
 
 function getManualAiMetadata() {
@@ -443,7 +562,7 @@ function getManualAiMetadata() {
   const accepted = state.manualAiDecision === 'accepted';
 
   return {
-    source: 'mock_ai',
+    source: state.manualAiSuggestion.source ?? 'mock_ai',
     accepted,
     rejected: !accepted,
     confidence: state.manualAiSuggestion.confidence,
@@ -699,7 +818,7 @@ async function saveCurrentSession() {
   render();
 
   try {
-    const response = await fetch('/api/sessions', {
+    const response = await apiFetch('/api/sessions', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json'
@@ -727,7 +846,7 @@ async function loadSavedSessions({ silent = false } = {}) {
   if (!silent) render();
 
   try {
-    const response = await fetch('/api/sessions', { cache: 'no-store' });
+    const response = await apiFetch('/api/sessions', { cache: 'no-store' });
     const payload = await response.json().catch(() => []);
 
     if (!response.ok) {
@@ -816,6 +935,83 @@ function buildSessionLog() {
   };
 }
 
+function renderAuthChecking() {
+  app.innerHTML = `
+    <section class="flow-screen center-screen">
+      <p class="eyebrow">Safety Lens</p>
+      <h1>Checking Login</h1>
+      <p class="helper-text">Preparing protected local access...</p>
+    </section>
+  `;
+}
+
+function renderAuth() {
+  const isRegister = state.authMode === 'register';
+  const submitText = state.isAuthSubmitting ? 'Please wait...' : isRegister ? 'Register' : 'Login';
+
+  app.innerHTML = `
+    <section class="flow-screen auth-screen">
+      <header class="flow-header compact-header">
+        <p class="eyebrow">Safety Lens</p>
+        <p class="mode">${isRegister ? 'Register' : 'Login'}</p>
+      </header>
+
+      <section class="button-grid auth-tabs" aria-label="Authentication mode">
+        <button class="focusable ${!isRegister ? 'primary' : ''}" data-action="auth-login">Login</button>
+        <button class="focusable ${isRegister ? 'primary' : ''}" data-action="auth-register">Register</button>
+      </section>
+
+      <form class="form-panel auth-form" id="auth-form">
+        ${
+          isRegister
+            ? `
+              <label>
+                <span>Name</span>
+                <input class="focusable" name="name" autocomplete="name" />
+              </label>
+            `
+            : ''
+        }
+        <label>
+          <span>Email</span>
+          <input class="focusable" name="email" type="email" autocomplete="email" required />
+        </label>
+        <label>
+          <span>Password</span>
+          <input class="focusable" name="password" type="password" autocomplete="${
+            isRegister ? 'new-password' : 'current-password'
+          }" minlength="8" required />
+        </label>
+        ${
+          isRegister
+            ? `
+              <label>
+                <span>Role</span>
+                <input class="focusable" name="role" value="supervisor" />
+              </label>
+              <label>
+                <span>Registration key</span>
+                <input class="focusable" name="registrationKey" type="password" required />
+              </label>
+            `
+            : ''
+        }
+        <p class="save-feedback">${escapeHtml(state.authFeedback)}</p>
+      </form>
+
+      <button class="focusable primary full-action" form="auth-form" type="submit" ${
+        state.isAuthSubmitting ? 'disabled' : ''
+      }>${submitText}</button>
+    </section>
+  `;
+
+  app.querySelector('#auth-form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    await submitAuth(event.currentTarget);
+  });
+  bindButtons();
+}
+
 function renderLoading() {
   app.innerHTML = `
     <section class="flow-screen center-screen">
@@ -845,6 +1041,7 @@ function renderStart() {
         <p class="eyebrow">Safety Lens</p>
         <h1>Start TBM</h1>
       </header>
+      ${buildUserBadge()}
 
       <section class="form-panel" aria-label="TBM session details">
         <label>
@@ -882,6 +1079,7 @@ function renderParticipation() {
         <p class="eyebrow">Worker Participation</p>
         <p class="mode">${escapeHtml(state.session.taskName)}</p>
       </header>
+      ${buildUserBadge()}
 
       <form class="add-worker" id="add-worker-form">
         <input class="focusable" id="worker-name" autocomplete="off" placeholder="Add worker name" />
@@ -934,6 +1132,7 @@ function renderManualEntry() {
         <p class="eyebrow">Safety Lens</p>
         <p class="mode">Log New Hazard</p>
       </header>
+      ${buildUserBadge()}
 
       <form class="form-panel manual-entry-form" id="manual-entry-form">
         <p class="helper-text">Browser prototype / voice transcript placeholder</p>
@@ -1040,6 +1239,7 @@ function renderChecklist() {
       <div>
         <p class="eyebrow">Safety Lens</p>
         <p class="mode">Current mode: TBM Checklist</p>
+        ${buildUserBadge()}
       </div>
       <p class="progress">${state.index + 1} / ${state.hazards.length}</p>
     </section>
@@ -1087,6 +1287,7 @@ function renderSummary() {
   app.innerHTML = `
     <section class="summary">
       <p class="eyebrow">Safety Lens</p>
+      ${buildUserBadge()}
       <h1>TBM Complete</h1>
       <div class="summary-grid">
         <div>
@@ -1147,6 +1348,7 @@ function renderSavedSessions() {
           state.savedSessions.length === 1 ? '' : 's'
         }</p>
       </header>
+      ${buildUserBadge()}
 
       <section class="saved-session-panel" aria-label="Saved TBM sessions">
         ${
@@ -1173,6 +1375,17 @@ function bindButtons() {
     button.addEventListener('click', () => {
       const action = button.dataset.action;
 
+      if (action === 'auth-login') {
+        state.authMode = 'login';
+        state.authFeedback = '';
+        render();
+      }
+      if (action === 'auth-register') {
+        state.authMode = 'register';
+        state.authFeedback = '';
+        render();
+      }
+      if (action === 'logout') logout();
       if (action === 'retry') loadHazards();
       if (action === 'start') startTbm();
       if (action === 'remove-worker') removeWorker(button.dataset.worker);
@@ -1197,6 +1410,8 @@ function bindButtons() {
 }
 
 function render() {
+  if (state.phase === 'auth-check') renderAuthChecking();
+  if (state.phase === 'auth') renderAuth();
   if (state.phase === 'loading') renderLoading();
   if (state.phase === 'error') renderError();
   if (state.phase === 'start') renderStart();
@@ -1217,4 +1432,4 @@ window.addEventListener('keydown', (event) => {
   if (event.key === '2') setStatus('Fix Ordered');
 });
 
-loadHazards();
+checkAuth();

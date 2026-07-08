@@ -259,6 +259,41 @@ button:hover {
   grid-template-rows: auto auto auto;
 }
 
+.auth-screen {
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+}
+
+.auth-tabs {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.auth-form {
+  scrollbar-width: thin;
+}
+
+.user-badge {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 92px;
+  align-items: center;
+  gap: var(--space-sm);
+  padding: var(--space-xs) var(--space-sm);
+  border: 2px solid rgba(255, 255, 255, 0.18);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.user-badge span {
+  color: #d8f8f4;
+  font-size: 15px;
+  font-weight: 900;
+  line-height: 1.15;
+}
+
+.user-badge .small-button {
+  min-height: 36px;
+  font-size: 13px;
+}
+
 .flow-header {
   min-width: 0;
   display: grid;
@@ -336,7 +371,7 @@ select {
 }
 
 .participation-screen {
-  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  grid-template-rows: auto auto auto minmax(0, 1fr) auto;
 }
 
 .add-worker {
@@ -404,7 +439,7 @@ select {
 }
 
 .manual-entry-screen {
-  grid-template-rows: auto minmax(0, 1fr) auto;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
 }
 
 .manual-entry-form {
