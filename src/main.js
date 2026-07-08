@@ -105,8 +105,8 @@ function getApiErrorMessage(error, fallback) {
   return error.message || fallback;
 }
 
-function v2Icon() {
-  return '<span class="v2-icon-box" aria-hidden="true"></span>';
+function v2Icon(symbol = '') {
+  return `<span class="v2-icon-box" aria-hidden="true">${escapeHtml(symbol)}</span>`;
 }
 
 function v2Logo() {
@@ -119,9 +119,9 @@ function v2Logo() {
   `;
 }
 
-function v2Progress(current, total, label = '') {
+function v2Progress(current, total, label = '', type = 'workflow') {
   return `
-    <div class="v2-progress">
+    <div class="v2-progress is-${type}">
       <div class="v2-progress-text">
         <strong>${current}</strong><span>/ ${total}</span>
         ${label ? `<em>${escapeHtml(label)}</em>` : ''}
@@ -135,23 +135,21 @@ function v2Progress(current, total, label = '') {
   `;
 }
 
-function getV2Step() {
-  if (state.phase === 'start') return 1;
-  if (state.phase === 'participation') return 3;
-  if (state.phase === 'checklist') return state.index + 1;
-  if (state.phase === 'summary') return state.hazards.length || 8;
-  if (state.phase === 'saved-sessions') return 2;
-  return 1;
+function v2WorkflowProgress(step) {
+  return v2Progress(step, 4, 'Workflow', 'workflow');
 }
 
-function v2Header(title, currentStep = getV2Step(), totalSteps = Math.max(state.hazards.length || 8, currentStep), label = '') {
+function v2ChecklistProgress() {
+  return v2Progress(state.index + 1, state.hazards.length, 'Hazards', 'checklist');
+}
+
+function v2Header(title, progressHtml = '') {
   return `
     <header class="v2-header">
       ${v2Logo()}
       <div class="v2-header-title"><h1>${escapeHtml(title)}</h1></div>
       <div class="v2-header-right">
-        ${v2Progress(currentStep, totalSteps, label)}
-        ${buildUserBadge()}
+        ${progressHtml}
       </div>
     </header>
   `;
@@ -171,7 +169,7 @@ function buildUserBadge() {
 
   return `
     <section class="v2-user-badge user-badge" aria-label="Logged in user">
-      ${v2Icon()}
+      ${v2Icon('U')}
       <span>${escapeHtml(state.currentUser.name)}</span>
       <button class="focusable v2-user-logout" data-action="logout" aria-label="Logout">Logout</button>
     </section>
@@ -1010,7 +1008,7 @@ function renderAuthChecking() {
         <p>Worksite Awareness. Safer Outcomes.</p>
       </div>
       <section class="v2-card v2-loading-card">
-        ${v2Icon()}
+        ${v2Icon('i')}
         <h2>Checking Login</h2>
         <p>Preparing protected local access...</p>
       </section>
@@ -1030,8 +1028,8 @@ function renderAuth() {
       </div>
 
       <section class="auth-tabs" aria-label="Authentication mode">
-        <button class="focusable ${!isRegister ? 'is-active' : ''}" data-action="auth-login" type="button">${v2Icon()} Login</button>
-        <button class="focusable ${isRegister ? 'is-active' : ''}" data-action="auth-register" type="button">${v2Icon()} Register</button>
+        <button class="focusable ${!isRegister ? 'is-active' : ''}" data-action="auth-login" type="button">${v2Icon('L')} Login</button>
+        <button class="focusable ${isRegister ? 'is-active' : ''}" data-action="auth-register" type="button">${v2Icon('R')} Register</button>
       </section>
 
       <form class="v2-card auth-form" id="auth-form">
@@ -1039,7 +1037,7 @@ function renderAuth() {
           isRegister
             ? `
               <div class="auth-field">
-                ${v2Icon()}
+                ${v2Icon('N')}
                 <label>
                   <span>Name</span>
                   <input class="focusable" name="name" autocomplete="name" placeholder="Your name" />
@@ -1049,14 +1047,14 @@ function renderAuth() {
             : ''
         }
         <div class="auth-field">
-          ${v2Icon()}
+          ${v2Icon('@')}
           <label>
             <span>Email</span>
             <input class="focusable" name="email" type="email" autocomplete="email" placeholder="name@company.com" required />
           </label>
         </div>
         <div class="auth-field">
-          ${v2Icon()}
+          ${v2Icon('*')}
           <label>
             <span>Password</span>
             <input class="focusable" name="password" type="password" autocomplete="${
@@ -1068,14 +1066,14 @@ function renderAuth() {
           isRegister
             ? `
               <div class="auth-field">
-                ${v2Icon()}
+                ${v2Icon('R')}
                 <label>
                   <span>Role</span>
                   <input class="focusable" name="role" value="supervisor" />
                 </label>
               </div>
               <div class="auth-field">
-                ${v2Icon()}
+                ${v2Icon('K')}
                 <label>
                   <span>Registration key</span>
                   <input class="focusable" name="registrationKey" type="password" required />
@@ -1109,7 +1107,7 @@ function renderLoading() {
         <p>Worksite Awareness. Safer Outcomes.</p>
       </div>
       <section class="v2-card v2-loading-card">
-        ${v2Icon()}
+        ${v2Icon('i')}
         <h2>Loading TBM</h2>
         <p>Loading hazard controls...</p>
       </section>
@@ -1138,7 +1136,7 @@ function renderError() {
 function renderStart() {
   app.innerHTML = `
     <section class="v2-screen">
-      ${v2Header('Start TBM', 1, Math.max(state.hazards.length || 8, 1))}
+      ${v2Header('Start TBM', v2WorkflowProgress(1))}
       <section class="v2-card v2-form-card" aria-label="TBM session details">
         <div class="v2-screen-intro">
           <div class="v2-warning-tile">▶</div>
@@ -1147,35 +1145,30 @@ function renderStart() {
             <p>Kick off a Toolbox Meeting to promote safety and alignment.</p>
           </div>
         </div>
+        ${buildUserBadge()}
         <div class="v2-form-grid">
           <label class="v2-field-row">
-            ${v2Icon()}
+            ${v2Icon('S')}
             <span>Site name</span>
             <input class="focusable" name="siteName" value="${escapeHtml(state.session.siteName)}" />
           </label>
           <label class="v2-field-row">
-            ${v2Icon()}
+            ${v2Icon('T')}
             <span>Task name</span>
             <input class="focusable" name="taskName" value="${escapeHtml(state.session.taskName)}" />
           </label>
           <label class="v2-field-row">
-            ${v2Icon()}
+            ${v2Icon('U')}
             <span>Supervisor</span>
             <input class="focusable" name="supervisorName" value="${escapeHtml(state.session.supervisorName)}" />
           </label>
           <div class="v2-field-row">
-            ${v2Icon()}
+            ${v2Icon('D')}
             <span>Date / time</span>
             <strong>${escapeHtml(formatDateTime(state.session.scheduledAt))}</strong>
           </div>
         </div>
         <button class="focusable v2-key-button v2-key-primary v2-full-button" data-action="start">▶ Start TBM</button>
-      </section>
-
-      <section class="v2-action-row v2-action-row-nav">
-        <button class="focusable v2-key-button" type="button" disabled>← Previous</button>
-        <button class="focusable v2-key-button" type="button" disabled>＋ Log New Hazard</button>
-        <button class="focusable v2-key-button v2-key-primary" data-action="start">Start TBM</button>
       </section>
     </section>
   `;
@@ -1191,7 +1184,7 @@ function renderParticipation() {
 
   app.innerHTML = `
     <section class="v2-screen">
-      ${v2Header('Worker Participation', 3, Math.max(state.hazards.length || 8, 3))}
+      ${v2Header('Worker Participation', v2WorkflowProgress(2))}
       <section class="v2-card v2-participation-card">
         <div class="v2-section-heading">
           <h2>Worker Attendance</h2>
@@ -1200,7 +1193,7 @@ function renderParticipation() {
 
         <form class="v2-add-worker" id="add-worker-form">
           <div class="v2-input-with-icon">
-            ${v2Icon()}
+            ${v2Icon('+')}
             <input class="focusable" id="worker-name" autocomplete="off" placeholder="Add worker name..." />
           </div>
           <button class="focusable v2-key-button" type="submit">Add</button>
@@ -1260,7 +1253,7 @@ function renderParticipation() {
 function renderManualEntry() {
   app.innerHTML = `
     <section class="v2-screen">
-      ${v2Header('Log New Hazard', 1, 3, 'Details')}
+      ${v2Header('Log New Hazard')}
 
       <form class="v2-manual-layout manual-entry-form" id="manual-entry-form">
         <section class="v2-card v2-manual-main">
@@ -1313,7 +1306,7 @@ function renderManualEntry() {
           <section class="v2-card v2-upload-card">
             <h3>Attach Photo</h3>
             <label class="v2-upload-zone">
-              ${v2Icon()}
+              ${v2Icon('P')}
               <span id="photo-preview">No photo selected</span>
               <input class="focusable" name="evidencePhotos" type="file" accept="image/jpeg,image/png,image/webp" multiple />
             </label>
@@ -1327,9 +1320,8 @@ function renderManualEntry() {
         </aside>
       </form>
 
-      <section class="v2-action-row v2-action-row-nav">
+      <section class="v2-action-row">
         <button class="focusable v2-key-button" data-action="cancel-manual">← Cancel</button>
-        <button class="focusable v2-key-button" type="button" disabled>Save Draft</button>
         <button class="focusable v2-key-button v2-key-primary" form="manual-entry-form" type="submit">Save</button>
       </section>
     </section>
@@ -1370,11 +1362,12 @@ function renderManualEntry() {
 function renderChecklist() {
   const hazard = currentHazard();
   const response = currentResponse();
-  const statusTone = response.status === 'Fix Ordered' ? 'warning' : response.status ? 'danger' : 'neutral';
+  const statusTone =
+    response.status === 'Confirmed' ? 'success' : response.status === 'Fix Ordered' ? 'warning' : 'neutral';
 
   app.innerHTML = `
     <section class="v2-screen">
-      ${v2Header('TBM Checklist', state.index + 1, state.hazards.length)}
+      ${v2Header('TBM Checklist', v2ChecklistProgress())}
       <section class="v2-card v2-hazard-card" aria-label="Current hazard">
         <div class="v2-hazard-hero">
           <div class="v2-warning-tile">!</div>
@@ -1386,11 +1379,11 @@ function renderChecklist() {
         </div>
 
         <div class="v2-detail-list">
-          <div class="v2-detail-row">${v2Icon()}<p>Location</p><strong>${escapeHtml(hazard.location)}</strong></div>
-          <div class="v2-detail-row">${v2Icon()}<p>Risk Level</p><strong>${escapeHtml(hazard.riskLevel ?? response.riskLevel ?? 'medium')}</strong></div>
-          <div class="v2-detail-row">${v2Icon()}<p>Category</p><strong>${escapeHtml(hazard.category ?? response.category ?? 'general')}</strong></div>
-          <div class="v2-detail-row">${v2Icon()}<p>Risk</p><strong>${escapeHtml(hazard.risk)}</strong></div>
-          <div class="v2-detail-row">${v2Icon()}<p>Recommended Action</p><strong>${escapeHtml(hazard.action)}</strong></div>
+          <div class="v2-detail-row">${v2Icon('L')}<p>Location</p><strong>${escapeHtml(hazard.location)}</strong></div>
+          <div class="v2-detail-row">${v2Icon('!')}<p>Risk Level</p><strong>${escapeHtml(hazard.riskLevel ?? response.riskLevel ?? 'medium')}</strong></div>
+          <div class="v2-detail-row">${v2Icon('C')}<p>Category</p><strong>${escapeHtml(hazard.category ?? response.category ?? 'general')}</strong></div>
+          <div class="v2-detail-row">${v2Icon('R')}<p>Risk</p><strong>${escapeHtml(hazard.risk)}</strong></div>
+          <div class="v2-detail-row">${v2Icon('A')}<p>Recommended Action</p><strong>${escapeHtml(hazard.action)}</strong></div>
         </div>
       </section>
 
@@ -1425,7 +1418,7 @@ function renderSummary() {
 
   app.innerHTML = `
     <section class="v2-screen">
-      ${v2Header('TBM Complete', state.hazards.length, state.hazards.length)}
+      ${v2Header('TBM Complete', v2WorkflowProgress(4))}
       <section class="v2-card v2-summary-card">
         <div class="v2-summary-hero">
           <div class="v2-success-tile">✓</div>
@@ -1481,13 +1474,13 @@ function renderSavedSessions() {
         .map(
           (session) => `
             <li class="v2-session-row">
-              ${v2Icon()}
+              ${v2Icon('D')}
               <div class="v2-session-date">
                 <strong>${escapeHtml(formatSavedSessionDate(session))}</strong>
                 <span>${escapeHtml(session.status ?? 'unknown')}</span>
               </div>
               <div class="v2-session-site">
-                ${v2Icon()}
+                ${v2Icon('S')}
                 <div>
                   <strong>${escapeHtml(getSavedSessionSiteName(session))}</strong>
                   <span>${escapeHtml(session.site?.siteArea ?? session.siteArea ?? 'Saved TBM session')}</span>
@@ -1508,14 +1501,14 @@ function renderSavedSessions() {
 
   app.innerHTML = `
     <section class="v2-screen">
-      ${v2Header('Saved Sessions', 2, Math.max(state.hazards.length || 8, 2))}
+      ${v2Header('Saved Sessions')}
       <section class="v2-card v2-saved-card" aria-label="Saved TBM sessions">
         <div class="v2-section-heading v2-section-heading-row">
           <div>
             <h2>Saved Sessions</h2>
             <p>You have ${state.savedSessions.length} saved session${state.savedSessions.length === 1 ? '' : 's'}.</p>
           </div>
-          <button class="focusable v2-key-button v2-key-small" data-action="refresh-saved">Newest First</button>
+          <button class="focusable v2-key-button v2-key-small" data-action="refresh-saved">Refresh</button>
         </div>
         <section class="v2-saved-panel">
         ${

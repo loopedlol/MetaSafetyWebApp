@@ -95,7 +95,7 @@ span {
 .v2-header {
   min-height: 52px;
   display: grid;
-  grid-template-columns: 1fr 1.1fr 1fr;
+  grid-template-columns: minmax(120px, 1fr) minmax(0, 1.15fr) minmax(90px, 1fr);
   align-items: center;
   gap: 8px;
   padding: 8px 10px;
@@ -176,6 +176,7 @@ span {
 
 .v2-progress {
   min-width: 58px;
+  max-width: 132px;
 }
 
 .v2-progress-text {
@@ -260,19 +261,12 @@ span {
   border: 1px solid var(--v2-line);
   border-radius: 9px;
   background: #f8f9fa;
-  color: transparent;
+  color: #2f363e;
   box-shadow: var(--v2-shadow-key);
-  position: relative;
-}
-
-.v2-icon-box::after,
-.v2-placeholder-icon::after {
-  content: "";
-  width: 13px;
-  height: 13px;
-  border-radius: 3px;
-  background: #2f363e;
-  opacity: 0.86;
+  font-size: 13px;
+  font-weight: 950;
+  line-height: 1;
+  text-transform: uppercase;
 }
 
 .v2-warning-tile,
@@ -735,15 +729,16 @@ span {
 .v2-manual-layout {
   min-height: 0;
   display: grid;
-  grid-template-columns: minmax(0, 1.2fr) minmax(0, 0.9fr);
+  grid-template-columns: minmax(0, 1fr);
   gap: 10px;
-  overflow: hidden;
+  align-content: start;
+  overflow: auto;
 }
 
 .v2-manual-main,
 .v2-manual-side {
   min-height: 0;
-  overflow: auto;
+  overflow: visible;
 }
 
 .v2-manual-main {
