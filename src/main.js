@@ -7,6 +7,7 @@ const stressMemo =
   'Long memo stress test: crew reported this needs barricades, signage, owner assignment, and follow-up before restart. This text should wrap and scroll inside the memo field without pushing buttons over other content.';
 
 const isStressTest = new URLSearchParams(window.location.search).has('stress');
+const isGlassesMode = new URLSearchParams(window.location.search).get('mode') === 'glasses';
 
 const state = {
   phase: 'auth-check',
@@ -61,7 +62,10 @@ const state = {
   manualEntryFeedback: '',
   manualAiSuggestion: null,
   manualAiDecision: null,
-  returnPhase: 'checklist'
+  returnPhase: 'checklist',
+  glassesStep: 'start',
+  glassesMemoFeedback: '',
+  glassesPhotoFeedback: ''
 };
 
 const app = document.querySelector('#app');
@@ -457,6 +461,143 @@ function setStatus(status) {
   }
 
   render();
+}
+
+function getMockEvidencePhoto() {
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="320" height="180" viewBox="0 0 320 180"><rect width="320" height="180" fill="#f2f4f6"/><rect x="22" y="22" width="276" height="136" rx="14" fill="#fff" stroke="#c7ccd3" stroke-width="4"/><circle cx="82" cy="78" r="22" fill="#ff4438" opacity=".88"/><path d="M54 136l62-48 44 34 36-28 70 42H54z" fill="#6f7782" opacity=".72"/><text x="160" y="162" text-anchor="middle" font-family="Arial" font-size="16" fill="#1f252c">Mock evidence</text></svg>`;
+
+  return {
+    uploadId: crypto.randomUUID(),
+    originalName: `glasses_mock_evidence_${state.index + 1}.svg`,
+    size: svg.length,
+    mimetype: 'image/svg+xml',
+    url: `data:image/svg+xml,${encodeURIComponent(svg)}`,
+    uploadedAt: new Date().toISOString(),
+    source: 'glasses_mock_capture'
+  };
+}
+
+function captureGlassesMemo() {
+  if (!currentResponse()) return;
+
+  const memo = 'Voice memo captured: supervisor requested follow-up before restart.';
+  state.memo = memo;
+  currentResponse().memo = memo;
+  state.glassesMemoFeedback = memo;
+  state.glassesStep = 'memo';
+  render();
+}
+
+function captureGlassesPhoto() {
+  const response = currentResponse();
+  if (!response) return;
+
+  response.evidencePhotos = [...(response.evidencePhotos ?? []), getMockEvidencePhoto()];
+  response.updatedAt = new Date().toISOString();
+  state.glassesPhotoFeedback = 'Mock photo evidence captured for this hazard.';
+  state.glassesStep = 'photo';
+  render();
+}
+
+function startGlassesTbm() {
+  if (!state.session.startedAt) state.session.startedAt = new Date().toISOString();
+  state.phase = 'participation';
+  state.glassesStep = 'workers';
+  render();
+}
+
+function continueGlassesFromWorkers() {
+  state.workers = state.workers.map((worker) => ({ ...worker, present: true, acknowledged: true }));
+  state.phase = 'checklist';
+  state.index = 0;
+  state.memo = currentResponse()?.memo ?? '';
+  state.glassesStep = 'hazard';
+  render();
+}
+
+function continueGlassesReview() {
+  if (state.phase === 'summary' || state.glassesStep === 'summary') {
+    state.glassesStep = 'summary';
+    render();
+    return;
+  }
+
+  state.glassesStep = 'hazard';
+  render();
+}
+
+function exitGlassesMode() {
+  const url = new URL(window.location.href);
+  url.searchParams.delete('mode');
+  window.location.href = url.toString();
+}
+
+function handleGlassesAction(action) {
+  if (action === 'exit') {
+    exitGlassesMode();
+    return;
+  }
+
+  if (action === 'start') {
+    startGlassesTbm();
+    return;
+  }
+
+  if (action === 'workers') {
+    continueGlassesFromWorkers();
+    return;
+  }
+
+  if (action === 'memo') {
+    captureGlassesMemo();
+    return;
+  }
+
+  if (action === 'photo') {
+    captureGlassesPhoto();
+    return;
+  }
+
+  if (action === 'confirmed') {
+    if (state.glassesStep !== 'hazard') return;
+    if (state.phase !== 'checklist') state.phase = 'checklist';
+    state.glassesStep = 'hazard';
+    setStatus('Confirmed');
+    return;
+  }
+
+  if (action === 'fix') {
+    if (state.glassesStep !== 'hazard') return;
+    if (state.phase !== 'checklist') state.phase = 'checklist';
+    state.glassesStep = 'hazard';
+    setStatus('Fix Ordered');
+    return;
+  }
+
+  if (action === 'save-session') {
+    saveCurrentSession();
+    return;
+  }
+
+  if (action === 'next') {
+    if (state.glassesStep === 'start') startGlassesTbm();
+    else if (state.glassesStep === 'workers') continueGlassesFromWorkers();
+    else if (state.glassesStep === 'memo' || state.glassesStep === 'photo') continueGlassesReview();
+    else if (state.phase === 'checklist') goTo(state.index + 1);
+    else state.glassesStep = 'summary';
+    return;
+  }
+
+  if (action === 'prev') {
+    if (state.glassesStep === 'workers') state.glassesStep = 'start';
+    else if (state.glassesStep === 'hazard' && state.index > 0) goTo(state.index - 1);
+    else if (state.glassesStep === 'memo' || state.glassesStep === 'photo') state.glassesStep = 'hazard';
+    else if (state.glassesStep === 'summary') {
+      state.phase = 'checklist';
+      state.glassesStep = 'hazard';
+    }
+    render();
+  }
 }
 
 function toExportHazardStatus(status) {
@@ -1392,6 +1533,146 @@ function renderManualEntry() {
   bindButtons();
 }
 
+function renderGlassesActions(actions) {
+  return `
+    <section class="glasses-actions">
+      ${actions
+        .map(
+          (action) => `
+            <button class="focusable v2-key-button ${action.primary ? 'v2-key-primary' : ''}" data-glasses-action="${escapeHtml(
+              action.action
+            )}">${escapeHtml(action.label)}</button>
+          `
+        )
+        .join('')}
+    </section>
+  `;
+}
+
+function bindGlassesButtons() {
+  app.querySelectorAll('button[data-glasses-action]').forEach((button) => {
+    button.addEventListener('click', () => handleGlassesAction(button.dataset.glassesAction));
+  });
+}
+
+function renderGlasses() {
+  if (state.phase === 'summary') state.glassesStep = 'summary';
+
+  const presentCount = state.workers.filter((worker) => worker.present).length;
+  const confirmed = state.responses.filter((item) => item.status === 'Confirmed').length;
+  const fixOrdered = state.responses.filter((item) => item.status === 'Fix Ordered').length;
+  const unchecked = state.responses.filter((item) => toExportHazardStatus(item.status) === 'not_checked').length;
+  const hazard = currentHazard();
+  const response = currentResponse();
+
+  let body = '';
+  let actions = [];
+
+  if (state.glassesStep === 'start') {
+    body = `
+      <p class="glasses-kicker">Glasses HUD Mode</p>
+      <h1>Start TBM</h1>
+      <p class="glasses-large">${escapeHtml(state.session.siteName)}</p>
+      <p class="glasses-muted">${escapeHtml(state.session.taskName)}</p>
+      <div class="glasses-hint">Enter or ArrowRight to begin</div>
+    `;
+    actions = [
+      { action: 'start', label: 'Start', primary: true },
+      { action: 'exit', label: 'Exit' }
+    ];
+  } else if (state.glassesStep === 'workers') {
+    body = `
+      <p class="glasses-kicker">Worker Attendance</p>
+      <h1>${presentCount} / ${state.workers.length} present</h1>
+      <p class="glasses-large">Mark all demo workers present?</p>
+      <p class="glasses-muted">${state.workers.map((worker) => escapeHtml(worker.name)).join(' · ')}</p>
+      <div class="glasses-hint">Enter marks all present</div>
+    `;
+    actions = [
+      { action: 'workers', label: 'Mark Present', primary: true },
+      { action: 'prev', label: 'Back' }
+    ];
+  } else if (state.glassesStep === 'memo') {
+    body = `
+      <p class="glasses-kicker">Voice Memo Mock</p>
+      <h1>Memo Captured</h1>
+      <p class="glasses-large">${escapeHtml(state.glassesMemoFeedback)}</p>
+      <p class="glasses-muted">Saved to Hazard ${state.index + 1}.</p>
+    `;
+    actions = [
+      { action: 'next', label: 'Continue', primary: true },
+      { action: 'photo', label: 'Photo' }
+    ];
+  } else if (state.glassesStep === 'photo') {
+    body = `
+      <p class="glasses-kicker">Photo Evidence Mock</p>
+      <h1>Photo Captured</h1>
+      <p class="glasses-large">${escapeHtml(state.glassesPhotoFeedback)}</p>
+      <p class="glasses-muted">${response?.evidencePhotos?.length ?? 0} evidence item${
+        (response?.evidencePhotos?.length ?? 0) === 1 ? '' : 's'
+      } on this hazard.</p>
+    `;
+    actions = [
+      { action: 'next', label: 'Continue', primary: true },
+      { action: 'memo', label: 'Memo' }
+    ];
+  } else if (state.glassesStep === 'summary') {
+    body = `
+      <p class="glasses-kicker">TBM Complete</p>
+      <h1>Summary</h1>
+      <section class="glasses-stats" aria-label="Glasses summary counts">
+        <div><strong>${confirmed}</strong><span>Confirmed</span></div>
+        <div><strong>${fixOrdered}</strong><span>Fix Ordered</span></div>
+        <div><strong>${unchecked}</strong><span>Not Checked</span></div>
+      </section>
+      <p class="glasses-muted">${escapeHtml(state.saveFeedback || 'Save the completed session when ready.')}</p>
+    `;
+    actions = [
+      { action: 'save-session', label: state.isSavingSession ? 'Saving...' : 'Save', primary: true },
+      { action: 'exit', label: 'Exit' }
+    ];
+  } else {
+    const status = response?.status ?? 'Not Marked';
+    body = `
+      <p class="glasses-kicker">Hazard ${state.index + 1} / ${state.hazards.length}</p>
+      <h1>${escapeHtml(hazard?.name ?? 'No hazard')}</h1>
+      <dl class="glasses-hazard-facts">
+        <div><dt>Location</dt><dd>${escapeHtml(hazard?.location ?? '')}</dd></div>
+        <div><dt>Risk</dt><dd>${escapeHtml(hazard?.riskLevel ?? 'medium')}</dd></div>
+        <div><dt>Status</dt><dd>${escapeHtml(status)}</dd></div>
+      </dl>
+      <p class="glasses-muted">${escapeHtml(hazard?.action ?? '')}</p>
+      <div class="glasses-hint">1 Confirm · 2 Fix · M Memo · P Photo</div>
+    `;
+    actions = [
+      { action: 'confirmed', label: 'Confirmed', primary: true },
+      { action: 'fix', label: 'Fix Ordered' },
+      { action: 'memo', label: 'Memo' }
+    ];
+  }
+
+  app.innerHTML = `
+    <section class="glasses-screen">
+      <header class="glasses-topline">
+        ${v2Logo()}
+        <button class="focusable glasses-exit" data-glasses-action="exit">Exit</button>
+      </header>
+      <main class="glasses-card" aria-live="polite">
+        ${body}
+      </main>
+      ${renderGlassesActions(actions)}
+      <footer class="glasses-shortcuts">←/→ Navigate · Enter Continue · Esc Exit</footer>
+    </section>
+  `;
+
+  app.querySelectorAll('button[data-action]').forEach((button) => {
+    button.addEventListener('click', () => {
+      if (button.dataset.action === 'save-session') saveCurrentSession();
+    });
+  });
+  bindGlassesButtons();
+}
+
 function renderChecklist() {
   const hazard = currentHazard();
   const response = currentResponse();
@@ -1610,6 +1891,10 @@ function render() {
   if (state.phase === 'auth') renderAuth();
   if (state.phase === 'loading') renderLoading();
   if (state.phase === 'error') renderError();
+  if (isGlassesMode && state.currentUser && state.hazards.length && !['auth-check', 'auth', 'loading', 'error'].includes(state.phase)) {
+    renderGlasses();
+    return;
+  }
   if (state.phase === 'start') renderStart();
   if (state.phase === 'participation') renderParticipation();
   if (state.phase === 'manual-entry') renderManualEntry();
@@ -1620,6 +1905,17 @@ function render() {
 
 window.addEventListener('keydown', (event) => {
   if (event.target.matches('input, textarea')) return;
+  if (isGlassesMode && state.currentUser && state.hazards.length) {
+    if (event.key === 'ArrowRight') handleGlassesAction('next');
+    if (event.key === 'ArrowLeft') handleGlassesAction('prev');
+    if (event.key === '1') handleGlassesAction('confirmed');
+    if (event.key === '2') handleGlassesAction('fix');
+    if (event.key.toLowerCase() === 'm') handleGlassesAction('memo');
+    if (event.key.toLowerCase() === 'p') handleGlassesAction('photo');
+    if (event.key === 'Enter') handleGlassesAction('next');
+    if (event.key === 'Escape') handleGlassesAction('exit');
+    return;
+  }
   if (state.phase !== 'checklist') return;
 
   if (event.key === 'ArrowRight') goTo(state.index + 1);
