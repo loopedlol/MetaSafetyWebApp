@@ -20,18 +20,18 @@ const state = {
   session: {
     sessionId: crypto.randomUUID(),
     createdAt: new Date().toISOString(),
-    siteName: 'Seoul Site A',
-    siteArea: 'Tower A / Level 3',
+    siteName: '서울 강동 스마트타워 신축공사',
+    siteArea: 'Tower A / Level 3 / Grid B-12',
     gps: {
       latitude: null,
       longitude: null,
       accuracyMeters: null
     },
-    taskName: 'Morning TBM / Risk Assessment',
+    taskName: '전기 배선 및 자재 반입 전 TBM',
     workType: 'Construction safety TBM',
-    plannedWorkDescription: 'Daily toolbox meeting and pre-work hazard confirmation.',
-    supervisorName: 'Kim Supervisor',
-    supervisorRole: 'Site safety supervisor',
+    plannedWorkDescription: '전기 배선, 케이블 트레이 설치, 자재 반입 전 유해위험요인 확인.',
+    supervisorName: '김지훈',
+    supervisorRole: '현장 안전관리자',
     scheduledAt: new Date(),
     startedAt: null,
     completedAt: null,
@@ -47,9 +47,10 @@ const state = {
     }
   },
   workers: [
-    { id: crypto.randomUUID(), name: 'Park Minjun', role: 'Worker', present: false, acknowledged: false },
-    { id: crypto.randomUUID(), name: 'Lee Jisoo', role: 'Signal worker', present: false, acknowledged: false },
-    { id: crypto.randomUUID(), name: 'Choi Hana', role: 'Electrician', present: false, acknowledged: false }
+    { id: crypto.randomUUID(), name: '박민준', role: '전기공', present: false, acknowledged: false },
+    { id: crypto.randomUUID(), name: '이지수', role: '신호수', present: false, acknowledged: false },
+    { id: crypto.randomUUID(), name: '최하나', role: '자재 반입 담당', present: false, acknowledged: false },
+    { id: crypto.randomUUID(), name: '정도윤', role: '작업반장', present: false, acknowledged: false }
   ],
   responses: [],
   nearMisses: [],
@@ -105,8 +106,30 @@ function getApiErrorMessage(error, fallback) {
   return error.message || fallback;
 }
 
-function v2Icon(symbol = '') {
-  return `<span class="v2-icon-box" aria-hidden="true">${escapeHtml(symbol)}</span>`;
+const iconPaths = {
+  info: '<circle cx="12" cy="12" r="9"></circle><path d="M12 11v5"></path><path d="M12 8h.01"></path>',
+  login: '<path d="M10 17l5-5-5-5"></path><path d="M15 12H3"></path><path d="M15 4h3a3 3 0 0 1 3 3v10a3 3 0 0 1-3 3h-3"></path>',
+  register: '<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle><path d="M19 8v6"></path><path d="M22 11h-6"></path>',
+  user: '<path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle>',
+  email: '<rect x="3" y="5" width="18" height="14" rx="2"></rect><path d="m3 7 9 6 9-6"></path>',
+  lock: '<rect x="4" y="11" width="16" height="9" rx="2"></rect><path d="M8 11V7a4 4 0 0 1 8 0v4"></path>',
+  key: '<circle cx="7.5" cy="15.5" r="3.5"></circle><path d="M10 13 21 2"></path><path d="m16 7 3 3"></path>',
+  site: '<path d="M12 21s7-4.8 7-11a7 7 0 1 0-14 0c0 6.2 7 11 7 11Z"></path><circle cx="12" cy="10" r="2.5"></circle>',
+  task: '<rect x="5" y="4" width="14" height="16" rx="2"></rect><path d="M9 8h6"></path><path d="M9 12h6"></path><path d="M9 16h4"></path>',
+  calendar: '<rect x="3" y="5" width="18" height="16" rx="2"></rect><path d="M16 3v4"></path><path d="M8 3v4"></path><path d="M3 11h18"></path>',
+  add: '<path d="M12 5v14"></path><path d="M5 12h14"></path>',
+  photo: '<rect x="3" y="5" width="18" height="16" rx="2"></rect><circle cx="8.5" cy="10.5" r="1.5"></circle><path d="m21 15-5-5L5 21"></path>',
+  location: '<path d="M12 21s6-5.3 6-11a6 6 0 1 0-12 0c0 5.7 6 11 6 11Z"></path><circle cx="12" cy="10" r="2"></circle>',
+  risk: '<path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"></path><path d="M12 9v4"></path><path d="M12 17h.01"></path>',
+  category: '<path d="M4 4h7v7H4z"></path><path d="M13 4h7v7h-7z"></path><path d="M4 13h7v7H4z"></path><path d="M13 13h7v7h-7z"></path>',
+  action: '<path d="M4 13l5 5L20 7"></path><path d="M14 7h6v6"></path>',
+  status: '<circle cx="12" cy="12" r="9"></circle><path d="m9 12 2 2 4-4"></path>',
+  report: '<path d="M6 3h9l3 3v15H6z"></path><path d="M14 3v4h4"></path><path d="M9 13h6"></path><path d="M9 17h6"></path>'
+};
+
+function v2Icon(name = 'info') {
+  const path = iconPaths[name] ?? iconPaths.info;
+  return `<span class="v2-icon-box" aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false">${path}</svg></span>`;
 }
 
 function v2Logo() {
@@ -169,7 +192,7 @@ function buildUserBadge() {
 
   return `
     <section class="v2-user-badge user-badge" aria-label="Logged in user">
-      ${v2Icon('U')}
+      ${v2Icon('user')}
       <span>${escapeHtml(state.currentUser.name)}</span>
       <button class="focusable v2-user-logout" data-action="logout" aria-label="Logout">Logout</button>
     </section>
@@ -755,24 +778,34 @@ function formatKoreanList(items, emptyText) {
   return items.map((item) => `<li>${escapeHtml(item)}</li>`).join('');
 }
 
+function formatReportPreviewItem(item, actionText = '') {
+  const photos = item.evidencePhotos?.length ? ` / 사진 ${item.evidencePhotos.length}건` : '';
+  const ai =
+    item.aiSuggestion?.accepted === true
+      ? ' / Mock AI 참고 의견 수락'
+      : item.aiSuggestion?.rejected === true
+        ? ' / Mock AI 참고 의견 거부'
+        : '';
+  const action = actionText ? ` - ${actionText}` : '';
+  return `${item.title} (${item.location}, 위험도: ${item.riskLevel})${action}${photos}${ai}`;
+}
+
 function buildKoreanReportHtml() {
   const presentWorkers = state.workers.filter((worker) => worker.present);
   const confirmed = state.responses.filter((item) => toExportHazardStatus(item.status) === 'confirmed');
   const fixOrdered = state.responses.filter((item) => toExportHazardStatus(item.status) === 'fix_ordered');
   const unchecked = state.responses.filter((item) => toExportHazardStatus(item.status) === 'not_checked');
-  const hazardLines = state.responses.map(
-    (item) => `${item.title} (${item.location}, 위험도: ${item.riskLevel})`
-  );
-  const nearMissLines = state.nearMisses.map(
-    (item) => `${item.title} (${item.location}, 위험도: ${item.riskLevel}) - ${item.actionTaken || '조치 내용 미입력'}`
+  const hazardLines = state.responses.map((item) => formatReportPreviewItem(item));
+  const nearMissLines = state.nearMisses.map((item) =>
+    formatReportPreviewItem(item, item.actionTaken || '조치 내용 미입력')
   );
   const manualHazardLines = state.responses
     .filter((item) => item.source === 'manual_entry')
-    .map((item) => `${item.title} (${item.location}, 위험도: ${item.riskLevel})`);
+    .map((item) => formatReportPreviewItem(item));
 
   return `
     <section class="report-preview" aria-label="Korean TBM report preview">
-      <h2>TBM 보고서 미리보기</h2>
+      <h2>작업 전 안전회의(TBM) 보고서 미리보기</h2>
       <dl class="report-meta">
         <div>
           <dt>현장명</dt>
@@ -805,7 +838,7 @@ function buildKoreanReportHtml() {
       </section>
 
       <section>
-        <h3>주요 유해위험요인</h3>
+        <h3>전체 유해위험요인</h3>
         <ul>${formatKoreanList(hazardLines, '등록된 유해위험요인 없음')}</ul>
       </section>
 
@@ -815,12 +848,12 @@ function buildKoreanReportHtml() {
       </section>
 
       <section>
-        <h3>아차사고 기록</h3>
+        <h3>아차사고 및 Near-miss 기록</h3>
         <ul>${formatKoreanList(nearMissLines, '아차사고 기록 없음')}</ul>
       </section>
 
       <section>
-        <h3>확인 완료 항목</h3>
+        <h3>확인 완료 항목(Confirmed)</h3>
         <ul>${formatKoreanList(
           confirmed.map((item) => item.title),
           '확인 완료 항목 없음'
@@ -828,15 +861,15 @@ function buildKoreanReportHtml() {
       </section>
 
       <section>
-        <h3>조치 필요 항목</h3>
+        <h3>조치 필요 항목(Fix Ordered)</h3>
         <ul>${formatKoreanList(
-          fixOrdered.map((item) => `${item.title} - ${item.recommendedAction}`),
+          fixOrdered.map((item) => formatReportPreviewItem(item, item.recommendedAction)),
           '조치 필요 항목 없음'
         )}</ul>
       </section>
 
       <section>
-        <h3>미확인 항목</h3>
+        <h3>미확인 항목(Not Checked)</h3>
         <ul>${formatKoreanList(
           unchecked.map((item) => item.title),
           '미확인 항목 없음'
@@ -1008,7 +1041,7 @@ function renderAuthChecking() {
         <p>Worksite Awareness. Safer Outcomes.</p>
       </div>
       <section class="v2-card v2-loading-card">
-        ${v2Icon('i')}
+        ${v2Icon('info')}
         <h2>Checking Login</h2>
         <p>Preparing protected local access...</p>
       </section>
@@ -1028,8 +1061,8 @@ function renderAuth() {
       </div>
 
       <section class="auth-tabs" aria-label="Authentication mode">
-        <button class="focusable ${!isRegister ? 'is-active' : ''}" data-action="auth-login" type="button">${v2Icon('L')} Login</button>
-        <button class="focusable ${isRegister ? 'is-active' : ''}" data-action="auth-register" type="button">${v2Icon('R')} Register</button>
+        <button class="focusable ${!isRegister ? 'is-active' : ''}" data-action="auth-login" type="button">${v2Icon('login')} Login</button>
+        <button class="focusable ${isRegister ? 'is-active' : ''}" data-action="auth-register" type="button">${v2Icon('register')} Register</button>
       </section>
 
       <form class="v2-card auth-form" id="auth-form">
@@ -1037,7 +1070,7 @@ function renderAuth() {
           isRegister
             ? `
               <div class="auth-field">
-                ${v2Icon('N')}
+                ${v2Icon('user')}
                 <label>
                   <span>Name</span>
                   <input class="focusable" name="name" autocomplete="name" placeholder="Your name" />
@@ -1047,14 +1080,14 @@ function renderAuth() {
             : ''
         }
         <div class="auth-field">
-          ${v2Icon('@')}
+          ${v2Icon('email')}
           <label>
             <span>Email</span>
             <input class="focusable" name="email" type="email" autocomplete="email" placeholder="name@company.com" required />
           </label>
         </div>
         <div class="auth-field">
-          ${v2Icon('*')}
+          ${v2Icon('lock')}
           <label>
             <span>Password</span>
             <input class="focusable" name="password" type="password" autocomplete="${
@@ -1066,14 +1099,14 @@ function renderAuth() {
           isRegister
             ? `
               <div class="auth-field">
-                ${v2Icon('R')}
+                ${v2Icon('user')}
                 <label>
                   <span>Role</span>
                   <input class="focusable" name="role" value="supervisor" />
                 </label>
               </div>
               <div class="auth-field">
-                ${v2Icon('K')}
+                ${v2Icon('key')}
                 <label>
                   <span>Registration key</span>
                   <input class="focusable" name="registrationKey" type="password" required />
@@ -1107,7 +1140,7 @@ function renderLoading() {
         <p>Worksite Awareness. Safer Outcomes.</p>
       </div>
       <section class="v2-card v2-loading-card">
-        ${v2Icon('i')}
+        ${v2Icon('info')}
         <h2>Loading TBM</h2>
         <p>Loading hazard controls...</p>
       </section>
@@ -1148,22 +1181,22 @@ function renderStart() {
         ${buildUserBadge()}
         <div class="v2-form-grid">
           <label class="v2-field-row">
-            ${v2Icon('S')}
+            ${v2Icon('site')}
             <span>Site name</span>
             <input class="focusable" name="siteName" value="${escapeHtml(state.session.siteName)}" />
           </label>
           <label class="v2-field-row">
-            ${v2Icon('T')}
+            ${v2Icon('task')}
             <span>Task name</span>
             <input class="focusable" name="taskName" value="${escapeHtml(state.session.taskName)}" />
           </label>
           <label class="v2-field-row">
-            ${v2Icon('U')}
+            ${v2Icon('user')}
             <span>Supervisor</span>
             <input class="focusable" name="supervisorName" value="${escapeHtml(state.session.supervisorName)}" />
           </label>
           <div class="v2-field-row">
-            ${v2Icon('D')}
+            ${v2Icon('calendar')}
             <span>Date / time</span>
             <strong>${escapeHtml(formatDateTime(state.session.scheduledAt))}</strong>
           </div>
@@ -1193,7 +1226,7 @@ function renderParticipation() {
 
         <form class="v2-add-worker" id="add-worker-form">
           <div class="v2-input-with-icon">
-            ${v2Icon('+')}
+            ${v2Icon('add')}
             <input class="focusable" id="worker-name" autocomplete="off" placeholder="Add worker name..." />
           </div>
           <button class="focusable v2-key-button" type="submit">Add</button>
@@ -1306,7 +1339,7 @@ function renderManualEntry() {
           <section class="v2-card v2-upload-card">
             <h3>Attach Photo</h3>
             <label class="v2-upload-zone">
-              ${v2Icon('P')}
+              ${v2Icon('photo')}
               <span id="photo-preview">No photo selected</span>
               <input class="focusable" name="evidencePhotos" type="file" accept="image/jpeg,image/png,image/webp" multiple />
             </label>
@@ -1379,11 +1412,11 @@ function renderChecklist() {
         </div>
 
         <div class="v2-detail-list">
-          <div class="v2-detail-row">${v2Icon('L')}<p>Location</p><strong>${escapeHtml(hazard.location)}</strong></div>
-          <div class="v2-detail-row">${v2Icon('!')}<p>Risk Level</p><strong>${escapeHtml(hazard.riskLevel ?? response.riskLevel ?? 'medium')}</strong></div>
-          <div class="v2-detail-row">${v2Icon('C')}<p>Category</p><strong>${escapeHtml(hazard.category ?? response.category ?? 'general')}</strong></div>
-          <div class="v2-detail-row">${v2Icon('R')}<p>Risk</p><strong>${escapeHtml(hazard.risk)}</strong></div>
-          <div class="v2-detail-row">${v2Icon('A')}<p>Recommended Action</p><strong>${escapeHtml(hazard.action)}</strong></div>
+          <div class="v2-detail-row">${v2Icon('location')}<p>Location</p><strong>${escapeHtml(hazard.location)}</strong></div>
+          <div class="v2-detail-row">${v2Icon('status')}<p>Risk Level</p><strong>${escapeHtml(hazard.riskLevel ?? response.riskLevel ?? 'medium')}</strong></div>
+          <div class="v2-detail-row">${v2Icon('category')}<p>Category</p><strong>${escapeHtml(hazard.category ?? response.category ?? 'general')}</strong></div>
+          <div class="v2-detail-row">${v2Icon('risk')}<p>Risk</p><strong>${escapeHtml(hazard.risk)}</strong></div>
+          <div class="v2-detail-row">${v2Icon('action')}<p>Recommended Action</p><strong>${escapeHtml(hazard.action)}</strong></div>
         </div>
       </section>
 
@@ -1474,13 +1507,13 @@ function renderSavedSessions() {
         .map(
           (session) => `
             <li class="v2-session-row">
-              ${v2Icon('D')}
+              ${v2Icon('calendar')}
               <div class="v2-session-date">
                 <strong>${escapeHtml(formatSavedSessionDate(session))}</strong>
                 <span>${escapeHtml(session.status ?? 'unknown')}</span>
               </div>
               <div class="v2-session-site">
-                ${v2Icon('S')}
+                ${v2Icon('site')}
                 <div>
                   <strong>${escapeHtml(getSavedSessionSiteName(session))}</strong>
                   <span>${escapeHtml(session.site?.siteArea ?? session.siteArea ?? 'Saved TBM session')}</span>

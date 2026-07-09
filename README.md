@@ -10,6 +10,24 @@ Because this folder needs to be runnable immediately, this prototype uses a ligh
 
 Source inspected: https://github.com/facebookincubator/meta-wearables-webapp
 
+## Demo Script
+
+Use this script for a short end-to-end Safety Lens V2 walkthrough:
+
+1. Register or login.
+2. Start TBM for `서울 강동 스마트타워 신축공사`.
+3. Mark workers present.
+4. Review the hazard checklist.
+5. Mark one hazard `Confirmed`.
+6. Mark one hazard `Fix Ordered`.
+7. Log a new hazard or near-miss with photo evidence.
+8. Run mock AI analysis.
+9. Accept the mock AI suggestion after human review.
+10. Save the session.
+11. Open Saved Sessions.
+12. Open the Korean report.
+13. Use browser print/save-to-PDF if needed.
+
 ## Run Frontend
 
 ```bash
@@ -45,7 +63,7 @@ npm run server
 The backend listens on:
 
 ```text
-http://localhost:3001
+http://127.0.0.1:3001
 ```
 
 You can also run both during local development with:
@@ -53,6 +71,8 @@ You can also run both during local development with:
 ```bash
 npm run dev:all
 ```
+
+This starts the Express backend and Vite frontend together and stops both when the command is interrupted.
 
 ## Build
 
@@ -124,6 +144,17 @@ uploaded image -> backend AI endpoint -> AI model/API -> suggestion -> human rev
 ```
 
 For now, attaching a photo enables Analyze Photo, which calls `POST /api/ai/analyze-hazard` and receives a deterministic mock suggestion from the backend. A human must accept or reject it before AI metadata is saved. This keeps the frontend/backend contract ready for a future real vision model while preserving the current local-only prototype.
+
+## Prototype / Mock Behavior
+
+The following behavior is intentional for the current demo prototype:
+
+- Authentication is local-file based and intended for demo use only.
+- AI photo analysis is deterministic mock analysis from the backend.
+- Uploaded photos are stored locally under `uploads/`.
+- Saved TBM sessions are stored locally under `data/sessions.json`.
+- The Korean report is generated as printable HTML; use the browser print dialog for PDF output.
+- Smart-glasses camera streaming, real AI analysis, production auth, and cloud storage are not implemented yet.
 
 ## Flow
 

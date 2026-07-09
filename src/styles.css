@@ -263,10 +263,17 @@ span {
   background: #f8f9fa;
   color: #2f363e;
   box-shadow: var(--v2-shadow-key);
-  font-size: 13px;
-  font-weight: 950;
-  line-height: 1;
-  text-transform: uppercase;
+}
+
+.v2-icon-box svg,
+.v2-placeholder-icon svg {
+  width: 17px;
+  height: 17px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 
 .v2-warning-tile,

@@ -1,32 +1,42 @@
 [
   {
-    "id": "open-floor-hole",
-    "name": "Open floor hole",
+    "id": "level3-open-slab-opening",
+    "name": "3층 슬래브 개구부 덮개 미설치",
     "source": "preloaded_checklist",
     "category": "fall_prevention",
-    "location": "Level 3 core opening",
+    "location": "Tower A / Level 3 / Grid B-12",
     "riskLevel": "high",
-    "risk": "Fall-through hazard near active work area.",
-    "action": "Cover, barricade, or mark the opening before work continues."
+    "risk": "자재 반입 동선 인근 개구부가 노출되어 작업자가 추락하거나 발을 헛디딜 수 있음.",
+    "action": "작업 전 개구부 덮개 설치 여부를 확인하고, 접근 통제선과 경고 표지를 설치한 뒤 담당자가 조치 완료를 확인."
   },
   {
-    "id": "missing-guardrail",
-    "name": "Missing guardrail",
-    "source": "preloaded_checklist",
-    "category": "fall_prevention",
-    "location": "North scaffold edge",
-    "riskLevel": "high",
-    "risk": "Unprotected edge exposed to crew traffic.",
-    "action": "Install guardrail or restrict access until fixed."
-  },
-  {
-    "id": "loose-power-cable",
-    "name": "Loose power cable",
+    "id": "temporary-cable-crossing",
+    "name": "임시 전선이 보행 통로를 가로지름",
     "source": "preloaded_checklist",
     "category": "electrical_housekeeping",
-    "location": "Temporary walkway to hoist",
+    "location": "Tower A / Level 3 / 자재 반입 통로",
     "riskLevel": "medium",
-    "risk": "Trip and electrical damage hazard across the walkway.",
-    "action": "Route overhead, tape down, or remove from the path."
+    "risk": "작업자가 케이블에 걸려 넘어지거나 이동 중 자재와 충돌할 수 있음.",
+    "action": "통로 케이블을 정리하고 케이블 보호대를 설치하며, 통행 전 작업반장에게 정리 상태를 공유."
+  },
+  {
+    "id": "scaffold-edge-material-staging",
+    "name": "비계 가장자리 인근 자재 적치",
+    "source": "preloaded_checklist",
+    "category": "material_storage",
+    "location": "Tower A / Level 3 / 북측 비계 출입부",
+    "riskLevel": "high",
+    "risk": "자재가 통로를 좁히고 가장자리 접근을 유도해 낙하물 또는 추락 위험이 커질 수 있음.",
+    "action": "자재를 지정 적치 구역으로 이동하고 비계 출입부 주변 통로 폭과 난간 상태를 확인."
+  },
+  {
+    "id": "lift-zone-spotter-required",
+    "name": "양중 구역 신호수 배치 확인 필요",
+    "source": "preloaded_checklist",
+    "category": "lifting_operations",
+    "location": "Tower A / Level 1-3 / 호이스트 반입 구간",
+    "riskLevel": "medium",
+    "risk": "자재 양중 중 작업자 접근 통제가 불충분하면 충돌 또는 낙하물 접촉 위험이 있음.",
+    "action": "양중 시작 전 신호수 배치, 출입 통제선, 무전 연락 상태를 확인하고 TBM 참석자에게 공유."
   }
 ]

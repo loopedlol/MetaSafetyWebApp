@@ -13,6 +13,7 @@ const __dirname = path.dirname(__filename);
 loadEnvFile();
 
 const PORT = process.env.PORT ?? 3001;
+const HOST = process.env.HOST ?? '127.0.0.1';
 const DATA_DIR = path.join(__dirname, 'data');
 const SESSIONS_FILE = path.join(DATA_DIR, 'sessions.json');
 const USERS_FILE = path.join(DATA_DIR, 'users.json');
@@ -223,11 +224,16 @@ function renderEvidencePhotos(item) {
 }
 
 function renderAiSuggestionNote(item) {
-  if (!item.aiSuggestion?.accepted) return '';
+  if (!item.aiSuggestion) return '';
 
   const confidence = Number(item.aiSuggestion.confidence);
-  const confidenceText = Number.isFinite(confidence) ? ` (${Math.round(confidence * 100)}% confidence)` : '';
-  return `<p class="ai-note">AI suggested, human accepted${confidenceText}.</p>`;
+  const confidenceText = Number.isFinite(confidence) ? ` / 신뢰도 ${Math.round(confidence * 100)}%` : '';
+  const decisionText = item.aiSuggestion.accepted
+    ? '작업자가 수락한 참고 의견'
+    : item.aiSuggestion.rejected
+      ? '작업자가 거부한 참고 의견'
+      : '작업자 검토 전 참고 의견';
+  return `<p class="ai-note">Mock AI 분석: ${decisionText}${confidenceText}. 공식 기록은 작업자 검토 결과를 기준으로 합니다.</p>`;
 }
 
 function renderReportTitle(item) {
@@ -530,7 +536,7 @@ function renderSessionReport(session) {
     <main>
       <header>
         <div>
-          <h1>TBM 보고서</h1>
+          <h1>작업 전 안전회의(TBM) 보고서</h1>
           <p>${formatReportValue(session.work?.taskName)}</p>
         </div>
         <p class="meta-note">Session ID<br />${formatReportValue(session.sessionId)}</p>
@@ -564,7 +570,7 @@ function renderSessionReport(session) {
       </section>
 
       <section>
-        <h2>주요 유해위험요인</h2>
+        <h2>전체 유해위험요인</h2>
         <table>
           <thead><tr>${hazardColumns.map((column) => `<th>${column.label}</th>`).join('')}</tr></thead>
           <tbody>${renderRows(session.hazards, hazardColumns, '등록된 유해위험요인 없음')}</tbody>
@@ -572,7 +578,7 @@ function renderSessionReport(session) {
       </section>
 
       <section>
-        <h2>확인 완료 항목</h2>
+        <h2>확인 완료 항목(Confirmed Hazards)</h2>
         <table>
           <thead><tr>${hazardColumns.map((column) => `<th>${column.label}</th>`).join('')}</tr></thead>
           <tbody>${renderRows(confirmedHazards, hazardColumns, '확인 완료 항목 없음')}</tbody>
@@ -580,7 +586,7 @@ function renderSessionReport(session) {
       </section>
 
       <section>
-        <h2>조치 필요 항목</h2>
+        <h2>조치 필요 항목(Fix Ordered)</h2>
         <table>
           <thead><tr>${hazardColumns.map((column) => `<th>${column.label}</th>`).join('')}</tr></thead>
           <tbody>${renderRows(fixOrderedHazards, hazardColumns, '조치 필요 항목 없음')}</tbody>
@@ -588,7 +594,7 @@ function renderSessionReport(session) {
       </section>
 
       <section>
-        <h2>미확인 항목</h2>
+        <h2>미확인 항목(Not Checked)</h2>
         <table>
           <thead><tr>${hazardColumns.map((column) => `<th>${column.label}</th>`).join('')}</tr></thead>
           <tbody>${renderRows(uncheckedHazards, hazardColumns, '미확인 항목 없음')}</tbody>
@@ -596,7 +602,7 @@ function renderSessionReport(session) {
       </section>
 
       <section>
-        <h2>아차사고 기록</h2>
+        <h2>아차사고 및 Near-miss 기록</h2>
         <table>
           <thead><tr><th>항목</th><th>위치</th><th>위험도</th><th>조치 내용</th><th>사진 증빙</th></tr></thead>
           <tbody>${renderRows(
@@ -941,6 +947,12 @@ app.use((error, _request, response, _next) => {
   response.status(500).json({ error: 'Internal server error.' });
 });
 
-app.listen(PORT, () => {
-  console.log(`Safety Lens backend listening on http://localhost:${PORT}`);
+const httpServer = app.listen(PORT, HOST, () => {
+  console.log(`Safety Lens backend listening on http://${HOST}:${PORT}`);
+});
+
+httpServer.on('error', (error) => {
+  console.error(`Safety Lens backend failed to start on ${HOST}:${PORT}.`);
+  console.error(error);
+  process.exitCode = 1;
 });
