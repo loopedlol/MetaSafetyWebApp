@@ -7,7 +7,9 @@ const stressMemo =
   'Long memo stress test: crew reported this needs barricades, signage, owner assignment, and follow-up before restart. This text should wrap and scroll inside the memo field without pushing buttons over other content.';
 
 const isStressTest = new URLSearchParams(window.location.search).has('stress');
+// Glasses HUD Mode is a browser preview for a future Meta Display / wearable app.
 const isGlassesMode = new URLSearchParams(window.location.search).get('mode') === 'glasses';
+const LOCAL_DRAFT_VERSION = 1;
 
 const state = {
   phase: 'auth-check',
@@ -63,9 +65,13 @@ const state = {
   manualAiSuggestion: null,
   manualAiDecision: null,
   returnPhase: 'checklist',
+  draftStatus: '',
+  pendingDraft: null,
+  // Glasses HUD Mode state: intentionally small and layered on top of the shared TBM session.
   glassesStep: 'start',
   glassesMemoFeedback: '',
-  glassesPhotoFeedback: ''
+  glassesPhotoFeedback: '',
+  glassesReviewFeedback: ''
 };
 
 const app = document.querySelector('#app');
@@ -84,13 +90,16 @@ async function apiFetch(url, options = {}) {
 }
 
 function formatDateTime(date) {
+  const parsedDate = date instanceof Date ? date : new Date(date);
+  if (Number.isNaN(parsedDate.getTime())) return 'Unknown date';
+
   return new Intl.DateTimeFormat('en-US', {
     year: 'numeric',
     month: 'short',
     day: '2-digit',
     hour: '2-digit',
     minute: '2-digit'
-  }).format(date);
+  }).format(parsedDate);
 }
 
 function escapeHtml(value) {
@@ -201,6 +210,129 @@ function buildUserBadge() {
       <button class="focusable v2-user-logout" data-action="logout" aria-label="Logout">Logout</button>
     </section>
   `;
+}
+
+// ---------------------------------------------------------------------------
+// Offline-first local draft helpers
+// ---------------------------------------------------------------------------
+// This stores only the active TBM work state. Auth cookies, passwords,
+// registration keys, and login form values are intentionally never persisted.
+// Future backend sync/offline queue work can build on this layer without
+// replacing the existing /api/sessions save path.
+
+function getDraftKey() {
+  return 'safety-lens-active-draft-v1';
+}
+
+function buildLocalDraft() {
+  return {
+    version: LOCAL_DRAFT_VERSION,
+    savedAt: new Date().toISOString(),
+    phase: state.phase,
+    index: state.index,
+    memo: state.memo,
+    session: state.session,
+    workers: state.workers,
+    hazards: state.hazards,
+    responses: state.responses,
+    nearMisses: state.nearMisses,
+    glassesStep: state.glassesStep,
+    glassesMemoFeedback: state.glassesMemoFeedback,
+    glassesPhotoFeedback: state.glassesPhotoFeedback,
+    glassesReviewFeedback: state.glassesReviewFeedback,
+    saveFeedback: state.saveFeedback
+  };
+}
+
+function isValidLocalDraft(draft) {
+  return Boolean(
+    draft &&
+      draft.version === LOCAL_DRAFT_VERSION &&
+      draft.session &&
+      Array.isArray(draft.workers) &&
+      Array.isArray(draft.responses) &&
+      Array.isArray(draft.nearMisses)
+  );
+}
+
+function clearLocalDraft(updateStatus = true) {
+  try {
+    localStorage.removeItem(getDraftKey());
+  } catch {
+    // Storage can be unavailable in restricted browser contexts.
+  }
+
+  if (updateStatus) state.draftStatus = 'Local draft cleared';
+}
+
+function loadLocalDraft() {
+  try {
+    const rawDraft = localStorage.getItem(getDraftKey());
+    if (!rawDraft) return null;
+
+    const draft = JSON.parse(rawDraft);
+    if (!isValidLocalDraft(draft)) {
+      clearLocalDraft(false);
+      return null;
+    }
+
+    return draft;
+  } catch {
+    clearLocalDraft(false);
+    return null;
+  }
+}
+
+function hasLocalDraft() {
+  return Boolean(loadLocalDraft());
+}
+
+function saveLocalDraft(status = 'Saved locally') {
+  if (!state.currentUser || state.phase === 'draft-restore' || !state.hazards.length || !state.responses.length) {
+    return;
+  }
+
+  try {
+    localStorage.setItem(getDraftKey(), JSON.stringify(buildLocalDraft()));
+    state.draftStatus = status;
+  } catch {
+    state.draftStatus = 'Local draft unavailable';
+  }
+}
+
+function restoreLocalDraft(draft) {
+  if (!isValidLocalDraft(draft)) {
+    clearLocalDraft();
+    state.pendingDraft = null;
+    state.phase = 'start';
+    return;
+  }
+
+  const safePhase = ['start', 'participation', 'checklist', 'manual-entry', 'summary', 'saved-sessions'].includes(
+    draft.phase
+  )
+    ? draft.phase
+    : 'start';
+
+  state.session = { ...state.session, ...draft.session };
+  state.workers = draft.workers;
+  state.hazards = Array.isArray(draft.hazards) && draft.hazards.length ? draft.hazards : state.hazards;
+  state.responses = draft.responses;
+  state.nearMisses = draft.nearMisses;
+  state.index = Math.max(0, Math.min(state.responses.length - 1, Number(draft.index) || 0));
+  state.phase = safePhase;
+  state.memo = draft.memo ?? currentResponse()?.memo ?? '';
+  state.glassesStep = draft.glassesStep ?? (safePhase === 'checklist' ? 'hazard' : 'start');
+  state.glassesMemoFeedback = draft.glassesMemoFeedback ?? '';
+  state.glassesPhotoFeedback = draft.glassesPhotoFeedback ?? '';
+  state.glassesReviewFeedback = draft.glassesReviewFeedback ?? '';
+  state.saveFeedback = draft.saveFeedback ?? '';
+  state.pendingDraft = null;
+  state.draftStatus = 'Draft restored';
+}
+
+function draftStatusHtml() {
+  return state.draftStatus ? `<p class="draft-status">${escapeHtml(state.draftStatus)}</p>` : '';
 }
 
 async function checkAuth() {
@@ -348,7 +480,14 @@ async function loadHazards() {
     const hazards = await response.json();
     state.hazards = isStressTest ? makeStressHazards(hazards) : hazards;
     state.responses = createResponses(state.hazards);
-    state.phase = 'start';
+    const draft = loadLocalDraft();
+    if (draft) {
+      state.pendingDraft = draft;
+      state.draftStatus = 'Local draft found';
+      state.phase = 'draft-restore';
+    } else {
+      state.phase = 'start';
+    }
   } catch (error) {
     state.phase = 'error';
     state.error = error.message || 'Could not load hazards.json. Check that the frontend server can serve public assets.';
@@ -377,11 +516,13 @@ function makeStressHazards(hazards) {
 
 function saveStartField(name, value) {
   state.session[name] = value.trim();
+  saveLocalDraft();
 }
 
 function startTbm() {
   state.session.startedAt = new Date().toISOString();
   state.phase = 'participation';
+  saveLocalDraft('Pending backend save');
   render();
 }
 
@@ -396,11 +537,13 @@ function addWorker(name) {
     present: true,
     acknowledged: true
   });
+  saveLocalDraft();
   render();
 }
 
 function removeWorker(id) {
   state.workers = state.workers.filter((worker) => worker.id !== id);
+  saveLocalDraft();
   render();
 }
 
@@ -409,11 +552,13 @@ function setWorkerPresent(id, present) {
   if (worker) {
     worker.present = present;
     worker.acknowledged = present;
+    saveLocalDraft();
   }
 }
 
 function markAllPresent() {
   state.workers = state.workers.map((worker) => ({ ...worker, present: true, acknowledged: true }));
+  saveLocalDraft();
   render();
 }
 
@@ -421,12 +566,14 @@ function continueToChecklist() {
   state.phase = 'checklist';
   state.index = 0;
   state.memo = currentResponse()?.memo ?? '';
+  saveLocalDraft();
   render();
 }
 
 function saveMemo(value) {
   state.memo = value;
   currentResponse().memo = value.trim();
+  saveLocalDraft();
 }
 
 function goTo(index) {
@@ -434,6 +581,7 @@ function goTo(index) {
 
   state.index = Math.max(0, Math.min(state.hazards.length - 1, index));
   state.memo = currentResponse().memo;
+  saveLocalDraft();
   render();
 }
 
@@ -460,8 +608,18 @@ function setStatus(status) {
     state.memo = currentResponse().memo;
   }
 
+  saveLocalDraft();
   render();
 }
+
+// ---------------------------------------------------------------------------
+// Glasses HUD Mode helpers
+// ---------------------------------------------------------------------------
+// Future Meta Web Apps integration points:
+// - Replace getMockEvidencePhoto/captureGlassesPhoto with camera/photo capture.
+// - Replace captureGlassesMemo with voice memo or speech-to-text capture.
+// - Add phone GPS / site-location APIs near session startup when available.
+// - Add local offline storage around shared session state before backend sync.
 
 function getMockEvidencePhoto() {
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="320" height="180" viewBox="0 0 320 180"><rect width="320" height="180" fill="#f2f4f6"/><rect x="22" y="22" width="276" height="136" rx="14" fill="#fff" stroke="#c7ccd3" stroke-width="4"/><circle cx="82" cy="78" r="22" fill="#ff4438" opacity=".88"/><path d="M54 136l62-48 44 34 36-28 70 42H54z" fill="#6f7782" opacity=".72"/><text x="160" y="162" text-anchor="middle" font-family="Arial" font-size="16" fill="#1f252c">Mock evidence</text></svg>`;
@@ -480,11 +638,13 @@ function getMockEvidencePhoto() {
 function captureGlassesMemo() {
   if (!currentResponse()) return;
 
+  // Future voice memo / speech-to-text hook: replace this fixed memo with transcript text.
   const memo = 'Voice memo captured: supervisor requested follow-up before restart.';
   state.memo = memo;
   currentResponse().memo = memo;
   state.glassesMemoFeedback = memo;
   state.glassesStep = 'memo';
+  saveLocalDraft();
   render();
 }
 
@@ -492,17 +652,21 @@ function captureGlassesPhoto() {
   const response = currentResponse();
   if (!response) return;
 
+  // Future camera/photo hook: replace this mock placeholder with device capture metadata.
   response.evidencePhotos = [...(response.evidencePhotos ?? []), getMockEvidencePhoto()];
   response.updatedAt = new Date().toISOString();
   state.glassesPhotoFeedback = 'Mock photo evidence captured for this hazard.';
   state.glassesStep = 'photo';
+  saveLocalDraft();
   render();
 }
 
 function startGlassesTbm() {
+  // Future phone GPS / site location hook can update state.session.gps here.
   if (!state.session.startedAt) state.session.startedAt = new Date().toISOString();
   state.phase = 'participation';
   state.glassesStep = 'workers';
+  saveLocalDraft('Pending backend save');
   render();
 }
 
@@ -512,17 +676,20 @@ function continueGlassesFromWorkers() {
   state.index = 0;
   state.memo = currentResponse()?.memo ?? '';
   state.glassesStep = 'hazard';
+  saveLocalDraft();
   render();
 }
 
 function continueGlassesReview() {
   if (state.phase === 'summary' || state.glassesStep === 'summary') {
     state.glassesStep = 'summary';
+    saveLocalDraft();
     render();
     return;
   }
 
   state.glassesStep = 'hazard';
+  saveLocalDraft();
   render();
 }
 
@@ -533,6 +700,8 @@ function exitGlassesMode() {
 }
 
 function handleGlassesAction(action) {
+  // This action router is the portability seam for future Neural Band gestures.
+  // Browser keyboard/buttons call it today; hardware input should call the same actions.
   if (action === 'exit') {
     exitGlassesMode();
     return;
@@ -562,6 +731,7 @@ function handleGlassesAction(action) {
     if (state.glassesStep !== 'hazard') return;
     if (state.phase !== 'checklist') state.phase = 'checklist';
     state.glassesStep = 'hazard';
+    state.glassesReviewFeedback = `Saved: Hazard ${state.index + 1} Confirmed.`;
     setStatus('Confirmed');
     return;
   }
@@ -570,11 +740,13 @@ function handleGlassesAction(action) {
     if (state.glassesStep !== 'hazard') return;
     if (state.phase !== 'checklist') state.phase = 'checklist';
     state.glassesStep = 'hazard';
+    state.glassesReviewFeedback = `Saved: Hazard ${state.index + 1} Fix Ordered.`;
     setStatus('Fix Ordered');
     return;
   }
 
   if (action === 'save-session') {
+    // Future offline-first sync hook: queue locally first, then call backend save.
     saveCurrentSession();
     return;
   }
@@ -596,6 +768,7 @@ function handleGlassesAction(action) {
       state.phase = 'checklist';
       state.glassesStep = 'hazard';
     }
+    saveLocalDraft();
     render();
   }
 }
@@ -910,6 +1083,7 @@ async function saveManualEntry(form) {
   state.manualAiSuggestion = null;
   state.manualAiDecision = null;
   state.phase = state.returnPhase;
+  saveLocalDraft();
   render();
 }
 
@@ -1072,6 +1246,8 @@ async function saveCurrentSession() {
 
     state.saveFeedback = 'Session saved locally.';
     await loadSavedSessions({ silent: true });
+    clearLocalDraft(false);
+    state.draftStatus = 'Backend saved';
   } catch (error) {
     state.saveFeedback = getApiErrorMessage(error, 'Save session failed.');
   } finally {
@@ -1307,6 +1483,49 @@ function renderError() {
   bindButtons();
 }
 
+function renderDraftRestore() {
+  const draft = state.pendingDraft;
+  const savedAt = draft?.savedAt ? formatDateTime(new Date(draft.savedAt)) : 'Recently';
+  const siteName = draft?.session?.siteName ?? state.session.siteName;
+  const phaseLabel = draft?.phase ? draft.phase.replace('-', ' ') : 'in-progress TBM';
+
+  app.innerHTML = `
+    <section class="v2-screen">
+      ${v2Header('Local Draft')}
+      <section class="v2-card v2-draft-card" aria-label="Local draft found">
+        <div class="v2-screen-intro">
+          <div class="v2-warning-tile">↻</div>
+          <div>
+            <h2>Local draft found</h2>
+            <p>A saved browser draft is available for this active TBM session.</p>
+          </div>
+        </div>
+        <dl class="v2-draft-meta">
+          <div>
+            <dt>Site</dt>
+            <dd>${escapeHtml(siteName)}</dd>
+          </div>
+          <div>
+            <dt>Last saved</dt>
+            <dd>${escapeHtml(savedAt)}</dd>
+          </div>
+          <div>
+            <dt>Screen</dt>
+            <dd>${escapeHtml(phaseLabel)}</dd>
+          </div>
+        </dl>
+        ${draftStatusHtml()}
+      </section>
+      <section class="v2-action-row">
+        <button class="focusable v2-key-button" data-action="discard-draft">Start New</button>
+        <button class="focusable v2-key-button v2-key-primary" data-action="restore-draft">Restore Draft</button>
+      </section>
+    </section>
+  `;
+
+  bindButtons();
+}
+
 function renderStart() {
   app.innerHTML = `
     <section class="v2-screen">
@@ -1320,6 +1539,7 @@ function renderStart() {
           </div>
         </div>
         ${buildUserBadge()}
+        ${draftStatusHtml()}
         <div class="v2-form-grid">
           <label class="v2-field-row">
             ${v2Icon('site')}
@@ -1364,6 +1584,7 @@ function renderParticipation() {
           <h2>Worker Attendance</h2>
           <p>Add workers below and mark who is present for this briefing.</p>
         </div>
+        ${draftStatusHtml()}
 
         <form class="v2-add-worker" id="add-worker-form">
           <div class="v2-input-with-icon">
@@ -1533,6 +1754,12 @@ function renderManualEntry() {
   bindButtons();
 }
 
+// ---------------------------------------------------------------------------
+// Glasses HUD Mode rendering
+// ---------------------------------------------------------------------------
+// Keep this path plain HTML/CSS/JS and one-card-at-a-time so it remains easy
+// to port to Meta Web Apps or another wearable runtime later.
+
 function renderGlassesActions(actions) {
   return `
     <section class="glasses-actions">
@@ -1620,6 +1847,7 @@ function renderGlasses() {
     body = `
       <p class="glasses-kicker">TBM Complete</p>
       <h1>Summary</h1>
+      ${state.glassesReviewFeedback ? `<p class="glasses-toast">${escapeHtml(state.glassesReviewFeedback)}</p>` : ''}
       <section class="glasses-stats" aria-label="Glasses summary counts">
         <div><strong>${confirmed}</strong><span>Confirmed</span></div>
         <div><strong>${fixOrdered}</strong><span>Fix Ordered</span></div>
@@ -1636,6 +1864,7 @@ function renderGlasses() {
     body = `
       <p class="glasses-kicker">Hazard ${state.index + 1} / ${state.hazards.length}</p>
       <h1>${escapeHtml(hazard?.name ?? 'No hazard')}</h1>
+      ${state.glassesReviewFeedback ? `<p class="glasses-toast">${escapeHtml(state.glassesReviewFeedback)}</p>` : ''}
       <dl class="glasses-hazard-facts">
         <div><dt>Location</dt><dd>${escapeHtml(hazard?.location ?? '')}</dd></div>
         <div><dt>Risk</dt><dd>${escapeHtml(hazard?.riskLevel ?? 'medium')}</dd></div>
@@ -1661,7 +1890,10 @@ function renderGlasses() {
         ${body}
       </main>
       ${renderGlassesActions(actions)}
-      <footer class="glasses-shortcuts">←/→ Navigate · Enter Continue · Esc Exit</footer>
+      <footer class="glasses-shortcuts">
+        ${draftStatusHtml()}
+        <span>←/→ Navigate · Enter Continue · Esc Exit</span>
+      </footer>
     </section>
   `;
 
@@ -1706,6 +1938,7 @@ function renderChecklist() {
         <textarea id="memo" class="v2-textarea focusable" rows="2" maxlength="220" placeholder="Add notes, details, or follow-up actions...">${escapeHtml(
         state.memo
       )}</textarea>
+        ${draftStatusHtml()}
       </section>
 
       <section class="v2-action-row" aria-label="Checklist actions">
@@ -1764,6 +1997,7 @@ function renderSummary() {
         </section>
       </section>
       ${state.saveFeedback ? `<p class="save-feedback">${escapeHtml(state.saveFeedback)}</p>` : ''}
+      ${draftStatusHtml()}
       <div class="v2-action-grid">
         <button class="focusable v2-key-button v2-key-primary" data-action="review">Review</button>
         <button class="focusable v2-key-button" data-action="log-new">＋ Log New Hazard</button>
@@ -1862,6 +2096,16 @@ function bindButtons() {
         state.authFeedback = '';
         render();
       }
+      if (action === 'restore-draft') {
+        restoreLocalDraft(state.pendingDraft || loadLocalDraft());
+        render();
+      }
+      if (action === 'discard-draft') {
+        clearLocalDraft();
+        state.pendingDraft = null;
+        state.phase = 'start';
+        render();
+      }
       if (action === 'logout') logout();
       if (action === 'retry') loadHazards();
       if (action === 'start') startTbm();
@@ -1891,7 +2135,14 @@ function render() {
   if (state.phase === 'auth') renderAuth();
   if (state.phase === 'loading') renderLoading();
   if (state.phase === 'error') renderError();
-  if (isGlassesMode && state.currentUser && state.hazards.length && !['auth-check', 'auth', 'loading', 'error'].includes(state.phase)) {
+  if (state.phase === 'draft-restore') renderDraftRestore();
+  // Glasses mode reuses auth/loading/error screens, then swaps only the authenticated TBM workflow.
+  if (
+    isGlassesMode &&
+    state.currentUser &&
+    state.hazards.length &&
+    !['auth-check', 'auth', 'loading', 'error', 'draft-restore'].includes(state.phase)
+  ) {
     renderGlasses();
     return;
   }
@@ -1906,6 +2157,14 @@ function render() {
 window.addEventListener('keydown', (event) => {
   if (event.target.matches('input, textarea')) return;
   if (isGlassesMode && state.currentUser && state.hazards.length) {
+    // Browser keyboard mapping for future wearable gestures:
+    // ArrowRight / Enter -> next, select, or pinch confirm
+    // ArrowLeft -> previous or back gesture
+    // 1 -> confirm hazard
+    // 2 -> fix ordered
+    // M -> voice memo
+    // P -> photo capture
+    // Escape -> exit glasses mode
     if (event.key === 'ArrowRight') handleGlassesAction('next');
     if (event.key === 'ArrowLeft') handleGlassesAction('prev');
     if (event.key === '1') handleGlassesAction('confirmed');

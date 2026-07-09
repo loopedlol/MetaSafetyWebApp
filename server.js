@@ -210,14 +210,16 @@ function renderEvidencePhotos(item) {
   return `
     <div class="photo-grid">
       ${photos
-        .map(
-          (photo, index) => `
+        .map((photo, index) => {
+          const isMockEvidence = photo.source === 'glasses_mock_capture' || String(photo.url ?? '').startsWith('data:');
+          const mockLabel = isMockEvidence ? ' (Glasses HUD mock evidence)' : '';
+          return `
             <figure>
               <img src="${escapeHtml(photo.url)}" alt="${formatReportValue(photo.originalName ?? `Evidence ${index + 1}`)}" />
-              <figcaption>${formatReportValue(photo.originalName ?? `사진 ${index + 1}`)}</figcaption>
+              <figcaption>${formatReportValue(photo.originalName ?? `사진 ${index + 1}`)}${mockLabel}</figcaption>
             </figure>
-          `
-        )
+          `;
+        })
         .join('')}
     </div>
   `;

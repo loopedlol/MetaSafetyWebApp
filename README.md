@@ -74,6 +74,39 @@ npm run dev:all
 
 This starts the Express backend and Vite frontend together and stops both when the command is interrupted.
 
+## Glasses HUD Mode
+
+Safety Lens includes a simplified wearable preview for Meta Display-style HUD workflows. It keeps the same auth, session, hazard, save, and report data model as the normal browser dashboard, but presents the TBM flow as one large card at a time.
+
+Open it while the dev server is running:
+
+```text
+http://localhost:5173/?mode=glasses
+```
+
+Glasses HUD Mode is intended for:
+
+- Meta Display / smart-glasses TBM walkthrough demos.
+- Gesture-first hazard review with minimal controls.
+- Validating the shared session/report pipeline from a wearable-style UI.
+
+Keyboard controls currently stand in for future wearable gestures:
+
+- `ArrowRight` or `Enter`: next / select / future pinch confirm.
+- `ArrowLeft`: previous / future back gesture.
+- `1`: mark hazard Confirmed.
+- `2`: mark hazard Fix Ordered.
+- `M`: capture mock voice memo.
+- `P`: capture mock photo evidence.
+- `Escape`: exit glasses mode.
+
+Mock behavior in glasses mode:
+
+- Voice memo is a fixed prototype transcript, not real speech-to-text.
+- Photo evidence is a mock inline image placeholder, not a real camera capture.
+- Save still uses the existing backend session endpoint.
+- Actual Meta SDK, Neural Band, camera, sensor, GPS, and offline-storage integration are future work.
+
 ## Build
 
 ```bash

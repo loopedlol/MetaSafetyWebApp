@@ -1053,6 +1053,59 @@ span {
 
 .save-feedback:empty { display: none; }
 
+.draft-status {
+  width: fit-content;
+  max-width: 100%;
+  margin: 0;
+  padding: 6px 10px;
+  border: 1px solid rgba(49, 185, 111, 0.24);
+  border-radius: 999px;
+  background: #f0faf4;
+  color: #23744c;
+  font-size: 11px;
+  font-weight: 950;
+  line-height: 1.15;
+}
+
+.v2-draft-card {
+  align-content: start;
+  gap: 18px;
+  padding: 20px;
+}
+
+.v2-draft-meta {
+  margin: 0;
+  display: grid;
+  gap: 10px;
+}
+
+.v2-draft-meta div {
+  display: grid;
+  grid-template-columns: 92px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid var(--v2-line);
+  border-radius: var(--v2-radius-md);
+  background: #fbfcfd;
+}
+
+.v2-draft-meta dt {
+  color: var(--v2-muted);
+  font-size: 10px;
+  font-weight: 950;
+  text-transform: uppercase;
+}
+
+.v2-draft-meta dd {
+  min-width: 0;
+  margin: 0;
+  color: var(--v2-text);
+  font-size: 13px;
+  font-weight: 900;
+  line-height: 1.25;
+}
+
 .v2-saved-card {
   padding: 16px;
   display: grid;
@@ -1212,11 +1265,35 @@ span {
   font-weight: 750;
 }
 
+.glasses-shortcuts {
+  display: grid;
+  justify-items: center;
+  gap: 6px;
+}
+
+.glasses-shortcuts .draft-status {
+  justify-self: center;
+}
+
 .glasses-hint {
   color: #3f4852;
   font-size: 15px;
   font-weight: 950;
   text-transform: uppercase;
+}
+
+.glasses-toast {
+  width: fit-content;
+  max-width: 100%;
+  margin: 0;
+  padding: 10px 14px;
+  border: 1px solid rgba(49, 185, 111, 0.34);
+  border-radius: 999px;
+  background: #effaf3;
+  color: #1b7f4b;
+  font-size: 16px;
+  line-height: 1.2;
+  font-weight: 950;
 }
 
 .glasses-hazard-facts {
