@@ -1,5 +1,9 @@
 import './styles.css';
 
+// ---------------------------------------------------------------------------
+// Constants / config
+// ---------------------------------------------------------------------------
+
 const SCHEMA_VERSION = '1.0.0';
 const APP_VERSION = '0.1.0';
 
@@ -10,6 +14,28 @@ const isStressTest = new URLSearchParams(window.location.search).has('stress');
 // Glasses HUD Mode is a browser preview for a future Meta Display / wearable app.
 const isGlassesMode = new URLSearchParams(window.location.search).get('mode') === 'glasses';
 const LOCAL_DRAFT_VERSION = 1;
+const HAZARD_REVIEW_STATUS = {
+  CONFIRMED: 'Confirmed',
+  FIX_ORDERED: 'Fix Ordered'
+};
+const EXPORTED_HAZARD_STATUS = {
+  CONFIRMED: 'confirmed',
+  FIX_ORDERED: 'fix_ordered',
+  NOT_CHECKED: 'not_checked'
+};
+const DRAFT_STATUS_TEXT = {
+  CLEARED: 'Browser draft cleared',
+  SAVED: 'Draft saved in this browser',
+  UNAVAILABLE: 'Local draft unavailable',
+  RESTORED: 'Draft restored from this browser',
+  FOUND: 'Browser draft found',
+  PENDING_BACKEND: 'Draft pending backend save',
+  BACKEND_SAVED: 'Backend saved - browser draft cleared'
+};
+
+// ---------------------------------------------------------------------------
+// App state
+// ---------------------------------------------------------------------------
 
 const state = {
   phase: 'auth-check',
@@ -76,6 +102,10 @@ const state = {
 
 const app = document.querySelector('#app');
 
+// ---------------------------------------------------------------------------
+// Utility helpers
+// ---------------------------------------------------------------------------
+
 async function apiFetch(url, options = {}) {
   const response = await fetch(url, options);
   if (response.status === 401) {
@@ -118,6 +148,10 @@ function getApiErrorMessage(error, fallback) {
 
   return error.message || fallback;
 }
+
+// ---------------------------------------------------------------------------
+// Icon helpers
+// ---------------------------------------------------------------------------
 
 const iconPaths = {
   info: '<circle cx="12" cy="12" r="9"></circle><path d="M12 11v5"></path><path d="M12 8h.01"></path>',
@@ -176,7 +210,7 @@ function v2WorkflowProgress(step) {
 }
 
 function v2ChecklistProgress() {
-  return v2Progress(state.index + 1, state.hazards.length, 'Hazards', 'checklist');
+  return v2Progress(getCurrentHazardNumber(), state.hazards.length, 'Hazards', 'checklist');
 }
 
 function v2Header(title, progressHtml = '') {
@@ -213,127 +247,8 @@ function buildUserBadge() {
 }
 
 // ---------------------------------------------------------------------------
-// Offline-first local draft helpers
+// Auth flow
 // ---------------------------------------------------------------------------
-// This stores only the active TBM work state. Auth cookies, passwords,
-// registration keys, and login form values are intentionally never persisted.
-// Future backend sync/offline queue work can build on this layer without
-// replacing the existing /api/sessions save path.
-
-function getDraftKey() {
-  return 'safety-lens-active-draft-v1';
-}
-
-function buildLocalDraft() {
-  return {
-    version: LOCAL_DRAFT_VERSION,
-    savedAt: new Date().toISOString(),
-    phase: state.phase,
-    index: state.index,
-    memo: state.memo,
-    session: state.session,
-    workers: state.workers,
-    hazards: state.hazards,
-    responses: state.responses,
-    nearMisses: state.nearMisses,
-    glassesStep: state.glassesStep,
-    glassesMemoFeedback: state.glassesMemoFeedback,
-    glassesPhotoFeedback: state.glassesPhotoFeedback,
-    glassesReviewFeedback: state.glassesReviewFeedback,
-    saveFeedback: state.saveFeedback
-  };
-}
-
-function isValidLocalDraft(draft) {
-  return Boolean(
-    draft &&
-      draft.version === LOCAL_DRAFT_VERSION &&
-      draft.session &&
-      Array.isArray(draft.workers) &&
-      Array.isArray(draft.responses) &&
-      Array.isArray(draft.nearMisses)
-  );
-}
-
-function clearLocalDraft(updateStatus = true) {
-  try {
-    localStorage.removeItem(getDraftKey());
-  } catch {
-    // Storage can be unavailable in restricted browser contexts.
-  }
-
-  if (updateStatus) state.draftStatus = 'Local draft cleared';
-}
-
-function loadLocalDraft() {
-  try {
-    const rawDraft = localStorage.getItem(getDraftKey());
-    if (!rawDraft) return null;
-
-    const draft = JSON.parse(rawDraft);
-    if (!isValidLocalDraft(draft)) {
-      clearLocalDraft(false);
-      return null;
-    }
-
-    return draft;
-  } catch {
-    clearLocalDraft(false);
-    return null;
-  }
-}
-
-function hasLocalDraft() {
-  return Boolean(loadLocalDraft());
-}
-
-function saveLocalDraft(status = 'Saved locally') {
-  if (!state.currentUser || state.phase === 'draft-restore' || !state.hazards.length || !state.responses.length) {
-    return;
-  }
-
-  try {
-    localStorage.setItem(getDraftKey(), JSON.stringify(buildLocalDraft()));
-    state.draftStatus = status;
-  } catch {
-    state.draftStatus = 'Local draft unavailable';
-  }
-}
-
-function restoreLocalDraft(draft) {
-  if (!isValidLocalDraft(draft)) {
-    clearLocalDraft();
-    state.pendingDraft = null;
-    state.phase = 'start';
-    return;
-  }
-
-  const safePhase = ['start', 'participation', 'checklist', 'manual-entry', 'summary', 'saved-sessions'].includes(
-    draft.phase
-  )
-    ? draft.phase
-    : 'start';
-
-  state.session = { ...state.session, ...draft.session };
-  state.workers = draft.workers;
-  state.hazards = Array.isArray(draft.hazards) && draft.hazards.length ? draft.hazards : state.hazards;
-  state.responses = draft.responses;
-  state.nearMisses = draft.nearMisses;
-  state.index = Math.max(0, Math.min(state.responses.length - 1, Number(draft.index) || 0));
-  state.phase = safePhase;
-  state.memo = draft.memo ?? currentResponse()?.memo ?? '';
-  state.glassesStep = draft.glassesStep ?? (safePhase === 'checklist' ? 'hazard' : 'start');
-  state.glassesMemoFeedback = draft.glassesMemoFeedback ?? '';
-  state.glassesPhotoFeedback = draft.glassesPhotoFeedback ?? '';
-  state.glassesReviewFeedback = draft.glassesReviewFeedback ?? '';
-  state.saveFeedback = draft.saveFeedback ?? '';
-  state.pendingDraft = null;
-  state.draftStatus = 'Draft restored';
-}
-
-function draftStatusHtml() {
-  return state.draftStatus ? `<p class="draft-status">${escapeHtml(state.draftStatus)}</p>` : '';
-}
 
 async function checkAuth() {
   state.phase = 'auth-check';
@@ -415,6 +330,133 @@ async function logout() {
   render();
 }
 
+// ---------------------------------------------------------------------------
+// Offline-first local draft helpers
+// ---------------------------------------------------------------------------
+// This stores only the active TBM work state. Auth cookies, passwords,
+// registration keys, and login form values are intentionally never persisted.
+// Future backend sync/offline queue work can build on this layer without
+// replacing the existing /api/sessions save path.
+
+function getDraftKey() {
+  return 'safety-lens-active-draft-v1';
+}
+
+function buildLocalDraft() {
+  return {
+    version: LOCAL_DRAFT_VERSION,
+    savedAt: new Date().toISOString(),
+    phase: state.phase,
+    index: state.index,
+    memo: state.memo,
+    session: state.session,
+    workers: state.workers,
+    hazards: state.hazards,
+    responses: state.responses,
+    nearMisses: state.nearMisses,
+    glassesStep: state.glassesStep,
+    glassesMemoFeedback: state.glassesMemoFeedback,
+    glassesPhotoFeedback: state.glassesPhotoFeedback,
+    glassesReviewFeedback: state.glassesReviewFeedback,
+    saveFeedback: state.saveFeedback
+  };
+}
+
+function isValidLocalDraft(draft) {
+  return Boolean(
+    draft &&
+      draft.version === LOCAL_DRAFT_VERSION &&
+      draft.session &&
+      Array.isArray(draft.workers) &&
+      Array.isArray(draft.responses) &&
+      Array.isArray(draft.nearMisses)
+  );
+}
+
+function clearLocalDraft(updateStatus = true) {
+  try {
+    localStorage.removeItem(getDraftKey());
+  } catch {
+    // Storage can be unavailable in restricted browser contexts.
+  }
+
+  if (updateStatus) state.draftStatus = DRAFT_STATUS_TEXT.CLEARED;
+}
+
+function loadLocalDraft() {
+  try {
+    const rawDraft = localStorage.getItem(getDraftKey());
+    if (!rawDraft) return null;
+
+    const draft = JSON.parse(rawDraft);
+    if (!isValidLocalDraft(draft)) {
+      clearLocalDraft(false);
+      return null;
+    }
+
+    return draft;
+  } catch {
+    clearLocalDraft(false);
+    return null;
+  }
+}
+
+function hasLocalDraft() {
+  return Boolean(loadLocalDraft());
+}
+
+function saveLocalDraft(status = DRAFT_STATUS_TEXT.SAVED) {
+  if (!state.currentUser || state.phase === 'draft-restore' || !state.hazards.length || !state.responses.length) {
+    return;
+  }
+
+  try {
+    localStorage.setItem(getDraftKey(), JSON.stringify(buildLocalDraft()));
+    state.draftStatus = status;
+  } catch {
+    state.draftStatus = DRAFT_STATUS_TEXT.UNAVAILABLE;
+  }
+}
+
+function restoreLocalDraft(draft) {
+  if (!isValidLocalDraft(draft)) {
+    clearLocalDraft();
+    state.pendingDraft = null;
+    state.phase = 'start';
+    return;
+  }
+
+  const safePhase = ['start', 'participation', 'checklist', 'manual-entry', 'summary', 'saved-sessions'].includes(
+    draft.phase
+  )
+    ? draft.phase
+    : 'start';
+
+  state.session = { ...state.session, ...draft.session };
+  state.workers = draft.workers;
+  state.hazards = Array.isArray(draft.hazards) && draft.hazards.length ? draft.hazards : state.hazards;
+  state.responses = draft.responses;
+  state.nearMisses = draft.nearMisses;
+  state.index = Math.max(0, Math.min(state.responses.length - 1, Number(draft.index) || 0));
+  state.phase = safePhase;
+  state.memo = draft.memo ?? currentResponse()?.memo ?? '';
+  state.glassesStep = draft.glassesStep ?? (safePhase === 'checklist' ? 'hazard' : 'start');
+  state.glassesMemoFeedback = draft.glassesMemoFeedback ?? '';
+  state.glassesPhotoFeedback = draft.glassesPhotoFeedback ?? '';
+  state.glassesReviewFeedback = draft.glassesReviewFeedback ?? '';
+  state.saveFeedback = draft.saveFeedback ?? '';
+  state.pendingDraft = null;
+  state.draftStatus = DRAFT_STATUS_TEXT.RESTORED;
+}
+
+function draftStatusHtml() {
+  return state.draftStatus ? `<p class="draft-status">${escapeHtml(state.draftStatus)}</p>` : '';
+}
+
+// ---------------------------------------------------------------------------
+// Hazard / session helpers
+// ---------------------------------------------------------------------------
+
 function currentHazard() {
   return state.hazards[state.index];
 }
@@ -439,7 +481,7 @@ function createResponses(hazards) {
     updatedAt: null,
     humanReview: {
       reviewed: false,
-      decision: 'not_checked',
+      decision: EXPORTED_HAZARD_STATUS.NOT_CHECKED,
       reviewedBy: null,
       reviewedAt: null
     }
@@ -463,7 +505,7 @@ function createManualHazardResponse(entry) {
     updatedAt: null,
     humanReview: {
       reviewed: false,
-      decision: 'not_checked',
+      decision: EXPORTED_HAZARD_STATUS.NOT_CHECKED,
       reviewedBy: null,
       reviewedAt: null
     }
@@ -483,7 +525,7 @@ async function loadHazards() {
     const draft = loadLocalDraft();
     if (draft) {
       state.pendingDraft = draft;
-      state.draftStatus = 'Local draft found';
+      state.draftStatus = DRAFT_STATUS_TEXT.FOUND;
       state.phase = 'draft-restore';
     } else {
       state.phase = 'start';
@@ -514,6 +556,10 @@ function makeStressHazards(hazards) {
   ];
 }
 
+// ---------------------------------------------------------------------------
+// Normal dashboard actions
+// ---------------------------------------------------------------------------
+
 function saveStartField(name, value) {
   state.session[name] = value.trim();
   saveLocalDraft();
@@ -522,7 +568,7 @@ function saveStartField(name, value) {
 function startTbm() {
   state.session.startedAt = new Date().toISOString();
   state.phase = 'participation';
-  saveLocalDraft('Pending backend save');
+  saveLocalDraft(DRAFT_STATUS_TEXT.PENDING_BACKEND);
   render();
 }
 
@@ -595,7 +641,7 @@ function setStatus(status) {
   response.updatedAt = reviewedAt;
   response.humanReview = {
     reviewed: true,
-    decision: status === 'Fix Ordered' ? 'fix_ordered' : 'accepted',
+    decision: status === HAZARD_REVIEW_STATUS.FIX_ORDERED ? EXPORTED_HAZARD_STATUS.FIX_ORDERED : 'accepted',
     reviewedBy: state.session.supervisorName,
     reviewedAt
   };
@@ -613,8 +659,10 @@ function setStatus(status) {
 }
 
 // ---------------------------------------------------------------------------
-// Glasses HUD Mode helpers
+// Glasses HUD actions
 // ---------------------------------------------------------------------------
+// Glasses mode shares the same session, response, draft, save, and report model
+// as the normal dashboard; only the interaction layer is different.
 // Future Meta Web Apps integration points:
 // - Replace getMockEvidencePhoto/captureGlassesPhoto with camera/photo capture.
 // - Replace captureGlassesMemo with voice memo or speech-to-text capture.
@@ -626,7 +674,7 @@ function getMockEvidencePhoto() {
 
   return {
     uploadId: crypto.randomUUID(),
-    originalName: `glasses_mock_evidence_${state.index + 1}.svg`,
+    originalName: `glasses_mock_evidence_${getCurrentHazardNumber()}.svg`,
     size: svg.length,
     mimetype: 'image/svg+xml',
     url: `data:image/svg+xml,${encodeURIComponent(svg)}`,
@@ -666,7 +714,7 @@ function startGlassesTbm() {
   if (!state.session.startedAt) state.session.startedAt = new Date().toISOString();
   state.phase = 'participation';
   state.glassesStep = 'workers';
-  saveLocalDraft('Pending backend save');
+  saveLocalDraft(DRAFT_STATUS_TEXT.PENDING_BACKEND);
   render();
 }
 
@@ -731,8 +779,8 @@ function handleGlassesAction(action) {
     if (state.glassesStep !== 'hazard') return;
     if (state.phase !== 'checklist') state.phase = 'checklist';
     state.glassesStep = 'hazard';
-    state.glassesReviewFeedback = `Saved: Hazard ${state.index + 1} Confirmed.`;
-    setStatus('Confirmed');
+    state.glassesReviewFeedback = `Saved: Hazard ${getCurrentHazardNumber()} Confirmed.`;
+    setStatus(HAZARD_REVIEW_STATUS.CONFIRMED);
     return;
   }
 
@@ -740,8 +788,8 @@ function handleGlassesAction(action) {
     if (state.glassesStep !== 'hazard') return;
     if (state.phase !== 'checklist') state.phase = 'checklist';
     state.glassesStep = 'hazard';
-    state.glassesReviewFeedback = `Saved: Hazard ${state.index + 1} Fix Ordered.`;
-    setStatus('Fix Ordered');
+    state.glassesReviewFeedback = `Saved: Hazard ${getCurrentHazardNumber()} Fix Ordered.`;
+    setStatus(HAZARD_REVIEW_STATUS.FIX_ORDERED);
     return;
   }
 
@@ -773,14 +821,50 @@ function handleGlassesAction(action) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Session export and saved-session helpers
+// ---------------------------------------------------------------------------
+
 function toExportHazardStatus(status) {
-  if (status === 'Confirmed') return 'confirmed';
-  if (status === 'Fix Ordered') return 'fix_ordered';
-  return 'not_checked';
+  if (status === HAZARD_REVIEW_STATUS.CONFIRMED) return EXPORTED_HAZARD_STATUS.CONFIRMED;
+  if (status === HAZARD_REVIEW_STATUS.FIX_ORDERED) return EXPORTED_HAZARD_STATUS.FIX_ORDERED;
+  return EXPORTED_HAZARD_STATUS.NOT_CHECKED;
+}
+
+function getHazardStatusGroups(responses = state.responses) {
+  return {
+    confirmed: responses.filter((item) => toExportHazardStatus(item.status) === EXPORTED_HAZARD_STATUS.CONFIRMED),
+    fixOrdered: responses.filter((item) => toExportHazardStatus(item.status) === EXPORTED_HAZARD_STATUS.FIX_ORDERED),
+    unchecked: responses.filter((item) => toExportHazardStatus(item.status) === EXPORTED_HAZARD_STATUS.NOT_CHECKED)
+  };
+}
+
+function getHazardReviewCounts(responses = state.responses) {
+  const groups = getHazardStatusGroups(responses);
+
+  return {
+    confirmed: groups.confirmed.length,
+    fixOrdered: groups.fixOrdered.length,
+    unchecked: groups.unchecked.length
+  };
+}
+
+function getChecklistStatusTone(status) {
+  if (status === HAZARD_REVIEW_STATUS.CONFIRMED) return 'success';
+  if (status === HAZARD_REVIEW_STATUS.FIX_ORDERED) return 'warning';
+  return 'neutral';
+}
+
+function getCurrentHazardNumber() {
+  return state.index + 1;
+}
+
+function getHazardProgressText() {
+  return `Hazard ${getCurrentHazardNumber()} / ${state.hazards.length}`;
 }
 
 function getSessionStatus() {
-  const hasUncheckedHazard = state.responses.some((item) => toExportHazardStatus(item.status) === 'not_checked');
+  const hasUncheckedHazard = getHazardStatusGroups().unchecked.length > 0;
 
   if (state.phase === 'summary' && !hasUncheckedHazard) return 'completed';
   if (state.phase === 'summary' && hasUncheckedHazard) return 'incomplete';
@@ -790,10 +874,10 @@ function getSessionStatus() {
 function getHumanReview(item) {
   const hazardStatus = toExportHazardStatus(item.status);
 
-  if (hazardStatus === 'not_checked') {
+  if (hazardStatus === EXPORTED_HAZARD_STATUS.NOT_CHECKED) {
     return {
       reviewed: false,
-      decision: 'not_checked',
+      decision: EXPORTED_HAZARD_STATUS.NOT_CHECKED,
       reviewedBy: null,
       reviewedAt: null
     };
@@ -801,14 +885,14 @@ function getHumanReview(item) {
 
   return {
     reviewed: true,
-    decision: hazardStatus === 'fix_ordered' ? 'fix_ordered' : 'accepted',
+    decision: hazardStatus === EXPORTED_HAZARD_STATUS.FIX_ORDERED ? EXPORTED_HAZARD_STATUS.FIX_ORDERED : 'accepted',
     reviewedBy: state.session.supervisorName,
     reviewedAt: item.humanReview.reviewedAt
   };
 }
 
 function getCorrectiveAction(item) {
-  const requiresAction = toExportHazardStatus(item.status) === 'fix_ordered';
+  const requiresAction = toExportHazardStatus(item.status) === EXPORTED_HAZARD_STATUS.FIX_ORDERED;
 
   return {
     required: requiresAction,
@@ -818,6 +902,10 @@ function getCorrectiveAction(item) {
     completedAt: null
   };
 }
+
+// ---------------------------------------------------------------------------
+// Manual entry and mock AI helpers
+// ---------------------------------------------------------------------------
 
 function openManualEntry() {
   state.returnPhase = state.phase === 'summary' ? 'summary' : 'checklist';
@@ -963,6 +1051,7 @@ function getManualAiMetadata() {
   if (!state.manualAiSuggestion || !state.manualAiDecision) return null;
   const accepted = state.manualAiDecision === 'accepted';
 
+  // Mock AI metadata is saved only after an explicit human accept/reject step.
   return {
     source: state.manualAiSuggestion.source ?? 'mock_ai',
     accepted,
@@ -1107,9 +1196,7 @@ function formatReportPreviewItem(item, actionText = '') {
 
 function buildKoreanReportHtml() {
   const presentWorkers = state.workers.filter((worker) => worker.present);
-  const confirmed = state.responses.filter((item) => toExportHazardStatus(item.status) === 'confirmed');
-  const fixOrdered = state.responses.filter((item) => toExportHazardStatus(item.status) === 'fix_ordered');
-  const unchecked = state.responses.filter((item) => toExportHazardStatus(item.status) === 'not_checked');
+  const { confirmed, fixOrdered, unchecked } = getHazardStatusGroups();
   const hazardLines = state.responses.map((item) => formatReportPreviewItem(item));
   const nearMissLines = state.nearMisses.map((item) =>
     formatReportPreviewItem(item, item.actionTaken || '조치 내용 미입력')
@@ -1244,10 +1331,10 @@ async function saveCurrentSession() {
       throw new Error(payload.error ?? `Save failed (${response.status})`);
     }
 
-    state.saveFeedback = 'Session saved locally.';
+    state.saveFeedback = 'Session saved to backend. Browser draft cleared.';
     await loadSavedSessions({ silent: true });
     clearLocalDraft(false);
-    state.draftStatus = 'Backend saved';
+    state.draftStatus = DRAFT_STATUS_TEXT.BACKEND_SAVED;
   } catch (error) {
     state.saveFeedback = getApiErrorMessage(error, 'Save session failed.');
   } finally {
@@ -1349,6 +1436,10 @@ function buildSessionLog() {
     device: state.session.device
   };
 }
+
+// ---------------------------------------------------------------------------
+// Render functions
+// ---------------------------------------------------------------------------
 
 function renderAuthChecking() {
   app.innerHTML = `
@@ -1786,9 +1877,7 @@ function renderGlasses() {
   if (state.phase === 'summary') state.glassesStep = 'summary';
 
   const presentCount = state.workers.filter((worker) => worker.present).length;
-  const confirmed = state.responses.filter((item) => item.status === 'Confirmed').length;
-  const fixOrdered = state.responses.filter((item) => item.status === 'Fix Ordered').length;
-  const unchecked = state.responses.filter((item) => toExportHazardStatus(item.status) === 'not_checked').length;
+  const { confirmed, fixOrdered, unchecked } = getHazardReviewCounts();
   const hazard = currentHazard();
   const response = currentResponse();
 
@@ -1824,7 +1913,7 @@ function renderGlasses() {
       <p class="glasses-kicker">Voice Memo Mock</p>
       <h1>Memo Captured</h1>
       <p class="glasses-large">${escapeHtml(state.glassesMemoFeedback)}</p>
-      <p class="glasses-muted">Saved to Hazard ${state.index + 1}.</p>
+      <p class="glasses-muted">Saved to Hazard ${getCurrentHazardNumber()}.</p>
     `;
     actions = [
       { action: 'next', label: 'Continue', primary: true },
@@ -1862,7 +1951,7 @@ function renderGlasses() {
   } else {
     const status = response?.status ?? 'Not Marked';
     body = `
-      <p class="glasses-kicker">Hazard ${state.index + 1} / ${state.hazards.length}</p>
+      <p class="glasses-kicker">${escapeHtml(getHazardProgressText())}</p>
       <h1>${escapeHtml(hazard?.name ?? 'No hazard')}</h1>
       ${state.glassesReviewFeedback ? `<p class="glasses-toast">${escapeHtml(state.glassesReviewFeedback)}</p>` : ''}
       <dl class="glasses-hazard-facts">
@@ -1908,8 +1997,7 @@ function renderGlasses() {
 function renderChecklist() {
   const hazard = currentHazard();
   const response = currentResponse();
-  const statusTone =
-    response.status === 'Confirmed' ? 'success' : response.status === 'Fix Ordered' ? 'warning' : 'neutral';
+  const statusTone = getChecklistStatusTone(response.status);
 
   app.innerHTML = `
     <section class="v2-screen">
@@ -1959,8 +2047,7 @@ function renderChecklist() {
 }
 
 function renderSummary() {
-  const confirmed = state.responses.filter((item) => item.status === 'Confirmed').length;
-  const fixOrdered = state.responses.filter((item) => item.status === 'Fix Ordered').length;
+  const { confirmed, fixOrdered } = getHazardReviewCounts();
   const saveButtonText = state.isSavingSession ? 'Saving...' : 'Save Session';
 
   app.innerHTML = `
@@ -2081,6 +2168,10 @@ function renderSavedSessions() {
   bindButtons();
 }
 
+// ---------------------------------------------------------------------------
+// Event binding
+// ---------------------------------------------------------------------------
+
 function bindButtons() {
   app.querySelectorAll('button[data-action]').forEach((button) => {
     button.addEventListener('click', () => {
@@ -2116,8 +2207,8 @@ function bindButtons() {
       if (action === 'cancel-manual') cancelManualEntry();
       if (action === 'prev') goTo(state.index - 1);
       if (action === 'next') goTo(state.index + 1);
-      if (action === 'confirmed') setStatus('Confirmed');
-      if (action === 'fix') setStatus('Fix Ordered');
+      if (action === 'confirmed') setStatus(HAZARD_REVIEW_STATUS.CONFIRMED);
+      if (action === 'fix') setStatus(HAZARD_REVIEW_STATUS.FIX_ORDERED);
       if (action === 'review') continueToChecklist();
       if (action === 'copy') copySessionLog(button);
       if (action === 'save-session') saveCurrentSession();
@@ -2129,6 +2220,10 @@ function bindButtons() {
     });
   });
 }
+
+// ---------------------------------------------------------------------------
+// Render dispatcher
+// ---------------------------------------------------------------------------
 
 function render() {
   if (state.phase === 'auth-check') renderAuthChecking();
@@ -2153,6 +2248,10 @@ function render() {
   if (state.phase === 'summary') renderSummary();
   if (state.phase === 'saved-sessions') renderSavedSessions();
 }
+
+// ---------------------------------------------------------------------------
+// Keyboard shortcuts
+// ---------------------------------------------------------------------------
 
 window.addEventListener('keydown', (event) => {
   if (event.target.matches('input, textarea')) return;
@@ -2179,8 +2278,12 @@ window.addEventListener('keydown', (event) => {
 
   if (event.key === 'ArrowRight') goTo(state.index + 1);
   if (event.key === 'ArrowLeft') goTo(state.index - 1);
-  if (event.key === '1') setStatus('Confirmed');
-  if (event.key === '2') setStatus('Fix Ordered');
+  if (event.key === '1') setStatus(HAZARD_REVIEW_STATUS.CONFIRMED);
+  if (event.key === '2') setStatus(HAZARD_REVIEW_STATUS.FIX_ORDERED);
 });
+
+// ---------------------------------------------------------------------------
+// App startup
+// ---------------------------------------------------------------------------
 
 checkAuth();

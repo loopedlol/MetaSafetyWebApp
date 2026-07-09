@@ -12,21 +12,45 @@ Source inspected: https://github.com/facebookincubator/meta-wearables-webapp
 
 ## Demo Script
 
-Use this script for a short end-to-end Safety Lens V2 walkthrough:
+Use these scripts for a short end-to-end Safety Lens V2 walkthrough.
 
-1. Register or login.
-2. Start TBM for `서울 강동 스마트타워 신축공사`.
-3. Mark workers present.
-4. Review the hazard checklist.
-5. Mark one hazard `Confirmed`.
-6. Mark one hazard `Fix Ordered`.
-7. Log a new hazard or near-miss with photo evidence.
-8. Run mock AI analysis.
-9. Accept the mock AI suggestion after human review.
-10. Save the session.
-11. Open Saved Sessions.
-12. Open the Korean report.
-13. Use browser print/save-to-PDF if needed.
+### A. Normal dashboard demo
+
+1. Start the backend and frontend with `npm run dev:all`.
+2. Open `http://localhost:5173`.
+3. Register or login.
+4. On Start TBM, keep the demo site `서울 강동 스마트타워 신축공사` or edit the site/task/supervisor fields.
+5. Click Start TBM.
+6. Mark workers present, then continue to the checklist.
+7. Review the first hazard and mark it `Confirmed`.
+8. Review the next hazard and mark it `Fix Ordered`.
+9. Click Log New Hazard.
+10. Choose a new hazard or near-miss, add a title/location/description/action, and attach a JPG/PNG/WEBP photo.
+11. Run Analyze Photo, then accept the mock AI suggestion after human review.
+12. Save the entry and finish the checklist.
+13. On Summary, click Save Session.
+14. Confirm the save message says the backend saved the session and the browser draft was cleared.
+15. Open Saved Sessions.
+16. Click Open Report for the saved session.
+17. Use browser print/save-to-PDF if needed.
+
+To demonstrate offline draft restore during this path, refresh the page after changing attendance, memo, or hazard status. Choose Restore Draft when the local draft prompt appears.
+
+### B. Glasses HUD demo
+
+1. Start the backend and frontend with `npm run dev:all`.
+2. Open `http://localhost:5173/?mode=glasses`.
+3. Register or login if needed.
+4. Press `Enter` or `ArrowRight` to start the wearable-style TBM.
+5. Press `Enter` to mark demo workers present.
+6. On a hazard card, press `M` to add the mock voice memo.
+7. Press `P` to add mock glasses photo evidence.
+8. Press `1` to mark one hazard Confirmed.
+9. Press `2` on another hazard to mark Fix Ordered.
+10. Refresh the page after a status or memo change and choose Restore Draft to show browser-local recovery.
+11. Continue through the remaining hazards with `ArrowRight`.
+12. Save the session on the Summary card.
+13. Exit glasses mode, open the normal dashboard, and use Saved Sessions to open the Korean report.
 
 ## Run Frontend
 
@@ -177,6 +201,14 @@ uploaded image -> backend AI endpoint -> AI model/API -> suggestion -> human rev
 ```
 
 For now, attaching a photo enables Analyze Photo, which calls `POST /api/ai/analyze-hazard` and receives a deterministic mock suggestion from the backend. A human must accept or reject it before AI metadata is saved. This keeps the frontend/backend contract ready for a future real vision model while preserving the current local-only prototype.
+
+## Known Prototype Limits
+
+- Mock AI is deterministic demo logic, not real hazard detection.
+- Glasses HUD photo evidence is a mock placeholder unless a photo is uploaded through the normal dashboard flow.
+- Meta SDK, Neural Band gestures, real camera capture, sensor input, and wearable deployment are future work.
+- The offline draft uses `localStorage`; it is local to one browser/profile and is not shared across devices.
+- The Korean report is printable HTML. Browser print/save-to-PDF works, but the app does not generate a standalone PDF file yet.
 
 ## Prototype / Mock Behavior
 

@@ -1,3 +1,7 @@
+// ---------------------------------------------------------------------------
+// Imports / config
+// ---------------------------------------------------------------------------
+
 import express from 'express';
 import bcrypt from 'bcryptjs';
 import multer from 'multer';
@@ -14,13 +18,19 @@ loadEnvFile();
 
 const PORT = process.env.PORT ?? 3001;
 const HOST = process.env.HOST ?? '127.0.0.1';
+const REGISTRATION_KEY = process.env.REGISTRATION_KEY;
+const SESSION_SECRET = process.env.SESSION_SECRET ?? 'change-me-session-secret';
+const AI_MODE = process.env.AI_MODE ?? 'mock';
+
+// ---------------------------------------------------------------------------
+// Storage paths and constants
+// ---------------------------------------------------------------------------
+
 const DATA_DIR = path.join(__dirname, 'data');
 const SESSIONS_FILE = path.join(DATA_DIR, 'sessions.json');
 const USERS_FILE = path.join(DATA_DIR, 'users.json');
 const UPLOADS_DIR = path.join(__dirname, 'uploads');
 const REQUIRED_FIELDS = ['sessionId', 'sessionType', 'site', 'work', 'supervisor', 'workers', 'hazards'];
-const REGISTRATION_KEY = process.env.REGISTRATION_KEY;
-const SESSION_SECRET = process.env.SESSION_SECRET ?? 'change-me-session-secret';
 const ALLOWED_IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp']);
 const IMAGE_EXTENSIONS = {
   'image/jpeg': '.jpg',
@@ -28,10 +38,17 @@ const IMAGE_EXTENSIONS = {
   'image/webp': '.webp'
 };
 
+// ---------------------------------------------------------------------------
+// Express app setup
+// ---------------------------------------------------------------------------
+
 const app = express();
-const AI_MODE = process.env.AI_MODE ?? 'mock';
 
 mkdirSync(UPLOADS_DIR, { recursive: true });
+
+// ---------------------------------------------------------------------------
+// Upload setup
+// ---------------------------------------------------------------------------
 
 const upload = multer({
   storage: multer.diskStorage({
@@ -60,6 +77,10 @@ const upload = multer({
 
 app.use(express.json({ limit: '1mb' }));
 app.use('/uploads', express.static(UPLOADS_DIR));
+
+// ---------------------------------------------------------------------------
+// File / data helpers
+// ---------------------------------------------------------------------------
 
 function loadEnvFile() {
   const envPath = path.join(__dirname, '.env');
@@ -91,6 +112,10 @@ function escapeHtml(value) {
 function normalizeEmail(email) {
   return String(email ?? '').trim().toLowerCase();
 }
+
+// ---------------------------------------------------------------------------
+// Auth / session helpers
+// ---------------------------------------------------------------------------
 
 function toPublicUser(user) {
   if (!user) return null;
@@ -165,6 +190,10 @@ function clearAuthCookie(response) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Report rendering helpers
+// ---------------------------------------------------------------------------
+
 function formatReportDate(value) {
   if (!value) return '미입력';
 
@@ -212,7 +241,7 @@ function renderEvidencePhotos(item) {
       ${photos
         .map((photo, index) => {
           const isMockEvidence = photo.source === 'glasses_mock_capture' || String(photo.url ?? '').startsWith('data:');
-          const mockLabel = isMockEvidence ? ' (Glasses HUD mock evidence)' : '';
+          const mockLabel = isMockEvidence ? ' (Glasses HUD mock photo - prototype evidence)' : '';
           return `
             <figure>
               <img src="${escapeHtml(photo.url)}" alt="${formatReportValue(photo.originalName ?? `Evidence ${index + 1}`)}" />
@@ -281,6 +310,10 @@ function normalizeSession(session) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// AI mock helpers
+// ---------------------------------------------------------------------------
+
 function createMockAiSuggestion(entryType) {
   const suggestedAt = new Date().toISOString();
 
@@ -318,10 +351,8 @@ async function analyzeHazardImage({ entryType, photo, photos, imageUrl }) {
     return createMockAiSuggestion(entryType);
   }
 
-  // TODO: Wire real vision analysis here when AI_MODE supports a real provider.
-  // The future implementation should pass imageUrl or uploaded photo metadata to
-  // a vision model/API, validate the structured response, and preserve the same
-  // suggestion contract used by the mock response.
+  // Future real vision providers should preserve this response contract so the
+  // frontend and saved-session schema do not need to change.
   throw new Error(`Unsupported AI_MODE "${AI_MODE}". Set AI_MODE=mock until a real provider is implemented.`);
 }
 
@@ -629,6 +660,10 @@ function renderSessionReport(session) {
 </html>`;
 }
 
+// ---------------------------------------------------------------------------
+// File / data persistence helpers
+// ---------------------------------------------------------------------------
+
 async function readSessions() {
   try {
     const file = await readFile(SESSIONS_FILE, 'utf8');
@@ -704,6 +739,10 @@ function validateSession(session) {
 
   return null;
 }
+
+// ---------------------------------------------------------------------------
+// Auth routes
+// ---------------------------------------------------------------------------
 
 app.post('/api/auth/register', async (request, response, next) => {
   try {
@@ -803,6 +842,10 @@ app.get('/api/auth/me', async (request, response, next) => {
     next(error);
   }
 });
+
+// ---------------------------------------------------------------------------
+// Session / upload / AI / report routes
+// ---------------------------------------------------------------------------
 
 app.post('/api/sessions', requireAuth, async (request, response, next) => {
   try {
@@ -943,6 +986,10 @@ app.get('/api/sessions/:sessionId', requireAuth, async (request, response, next)
 });
 
 app.use(express.static(path.join(__dirname, 'dist')));
+
+// ---------------------------------------------------------------------------
+// Error handling / startup
+// ---------------------------------------------------------------------------
 
 app.use((error, _request, response, _next) => {
   console.error(error);
