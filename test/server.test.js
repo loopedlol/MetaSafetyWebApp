@@ -370,7 +370,7 @@ describe('authenticated API', () => {
     assert.deepEqual(await readdir(uploadsDir), []);
   });
 
-  test('identifies mock AI output and keeps it pending human review', async () => {
+  test('rejects metadata without a valid owned upload ID', async () => {
     const agent = request.agent(server);
     await register(agent);
 
@@ -379,12 +379,147 @@ describe('authenticated API', () => {
       photos: [{ originalName: 'evidence.jpg', type: 'image/jpeg' }]
     });
 
-    assert.equal(response.status, 200);
-    assert.equal(response.body.source, 'mock_ai');
-    assert.equal(response.body.isMock, true);
-    assert.equal(response.body.requiresHumanReview, true);
-    assert.equal(response.body.accepted, undefined);
-    assert.equal(response.body.rejected, undefined);
+    assert.equal(response.status, 400);
+    assert.match(response.body.error, /uploadId/);
+  });
+
+  test('rejects an upload ID owned by another user', async () => {
+    const owner = request.agent(server);
+    const other = request.agent(server);
+    await register(owner, 'analysis-owner@example.com');
+    await register(other, 'analysis-other@example.com');
+    const upload = (await uploadPng(owner)).body[0];
+    const analysis = (await owner.post('/api/ai/analyze-hazard').send({ entryType: 'new_hazard', uploadId: upload.id })).body;
+
+    const response = await other.post('/api/ai/analyze-hazard').send({ entryType: 'new_hazard', uploadId: upload.id });
+    const review = await other.patch(`/api/ai/analyses/${analysis.analysisId}/review`).send({ decision: 'accepted' });
+
+    assert.equal(response.status, 404);
+    assert.deepEqual(response.body, { error: 'Resource not found.' });
+    assert.equal(review.status, 404);
+  });
+
+  test('uses an owned validated upload for deterministic visibly simulated mock output', async () => {
+    const agent = request.agent(server);
+    await register(agent);
+    const upload = (await uploadPng(agent)).body[0];
+    const first = await agent.post('/api/ai/analyze-hazard').send({ entryType: 'new_hazard', uploadId: upload.id });
+    const second = await agent.post('/api/ai/analyze-hazard').send({ entryType: 'new_hazard', uploadId: upload.id });
+
+    assert.equal(first.status, 200);
+    assert.deepEqual(first.body.suggestion, second.body.suggestion);
+    assert.equal(first.body.mode, 'mock');
+    assert.equal(first.body.provider, 'deterministic_fixture');
+    assert.equal(first.body.modelVersion, 'fixture-v1');
+    assert.equal(first.body.simulated, true);
+    assert.equal(first.body.pixelInterpretation, false);
+    assert.match(first.body.disclaimer, /pixels were not interpreted/i);
+    assert.equal(first.body.requiresHumanReview, true);
+    assert.equal(first.body.humanDecision, 'pending');
+    assert.equal(first.body.uploadId, upload.id);
+    assert.match(first.body.uploadHash, /^sha256:/);
+    assert.equal(first.body.ownerId, undefined);
+    assert.equal(first.body.filename, undefined);
+    const stored = app.locals.database.raw.prepare('SELECT * FROM ai_analyses WHERE id = ?').get(first.body.analysisId);
+    assert.equal(stored.upload_id, upload.id);
+    assert.equal(stored.mode, 'mock');
+    assert.equal(stored.provider, 'deterministic_fixture');
+    assert.equal(stored.model_version, 'fixture-v1');
+    assert.equal(stored.requested_at, '2026-07-10T00:00:00.000Z');
+    assert.equal(stored.completed_at, '2026-07-10T00:00:00.000Z');
+    assert.deepEqual(JSON.parse(stored.normalized_suggestion_json), first.body.suggestion);
+  });
+
+  test('records accepted, edited, and rejected human outcomes accurately', async () => {
+    const agent = request.agent(server);
+    await register(agent);
+    const upload = (await uploadPng(agent)).body[0];
+    const analyses = [];
+    for (const entryType of ['new_hazard', 'new_hazard', 'near_miss']) {
+      analyses.push((await agent.post('/api/ai/analyze-hazard').send({ entryType, uploadId: upload.id })).body);
+    }
+    const accepted = await agent.patch(`/api/ai/analyses/${analyses[0].analysisId}/review`).send({ decision: 'accepted' });
+    const editedSuggestion = {
+      title: 'Human-edited hazard', category: 'human_review', riskLevel: 'high',
+      description: 'A person changed the normalized suggestion.', recommendedAction: 'Use the human-selected control.'
+    };
+    const edited = await agent.patch(`/api/ai/analyses/${analyses[1].analysisId}/review`)
+      .send({ decision: 'edited', editedSuggestion });
+    const rejected = await agent.patch(`/api/ai/analyses/${analyses[2].analysisId}/review`).send({ decision: 'rejected' });
+
+    assert.equal(accepted.body.humanDecision, 'accepted');
+    assert.equal(edited.body.humanDecision, 'edited');
+    assert.deepEqual({ ...edited.body.editedSuggestion, confidence: undefined }, { ...editedSuggestion, confidence: undefined });
+    assert.equal(rejected.body.humanDecision, 'rejected');
+    for (const result of [accepted.body, edited.body, rejected.body]) {
+      assert.equal(result.reviewer, 'Test Supervisor');
+      assert.equal(result.reviewedAt, '2026-07-10T00:00:00.000Z');
+    }
+  });
+
+  test('AI output cannot bypass hazard review or finalization rules', async () => {
+    const agent = request.agent(server);
+    await register(agent);
+    const upload = (await uploadPng(agent)).body[0];
+    const analysis = (await agent.post('/api/ai/analyze-hazard').send({ entryType: 'new_hazard', uploadId: upload.id })).body;
+    const session = validSession('ai-cannot-finalize');
+    session.hazards[0].aiSuggestion = analysis;
+    session.hazards[0].evidencePhotos = [upload];
+
+    const response = await agent.post('/api/sessions').send({ ...session, saveMode: 'finalize' });
+
+    assert.equal(response.status, 400);
+    assert.ok(response.body.blockers.some((blocker) => blocker.includes('has not been reviewed')));
+    assert.equal(analysis.suggestion.status, undefined);
+  });
+
+  test('reports AI origin separately from the final human decision', async () => {
+    const agent = request.agent(server);
+    await register(agent);
+    const upload = (await uploadPng(agent)).body[0];
+    const analysis = (await agent.post('/api/ai/analyze-hazard').send({ entryType: 'new_hazard', uploadId: upload.id })).body;
+    const editedSuggestion = {
+      title: 'Human report title', category: 'human_review', riskLevel: 'medium',
+      description: 'Human reviewed description', recommendedAction: 'Human reviewed action'
+    };
+    const review = (await agent.patch(`/api/ai/analyses/${analysis.analysisId}/review`)
+      .send({ decision: 'edited', editedSuggestion })).body;
+    const session = validSession('ai-report-separation');
+    session.hazards[0].aiSuggestion = { ...analysis, ...review, edited: true };
+    assert.equal((await agent.post('/api/sessions').send(session)).status, 201);
+
+    const report = await agent.get('/api/sessions/ai-report-separation/report?lang=ko');
+
+    assert.equal(report.status, 200);
+    assert.match(report.text, /시뮬레이션된 모의 제안/);
+    assert.match(report.text, /이미지 픽셀을 해석하지 않음/);
+    assert.match(report.text, /최종 사람 결정/);
+    assert.match(report.text, /수정 후 사용/);
+    assert.match(report.text, /제안 원문 항목명/);
+    assert.match(report.text, /사람이 확정한 항목명/);
+  });
+
+  test('provider failures retain the original evidence and draft', async () => {
+    await closeServer();
+    app = createApp({
+      dataDir, uploadsDir, registrationKey: REGISTRATION_KEY, sessionSecret: SESSION_SECRET,
+      now: () => currentTime,
+      analysisProvider: { async analyze() { throw new Error('provider unavailable'); } }
+    });
+    server = app.listen(0, '127.0.0.1');
+    await once(server, 'listening');
+    const agent = request.agent(server);
+    await register(agent);
+    assert.equal((await agent.post('/api/sessions').send(validSession('provider-failure-draft'))).status, 201);
+    const upload = (await uploadPng(agent, 'provider-failure.png')).body[0];
+
+    const response = await agent.post('/api/ai/analyze-hazard').send({ entryType: 'new_hazard', uploadId: upload.id });
+
+    assert.equal(response.status, 502);
+    assert.match(response.body.error, /evidence was retained/i);
+    assert.equal((await agent.get(`/api/uploads/${upload.id}`)).status, 200);
+    assert.equal((await agent.get('/api/sessions/provider-failure-draft')).status, 200);
+    assert.equal((await readdir(uploadsDir)).length, 1);
   });
 
   test('rejects finalization when hazards are unchecked and sharing is not recorded', async () => {
@@ -624,7 +759,7 @@ describe('authenticated API', () => {
     assert.equal(uploaded.status, 201);
     const evidence = uploaded.body[0];
     const session = validSession('owner-full-flow');
-    session.hazards[0].evidencePhotos = [evidence];
+    session.hazards[0].evidencePhotos = [{ ...evidence, source: 'sdk_raw_camera' }];
 
     const saved = await owner.post('/api/sessions').send({ ...session, ownerId: 'client-forgery', createdBy: null });
     const listed = await owner.get('/api/sessions');
@@ -642,6 +777,7 @@ describe('authenticated API', () => {
     assert.equal(listed.body.length, 1);
     assert.equal(read.status, 200);
     assert.equal(read.body.hazards[0].evidencePhotos[0].url, evidence.url);
+    assert.equal(read.body.hazards[0].evidencePhotos[0].source, 'browser_file_picker');
     assert.equal(updated.status, 200);
     assert.equal(updated.body.ownerId, ownerId);
     assert.equal(updated.body.work.taskName, 'Updated owner task');

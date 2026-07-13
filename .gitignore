@@ -35,6 +35,9 @@ temp/
 
 # Test / coverage output
 coverage/
+test-artifacts/
+playwright-report/
+.cache/browser-tests/
 
 # Local cache
 .cache/

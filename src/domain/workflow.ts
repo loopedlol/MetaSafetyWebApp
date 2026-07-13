@@ -24,6 +24,40 @@ export const SHARING_STATUS = Object.freeze({
   SHARED: 'shared'
 });
 
+export const ATTENDANCE_CAPTURE_SOURCE = Object.freeze({ GLASSES_COUNT_SELECTOR: 'glasses_count_selector' });
+export const EVIDENCE_SOURCE = Object.freeze({
+  SDK_RAW_CAMERA: 'sdk_raw_camera', EXTERNAL_UPLOAD: 'external_upload', BROWSER_FILE_PICKER: 'browser_file_picker',
+  BROWSER_PREVIEW_MOCK: 'browser_preview_mock', UNKNOWN_LEGACY_SOURCE: 'unknown_legacy_source'
+});
+export const IMMEDIATE_RESPONSE_CATEGORY = Object.freeze({
+  STOP_WORK: 'stop_work', ISOLATE_AREA: 'isolate_area', INSTALL_BARRIER: 'install_barrier',
+  REMOVE_OBSTRUCTION: 'remove_obstruction', REPLACE_EQUIPMENT: 'replace_equipment', ADD_PPE: 'add_ppe',
+  REQUEST_SUPERVISOR_REVIEW: 'request_supervisor_review', OTHER_APPROVED_CONTROL: 'other_approved_control'
+});
+export const RESPONSIBLE_PARTY = Object.freeze({
+  SUPERVISOR: 'supervisor', SITE_MANAGER: 'site_manager', SAFETY_OFFICER: 'safety_officer',
+  EQUIPMENT_OPERATOR: 'equipment_operator', ASSIGNED_CREW: 'assigned_crew', EXTERNAL_CONTRACTOR: 'external_contractor'
+});
+export const DUE_PERIOD = Object.freeze({
+  IMMEDIATE: 'immediate', BEFORE_WORK_RESUMES: 'before_work_resumes', WITHIN_ONE_HOUR: 'within_one_hour',
+  SAME_SHIFT: 'same_shift', END_OF_DAY: 'end_of_day', SCHEDULED_FOLLOW_UP: 'scheduled_follow_up'
+});
+export const SHARING_METHOD = Object.freeze({ VERBAL_BRIEFING: 'verbal_briefing', TEAM_MEETING: 'team_meeting',
+  DISPLAYED_NOTICE: 'displayed_notice', MOBILE_MESSAGE: 'mobile_message', PRINTED_HANDOUT: 'printed_handout',
+  OTHER_APPROVED_METHOD: 'other_approved_method' });
+export const SHARING_PROOF_TYPE = Object.freeze({ PHOTO_EVIDENCE: 'photo_evidence', UPLOADED_DOCUMENT: 'uploaded_document',
+  ATTENDANCE_RECORD: 'attendance_record', SUPERVISOR_CONFIRMATION: 'supervisor_confirmation',
+  WORKER_ACKNOWLEDGMENT_RECORD: 'worker_acknowledgment_record', NO_INDEPENDENT_PROOF: 'no_independent_proof' });
+
+export function normalizeAttendanceSummary(summary: LegacyRecord = {}) {
+  if (!summary || typeof summary !== 'object') return null;
+  const expectedCount = Number(summary.expectedCount);
+  const presentCount = Number(summary.presentCount);
+  if (!Number.isInteger(expectedCount) || !Number.isInteger(presentCount) || expectedCount < 0 || expectedCount > 99 || presentCount < 0 || presentCount > expectedCount) return null;
+  return { expectedCount, presentCount, captureSource: summary.captureSource === ATTENDANCE_CAPTURE_SOURCE.GLASSES_COUNT_SELECTOR
+    ? summary.captureSource : ATTENDANCE_CAPTURE_SOURCE.GLASSES_COUNT_SELECTOR, deviceObservedAt: summary.deviceObservedAt ?? null };
+}
+
 export function normalizeHazardStatus(value: unknown) {
   if (value === HAZARD_STATUS.CONTROLLED || value === 'Confirmed' || value === 'confirmed' || value === 'accepted') {
     return HAZARD_STATUS.CONTROLLED;
@@ -133,6 +167,9 @@ export function normalizeCorrectiveAction(action: LegacyRecord = {}, status: str
     verifiedAt: verificationStatus === VERIFICATION_STATUS.VERIFIED ? action.verifiedAt : null,
     closureEvidence,
     legacyCompletedAt: action.completedAt ?? null
+    , immediateResponseCategory: Object.values(IMMEDIATE_RESPONSE_CATEGORY).includes(action.immediateResponseCategory) ? action.immediateResponseCategory : '',
+    responsibleParty: Object.values(RESPONSIBLE_PARTY).includes(action.responsibleParty) ? action.responsibleParty : '',
+    duePeriod: Object.values(DUE_PERIOD).includes(action.duePeriod) ? action.duePeriod : ''
   };
 }
 
@@ -178,6 +215,7 @@ export function normalizeSharing(sharing: LegacyRecord = {}) {
     recipients: status === SHARING_STATUS.SHARED ? sharing.recipients ?? sharing.sharedWith ?? '' : '',
     sharedAt: status === SHARING_STATUS.SHARED ? sharing.sharedAt ?? null : null,
     acknowledgmentResults: sharing.acknowledgmentResults ?? '',
+    proofType: status === SHARING_STATUS.SHARED && Object.values(SHARING_PROOF_TYPE).includes(sharing.proofType) ? sharing.proofType : '',
     legacyClaimedShared
   };
 }
@@ -246,6 +284,7 @@ export function normalizeSessionRecord(session: LegacyRecord = {}) {
     hazards: (session.hazards ?? []).map(normalizeHazard),
     nearMisses: Array.isArray(session.nearMisses) ? session.nearMisses : [],
     sharing: normalizeSharing(session.sharing)
+    , attendanceSummary: normalizeAttendanceSummary(session.attendanceSummary)
   };
   const canPreserveFinalizedRecord = Boolean(session.finalizedAt || session.completedAt) && !getFinalizationBlockers(normalized).length;
   const status = canPreserveFinalizedRecord ? getRecordStatus(normalized) : 'draft';

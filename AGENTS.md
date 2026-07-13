@@ -9,6 +9,7 @@ Safety Lens is a workplace-safety prototype for Korean-style toolbox meetings (T
 - `src/main.ts`: minimal browser entrypoint.
 - `src/workflows/application.ts`: shared normal/glasses application orchestration and event binding.
 - `src/api/`, `src/state/`, `src/storage/`, `src/domain/`, `src/views/`, and `src/types/`: typed frontend network, state, persistence, domain, presentation, and public-record ownership.
+- `src/i18n/`: Korean-default catalogs, translation/fallback behavior, language preference, and localized workflow presentation.
 - `src/styles.css`: shared normal-browser and glasses HUD styles.
 - `server.ts`: minimal backend entrypoint and public exports.
 - `server/app.ts`: Express composition and route orchestration.
@@ -16,6 +17,7 @@ Safety Lens is a workplace-safety prototype for Korean-style toolbox meetings (T
 - `db/migrations/`: ordered SQL migrations. Never edit an applied migration; add a new numbered migration.
 - `docs/database.md`: legacy field map, normalized schema, authoritative timestamps, import, recovery, and audit guarantees.
 - `test/`: Node test runner and Supertest API integration tests. Every test must use its own OS temporary data and upload directories.
+- `browser-tests/`: deterministic Playwright Chromium scenarios for normal and 600×600 glasses views. Generated evidence belongs only in ignored `test-artifacts/`.
 - `public/hazards.json`: prototype hazard checklist data copied into the Vite build.
 - `public/sw.js`: versioned application-shell and static-hazard cache; API responses are never cached.
 - `scripts/dev-all.mjs`: runs the Vite and Express development processes together.
@@ -67,6 +69,12 @@ Run tests once or in watch mode:
 ```bash
 npm test
 npm run test:watch
+```
+
+Run the isolated browser suite:
+
+```bash
+npm run test:browser
 ```
 
 Run the full repository check (syntax, tests, and production build):

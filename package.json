@@ -12,8 +12,11 @@
     "dev:all": "node scripts/dev-all.mjs",
     "build": "vite build",
     "typecheck": "tsc --noEmit",
-    "syntax-check": "node --check public/sw.js && node --check scripts/dev-all.mjs && node --check scripts/migrate.mjs && node --check scripts/import-json.mjs && node --check scripts/verify-audit.mjs && npm run typecheck",
+    "syntax-check": "node --check public/sw.js && node --check scripts/dev-all.mjs && node --check scripts/migrate.mjs && node --check scripts/import-json.mjs && node --check scripts/verify-audit.mjs && node --check browser-tests/start-test-servers.mjs && npm run typecheck",
     "test": "node --test",
+    "test:browser": "playwright test",
+    "test:browser:glasses": "playwright test browser-tests/glasses.spec.ts",
+    "test:browser:normal": "playwright test browser-tests/normal.spec.ts",
     "test:watch": "node --test --watch",
     "check": "npm run syntax-check && npm test && npm run build",
     "db:migrate": "node scripts/migrate.mjs",
@@ -21,6 +24,7 @@
     "audit:verify": "node scripts/verify-audit.mjs"
   },
   "devDependencies": {
+    "@playwright/test": "^1.61.1",
     "@types/express": "^5.0.6",
     "@types/multer": "^2.2.0",
     "@types/node": "^26.1.1",

@@ -203,8 +203,8 @@ export function openDatabase({ databasePath, migrationsDir, now = () => new Date
       const statement = db.prepare(`
         INSERT INTO evidence_uploads(
           id, owner_id, internal_filename, original_name, mime_type, size_bytes, sha256_hash,
-          uploaded_at, client_observed_uploaded_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          uploaded_at, client_observed_uploaded_at, source_classification
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
       for (const record of records) {
         statement.run(
@@ -216,7 +216,8 @@ export function openDatabase({ databasePath, migrationsDir, now = () => new Date
           record.size,
           record.hash,
           serverTime,
-          record.uploadedAt ?? null
+          record.uploadedAt ?? null,
+          'browser_file_picker'
         );
         appendAuditEvent({
           entityType: 'evidence_upload',
@@ -241,7 +242,8 @@ export function openDatabase({ databasePath, migrationsDir, now = () => new Date
           size: row.size_bytes,
           hash: row.sha256_hash,
           uploadedAt: row.uploaded_at,
-          clientObservedUploadedAt: row.client_observed_uploaded_at
+          clientObservedUploadedAt: row.client_observed_uploaded_at,
+          source: row.source_classification ?? 'unknown_legacy_source'
         }
       : null;
   }
@@ -252,6 +254,73 @@ export function openDatabase({ databasePath, migrationsDir, now = () => new Date
 
   function getUploadsForOwner(ownerId) {
     return db.prepare('SELECT * FROM evidence_uploads WHERE owner_id = ?').all(ownerId).map(mapUpload);
+  }
+
+  function mapAiAnalysis(row) {
+    return row
+      ? {
+          analysisId: row.id,
+          ownerId: row.owner_id,
+          uploadId: row.upload_id,
+          sessionId: row.session_id,
+          entryType: row.entry_type,
+          mode: row.mode,
+          provider: row.provider,
+          modelVersion: row.model_version,
+          requestedAt: row.requested_at,
+          completedAt: row.completed_at,
+          suggestion: json(row.normalized_suggestion_json, {}),
+          humanDecision: row.human_decision,
+          editedSuggestion: json(row.edited_suggestion_json),
+          reviewerUserId: row.reviewer_user_id,
+          reviewer: row.reviewer_label,
+          reviewedAt: row.reviewed_at
+        }
+      : null;
+  }
+
+  function createAiAnalysis(record, actorUserId) {
+    return transaction(() => {
+      db.prepare(`
+        INSERT INTO ai_analyses(
+          id, owner_id, upload_id, session_id, entry_type, mode, provider, model_version,
+          requested_at, completed_at, normalized_suggestion_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        record.analysisId, record.ownerId, record.uploadId, record.sessionId ?? null, record.entryType,
+        record.mode, record.provider, record.modelVersion ?? null, record.requestedAt, record.completedAt,
+        stableStringify(record.suggestion)
+      );
+      appendAuditEvent({
+        entityType: 'ai_analysis', entityId: record.analysisId, action: 'ai_analysis.generated', actorUserId,
+        metadata: { uploadId: record.uploadId, mode: record.mode, provider: record.provider, modelVersion: record.modelVersion }
+      });
+      return getAiAnalysisForOwner(record.analysisId, record.ownerId);
+    });
+  }
+
+  function getAiAnalysisForOwner(analysisId, ownerId) {
+    return mapAiAnalysis(db.prepare('SELECT * FROM ai_analyses WHERE id = ? AND owner_id = ?').get(analysisId, ownerId));
+  }
+
+  function reviewAiAnalysis({ analysisId, ownerId, decision, editedSuggestion, reviewerUserId, reviewer }) {
+    return transaction(() => {
+      const reviewedAt = now();
+      const result = db.prepare(`
+        UPDATE ai_analyses
+        SET human_decision = ?, edited_suggestion_json = ?, reviewer_user_id = ?, reviewer_label = ?, reviewed_at = ?
+        WHERE id = ? AND owner_id = ?
+      `).run(
+        decision, decision === 'edited' ? stableStringify(editedSuggestion) : null,
+        reviewerUserId, reviewer, reviewedAt, analysisId, ownerId
+      );
+      if (!result.changes) return null;
+      appendAuditEvent({
+        entityType: 'ai_analysis', entityId: analysisId, action: 'ai_analysis.reviewed', actorUserId: reviewerUserId,
+        metadata: { decision, reviewer }
+      });
+      return getAiAnalysisForOwner(analysisId, ownerId);
+    });
   }
 
   function getSessionOwner(sessionId) {
@@ -355,6 +424,12 @@ export function openDatabase({ databasePath, migrationsDir, now = () => new Date
         session.startedAt ?? null,
         session.exportedAt ?? null,
         nextRevision
+      );
+      const attendanceSummary = session.attendanceSummary;
+      db.prepare(`UPDATE tbm_sessions SET attendance_expected_count = ?, attendance_present_count = ?,
+        attendance_capture_source = ?, attendance_device_observed_at = ? WHERE id = ?`).run(
+        attendanceSummary?.expectedCount ?? null, attendanceSummary?.presentCount ?? null,
+        attendanceSummary?.captureSource ?? null, attendanceSummary?.deviceObservedAt ?? null, session.sessionId
       );
 
       const existingHazards = new Map(
@@ -494,8 +569,9 @@ export function openDatabase({ databasePath, migrationsDir, now = () => new Date
           INSERT INTO corrective_actions(
             id, hazard_id, required, immediate_control, assigned_to, due_at, work_status,
             verification_status, verified_by_user_id, verified_by_label, verified_at,
-            client_observed_verified_at, closure_evidence_json, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            client_observed_verified_at, closure_evidence_json, updated_at,
+            immediate_response_category, responsible_party, due_period
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).run(
           randomUUID(),
           hazardId,
@@ -510,7 +586,10 @@ export function openDatabase({ databasePath, migrationsDir, now = () => new Date
           verifiedAt,
           corrective.verifiedAt ?? null,
           stableStringify(corrective.closureEvidence ?? []),
-          serverTime
+          serverTime,
+          corrective.immediateResponseCategory || null,
+          corrective.responsibleParty || null,
+          corrective.duePeriod || null
         );
         if (verificationChanged && corrective.verificationStatus === 'verified') {
           appendAuditEvent({
@@ -560,15 +639,16 @@ export function openDatabase({ databasePath, migrationsDir, now = () => new Date
         latestSharing.status !== sharing.status ||
         (latestSharing.method ?? '') !== (sharing.method ?? '') ||
         (latestSharing.recipients ?? '') !== (sharing.recipients ?? '') ||
-        (latestSharing.acknowledgment_results ?? '') !== (sharing.acknowledgmentResults ?? '');
+        (latestSharing.acknowledgment_results ?? '') !== (sharing.acknowledgmentResults ?? '') ||
+        (latestSharing.proof_type ?? '') !== (sharing.proofType ?? '');
       if (sharingChanged) {
         const sharedAt = sharing.status === 'shared' ? serverTime : null;
         const sharingId = randomUUID();
         db.prepare(`
           INSERT INTO sharing_events(
             id, session_id, owner_id, status, method, recipients, acknowledgment_results,
-            actor_user_id, recorded_at, shared_at, client_observed_shared_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            actor_user_id, recorded_at, shared_at, client_observed_shared_at, proof_type
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).run(
           sharingId,
           session.sessionId,
@@ -580,7 +660,8 @@ export function openDatabase({ databasePath, migrationsDir, now = () => new Date
           actorUserId,
           serverTime,
           sharedAt,
-          sharing.sharedAt ?? null
+          sharing.sharedAt ?? null,
+          sharing.proofType || null
         );
         appendAuditEvent({
           entityType: 'sharing_event',
@@ -609,10 +690,10 @@ export function openDatabase({ databasePath, migrationsDir, now = () => new Date
   function insertEvidenceLinks({ parentType, parentId, ownerId, photos }) {
     let position = 0;
     for (const photo of photos) {
-      if (photo?.source === 'glasses_mock_capture' && String(photo.url ?? '').startsWith('data:image/svg+xml')) {
+      if (photo?.source === 'browser_preview_mock' && String(photo.url ?? '').startsWith('data:image/svg+xml')) {
         db.prepare(`
-          INSERT INTO mock_evidence(id, hazard_id, near_miss_id, position, original_name, data_url, observed_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?)
+          INSERT INTO mock_evidence(id, hazard_id, near_miss_id, position, original_name, data_url, observed_at, source_classification)
+          VALUES (?, ?, ?, ?, ?, ?, ?, 'browser_preview_mock')
         `).run(
           randomUUID(),
           parentType === 'hazard' ? parentId : null,
@@ -718,7 +799,10 @@ export function openDatabase({ databasePath, migrationsDir, now = () => new Date
             verifiedBy: corrective.verified_by_label,
             verifiedAt: corrective.verified_at,
             clientObservedVerifiedAt: corrective.client_observed_verified_at,
-            closureEvidence: json(corrective.closure_evidence_json, [])
+            closureEvidence: json(corrective.closure_evidence_json, []),
+            immediateResponseCategory: corrective.immediate_response_category ?? '',
+            responsibleParty: corrective.responsible_party ?? '',
+            duePeriod: corrective.due_period ?? ''
           },
           evidencePhotos: readEvidence('hazard', hazard.id)
         };
@@ -782,6 +866,10 @@ export function openDatabase({ databasePath, migrationsDir, now = () => new Date
         plannedWorkDescription: row.planned_work_description
       },
       supervisor: { name: row.supervisor_name, role: row.supervisor_role },
+      attendanceSummary: row.attendance_expected_count == null ? null : {
+        expectedCount: row.attendance_expected_count, presentCount: row.attendance_present_count,
+        captureSource: row.attendance_capture_source, deviceObservedAt: row.attendance_device_observed_at
+      },
       workers,
       hazards,
       nearMisses,
@@ -793,7 +881,8 @@ export function openDatabase({ databasePath, migrationsDir, now = () => new Date
             recipients: sharing.recipients ?? '',
             acknowledgmentResults: sharing.acknowledgment_results ?? '',
             sharedAt: sharing.shared_at,
-            clientObservedSharedAt: sharing.client_observed_shared_at
+            clientObservedSharedAt: sharing.client_observed_shared_at,
+            proofType: sharing.proof_type ?? ''
           }
         : { status: 'not_recorded', method: '', recipients: '', acknowledgmentResults: '', sharedAt: null },
       device: {
@@ -824,7 +913,7 @@ export function openDatabase({ databasePath, migrationsDir, now = () => new Date
       mimeType: item.mime_type,
       size: item.size_bytes,
       uploadedAt: item.uploaded_at,
-      source: 'uploaded_evidence',
+      source: item.source_classification ?? 'unknown_legacy_source',
       url: `/api/uploads/${encodeURIComponent(item.id)}`,
       position: item.position
     }));
@@ -833,7 +922,7 @@ export function openDatabase({ databasePath, migrationsDir, now = () => new Date
     `).all(parentId).map((item) => ({
       id: item.id,
       originalName: item.original_name,
-      source: 'glasses_mock_capture',
+      source: item.source_classification ?? 'unknown_legacy_source',
       url: item.data_url,
       uploadedAt: item.observed_at,
       position: item.position
@@ -898,6 +987,9 @@ export function openDatabase({ databasePath, migrationsDir, now = () => new Date
     createEvidenceUploads,
     getUploadForOwner,
     getUploadsForOwner,
+    createAiAnalysis,
+    getAiAnalysisForOwner,
+    reviewAiAnalysis,
     getSessionOwner,
     saveSession,
     listSessionsForOwner,

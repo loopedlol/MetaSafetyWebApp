@@ -1,5 +1,11 @@
 # Safety Lens SQLite Persistence
 
+## Structured glasses records
+
+Migration `004_glasses_structured_records.sql` adds nullable, backward-compatible fields for the glasses workflow. Count-only attendance is stored on the TBM session as expected/present counts, capture source, and device-observed time; it does not create named attendance or acknowledgment rows. Reports show it separately from named attendance.
+
+Corrective actions retain the existing open/verified and work-status semantics while optionally storing stable immediate-response, responsible-party, and due-period identifiers. Sharing events may store a structured proof type. Evidence provenance is server normalized: legacy evidence defaults to `unknown_legacy_source`, HTTP uploads are `browser_file_picker`, and browser mock SVG evidence is `browser_preview_mock`. Only a trusted native integration may assign `sdk_raw_camera`; provenance does not prove an unstaged or unmodified scene.
+
 ## Legacy Field Map
 
 The one-time importer maps the prototype JSON fields as follows:
@@ -19,6 +25,7 @@ The one-time importer maps the prototype JSON fields as follows:
 | Corrective action | immediate control, assignee, due time, work/verification status, verifier, closure evidence | `corrective_actions`; authoritative verification time is server-generated |
 | Near misses | identity, order, description, action, reporter, mock-AI metadata | `near_misses` |
 | Evidence | opaque ID, owner, internal filename, original name, MIME, size, SHA-256, time | `evidence_uploads` and evidence junction tables |
+| Image suggestions | analysis/upload IDs, upload hash relationship, mode/provider/model, server times, normalized fixture, human decision/reviewer | `ai_analyses`; hazard/near-miss JSON retains report-facing provenance |
 | Sharing | decision, method, recipients, acknowledgment results, client time | append-only `sharing_events`; `shared_at` is server-generated |
 | Worker feedback | current unstructured array | `tbm_sessions.worker_feedback_json` until a product schema exists |
 

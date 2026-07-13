@@ -2,6 +2,8 @@
 import '../styles.css';
 import {
   HAZARD_STATUS,
+  ATTENDANCE_CAPTURE_SOURCE, DUE_PERIOD, IMMEDIATE_RESPONSE_CATEGORY, RESPONSIBLE_PARTY,
+  SHARING_METHOD, SHARING_PROOF_TYPE,
   SHARING_STATUS,
   VERIFICATION_STATUS,
   WORK_STATUS,
@@ -11,6 +13,7 @@ import {
   isCorrectiveActionClosed,
   markAllWorkersPresent,
   normalizeCorrectiveAction,
+  normalizeAttendanceSummary,
   normalizeHazard,
   normalizeHazardStatus,
   normalizeSessionRecord,
@@ -22,11 +25,27 @@ import {
 import { openOfflineStore, SYNC_STATUS } from '../storage/offline-store.ts';
 import { createSyncEngine } from '../storage/sync-engine.ts';
 import { createApplicationState } from '../state/application-state.ts';
-import { escapeHtml, formatDateTime } from '../views/shared/format.ts';
+import { escapeHtml, formatDateTime as formatDateTimeValue } from '../views/shared/format.ts';
+import { conciseAnnouncement, hasUnsavedManualEntry, statusSymbol, viewFocusSelector } from '../views/shared/accessibility.ts';
 import { apiRequest } from '../api/client.ts';
 import { validatePublicUserBoundary, validateSessionBoundary } from '../domain/validation.ts';
-import { DRAFT_STATUS_TEXT, syncStatusForLabel } from '../views/dashboard/sync-status.ts';
-import { createMockGlassesEvidence, isGlassesPreview, normalBrowserUrl } from '../views/glasses/model.ts';
+import { DRAFT_STATUS_TEXT, draftStatusLabel, syncStatusForLabel } from '../views/dashboard/sync-status.ts';
+import {
+  GLASSES_STEP,
+  buildPrimaryHazardModel,
+  createMockGlassesEvidence,
+  attendanceValue,
+  evidenceSourceLabel,
+  glassesSyncState,
+  isAttendanceSummaryValid,
+  isGlassesPreview,
+  normalizeGlassesStep,
+  normalBrowserUrl,
+  reducePreviewHelp
+} from '../views/glasses/model.ts';
+import { createTranslator } from '../i18n/index.ts';
+import { persistLanguage, restoreLanguage, updateDocumentLanguage } from '../i18n/preference.ts';
+import { localizeFinalizationBlocker } from '../i18n/workflow.ts';
 
 // ---------------------------------------------------------------------------
 // Constants / config
@@ -41,7 +60,16 @@ const stressMemo =
 const isStressTest = new URLSearchParams(window.location.search).has('stress');
 // Glasses HUD Mode is a browser preview for a future Meta Display / wearable app.
 const isGlassesMode = isGlassesPreview(window.location.search);
+document.documentElement.classList.toggle('is-glasses-mode', isGlassesMode);
+document.documentElement.classList.toggle('is-normal-mode', !isGlassesMode);
 const LOCAL_DRAFT_VERSION = 2;
+let locale = restoreLanguage();
+let t = createTranslator(locale);
+updateDocumentLanguage(locale);
+let lastNormalViewKey = '';
+let lastNormalAnnouncement = '';
+let lastNormalDraftStatus = '';
+let pendingFocusSelector = '';
 
 // ---------------------------------------------------------------------------
 // App state
@@ -60,12 +88,25 @@ async function apiFetch(url, options = {}) {
   if (response.status === 401) {
     state.currentUser = null;
     state.authMode = 'login';
-    state.authFeedback = 'Please log in to continue.';
+    state.authFeedback = t('auth.loginRequired');
     state.phase = 'auth';
     render();
   }
 
   return response;
+}
+
+function formatDateTime(value) {
+  return formatDateTimeValue(value, locale);
+}
+
+function selectLanguage(value) {
+  locale = value === 'en' ? 'en' : 'ko';
+  t = createTranslator(locale);
+  persistLanguage(locale);
+  updateDocumentLanguage(locale);
+  pendingFocusSelector = '[data-language-selector]';
+  render();
 }
 
 function getApiErrorMessage(error, fallback) {
@@ -133,19 +174,27 @@ function v2Progress(current, total, label = '', type = 'workflow') {
 }
 
 function v2WorkflowProgress(step) {
-  return v2Progress(step, 4, 'Workflow', 'workflow');
+  return v2Progress(step, 4, t('workflow.label'), 'workflow');
 }
 
 function v2ChecklistProgress() {
-  return v2Progress(getCurrentHazardNumber(), state.hazards.length, 'Hazards', 'checklist');
+  return v2Progress(getCurrentHazardNumber(), state.hazards.length, t('hazards.label'), 'checklist');
+}
+
+function languageControl() {
+  return `<label class="language-control"><span class="sr-only">${t('language.label')}</span><select data-language-selector aria-label="${t('language.label')}">
+    <option value="ko" ${locale === 'ko' ? 'selected' : ''}>${t('language.korean')}</option>
+    <option value="en" ${locale === 'en' ? 'selected' : ''}>${t('language.english')}</option>
+  </select></label>`;
 }
 
 function v2Header(title, progressHtml = '') {
   return `
     <header class="v2-header">
       ${v2Logo()}
-      <div class="v2-header-title"><h1>${escapeHtml(title)}</h1></div>
+      <div class="v2-header-title"><h1 tabindex="-1" data-view-heading>${escapeHtml(title)}</h1></div>
       <div class="v2-header-right">
+        ${languageControl()}
         ${progressHtml}
       </div>
     </header>
@@ -154,9 +203,9 @@ function v2Header(title, progressHtml = '') {
 
 function v2StatusChip(label, value, tone = 'neutral') {
   return `
-    <div class="v2-status-chip is-${tone}">
+    <div class="v2-status-chip is-${tone}" role="group" aria-label="${escapeHtml(`${label}: ${value}`)}">
       <span>${escapeHtml(label)}</span>
-      <strong>${escapeHtml(value)}</strong>
+      <strong><b aria-hidden="true">${statusSymbol(tone)}</b> ${escapeHtml(value)}</strong>
     </div>
   `;
 }
@@ -165,10 +214,10 @@ function buildUserBadge() {
   if (!state.currentUser) return '';
 
   return `
-    <section class="v2-user-badge user-badge" aria-label="Logged in user">
+    <section class="v2-user-badge user-badge" aria-label="${t('common.login')}">
       ${v2Icon('user')}
       <span>${escapeHtml(state.currentUser.name)}</span>
-      <button class="focusable v2-user-logout" data-action="logout" aria-label="Logout">Logout</button>
+      <button class="focusable v2-user-logout" data-action="logout" aria-label="${t('common.logout')}">${t('common.logout')}</button>
     </section>
   `;
 }
@@ -200,11 +249,11 @@ async function checkAuth() {
     const cached = profiles[0];
     if (!navigator.onLine && cached?.user) {
       state.currentUser = cached.user;
-      state.authFeedback = 'Offline mode — identity is cached on this device; server authentication will be rechecked online.';
+      state.authFeedback = t('auth.offlineIdentity');
       await loadHazards();
     } else {
       state.currentUser = null;
-      state.authFeedback = getApiErrorMessage(error, 'Could not check login status.');
+      state.authFeedback = getApiErrorMessage(error, t('auth.checkFailed'));
       state.phase = 'auth';
       render();
     }
@@ -228,7 +277,7 @@ async function submitAuth(form) {
   }
 
   state.isAuthSubmitting = true;
-  state.authFeedback = isRegister ? 'Creating account...' : 'Logging in...';
+  state.authFeedback = isRegister ? t('auth.creating') : t('auth.loggingIn');
   render();
 
   try {
@@ -245,13 +294,13 @@ async function submitAuth(form) {
       throw new Error(result.error ?? 'Authentication failed.');
     }
 
-    if (!validatePublicUserBoundary(result.user)) throw new Error('Authentication response is invalid.');
+    if (!validatePublicUserBoundary(result.user)) throw new Error(t('auth.invalidResponse'));
     state.currentUser = result.user;
     await state.offlineStore?.putProfile({ userId: result.user.id, user: result.user });
     state.authFeedback = '';
     await loadHazards();
   } catch (error) {
-    state.authFeedback = getApiErrorMessage(error, 'Authentication failed.');
+    state.authFeedback = getApiErrorMessage(error, t('auth.failed'));
     state.phase = 'auth';
     render();
   } finally {
@@ -263,7 +312,7 @@ async function logout() {
   await apiRequest('/api/auth/logout', { method: 'POST' }).catch(() => {});
   state.currentUser = null;
   state.authMode = 'login';
-  state.authFeedback = 'Logged out.';
+  state.authFeedback = t('auth.loggedOut');
   state.phase = 'auth';
   render();
 }
@@ -291,9 +340,13 @@ function buildLocalDraft() {
     responses: state.responses,
     nearMisses: state.nearMisses,
     glassesStep: state.glassesStep,
+    glassesReturnStep: state.glassesReturnStep,
     glassesMemoFeedback: state.glassesMemoFeedback,
     glassesPhotoFeedback: state.glassesPhotoFeedback,
     glassesReviewFeedback: state.glassesReviewFeedback,
+    glassesAttendanceDigits: state.glassesAttendanceDigits,
+    glassesProvisionalDecision: state.glassesProvisionalDecision,
+    glassesContext: state.glassesContext,
     saveFeedback: state.saveFeedback
   };
 }
@@ -333,7 +386,7 @@ function saveLocalDraft(status = DRAFT_STATUS_TEXT.DEVICE_ONLY) {
   state.draftStatus = status;
   void state.offlineStore?.putDraft(buildLocalDraft()).catch(() => {
     state.draftStatus = DRAFT_STATUS_TEXT.UNAVAILABLE;
-    render();
+    refreshNonStructuralUi();
   });
 }
 
@@ -365,7 +418,8 @@ async function synchronizeNow() {
       state.session.completedAt = draft.serverSession.completedAt ?? null;
     }
   }
-  render();
+  if (isGlassesMode && state.phase === 'summary') render();
+  else refreshNonStructuralUi();
 }
 
 function restoreLocalDraft(draft) {
@@ -386,7 +440,8 @@ function restoreLocalDraft(draft) {
     ...state.session,
     ...draft.session,
     completedAt: null,
-    sharing: normalizeSharing(draft.session.sharing)
+    sharing: normalizeSharing(draft.session.sharing),
+    attendanceSummary: normalizeAttendanceSummary(draft.session.attendanceSummary)
   };
   state.workers = draft.workers.map(normalizeWorker);
   state.hazards = Array.isArray(draft.hazards) && draft.hazards.length ? draft.hazards : state.hazards;
@@ -395,10 +450,19 @@ function restoreLocalDraft(draft) {
   state.index = Math.max(0, Math.min(state.responses.length - 1, Number(draft.index) || 0));
   state.phase = safePhase;
   state.memo = draft.memo ?? currentResponse()?.memo ?? '';
-  state.glassesStep = draft.glassesStep ?? (safePhase === 'checklist' ? 'hazard' : 'start');
+  state.glassesStep = normalizeGlassesStep(draft.glassesStep, {
+    phase: safePhase,
+    blockerCount: getFinalizationBlockers({ hazards: state.responses, sharing: state.session.sharing }).length,
+    syncStatus: draft.syncStatus,
+    completedAt: state.session.completedAt
+  });
+  state.glassesReturnStep = draft.glassesReturnStep ?? GLASSES_STEP.HAZARD_DECISION;
   state.glassesMemoFeedback = draft.glassesMemoFeedback ?? '';
   state.glassesPhotoFeedback = draft.glassesPhotoFeedback ?? '';
   state.glassesReviewFeedback = draft.glassesReviewFeedback ?? '';
+  state.glassesAttendanceDigits = draft.glassesAttendanceDigits ?? state.glassesAttendanceDigits;
+  state.glassesProvisionalDecision = draft.glassesProvisionalDecision ?? null;
+  state.glassesContext = draft.glassesContext ?? null;
   state.saveFeedback = draft.saveFeedback ?? '';
   state.serverRevision = Number(draft.serverRevision) || 0;
   state.syncConflict = draft.conflict ?? null;
@@ -408,13 +472,114 @@ function restoreLocalDraft(draft) {
 
 function draftStatusHtml() {
   if (!state.draftStatus) return '';
-  const retry = [DRAFT_STATUS_TEXT.FAILED, DRAFT_STATUS_TEXT.QUEUED].includes(state.draftStatus)
-    ? '<button class="focusable v2-key-button v2-key-small" data-action="retry-sync">Retry sync</button>'
-    : '';
-  const resolve = state.draftStatus === DRAFT_STATUS_TEXT.CONFLICT
-    ? '<button class="focusable v2-key-button v2-key-small" data-action="resolve-conflict-local">Review and keep local changes</button>'
-    : '';
-  return `<div class="draft-status"><span>${escapeHtml(state.draftStatus)}</span>${retry}${resolve}</div>`;
+  const retryHidden = [DRAFT_STATUS_TEXT.FAILED, DRAFT_STATUS_TEXT.QUEUED].includes(state.draftStatus) ? '' : 'hidden';
+  const resolveHidden = state.draftStatus === DRAFT_STATUS_TEXT.CONFLICT ? '' : 'hidden';
+  return `<div class="draft-status" data-sync-presentation><span>${escapeHtml(draftStatusLabel(state.draftStatus, t))}</span>
+    <button class="focusable v2-key-button v2-key-small" data-action="retry-sync" ${retryHidden}>${t('sync.retry')}</button>
+    <button class="focusable v2-key-button v2-key-small" data-action="resolve-conflict-local" ${resolveHidden}>${t('sync.reviewLocal')}</button>
+  </div>`;
+}
+
+function bindCompositionSafeInput(element, callback) {
+  let composing = false;
+  element.addEventListener('compositionstart', () => { composing = true; });
+  element.addEventListener('compositionend', (event) => {
+    composing = false;
+    callback(event.currentTarget.value);
+  });
+  element.addEventListener('input', (event) => {
+    if (composing || event.isComposing) return;
+    callback(event.currentTarget.value);
+  });
+}
+
+function updateApplicationAnnouncement() {
+  const statusLabel = state.draftStatus ? draftStatusLabel(state.draftStatus, t) : '';
+  const statusChanged = state.draftStatus !== lastNormalDraftStatus;
+  const urgent = state.draftStatus === DRAFT_STATUS_TEXT.FAILED || state.draftStatus === DRAFT_STATUS_TEXT.CONFLICT;
+  const announcement = conciseAnnouncement({
+    feedback: statusChanged || urgent ? '' : state.saveFeedback || state.authFeedback,
+    status: state.draftStatus,
+    statusLabel
+  });
+  let liveRegion = document.querySelector('#application-live-region');
+  if (!liveRegion) {
+    liveRegion = document.createElement('p');
+    liveRegion.id = 'application-live-region';
+    liveRegion.className = 'sr-only';
+    document.body.append(liveRegion);
+  }
+  liveRegion.setAttribute('role', urgent ? 'alert' : 'status');
+  liveRegion.setAttribute('aria-live', urgent ? 'assertive' : 'polite');
+  liveRegion.setAttribute('aria-atomic', 'true');
+  if (announcement !== lastNormalAnnouncement) liveRegion.textContent = announcement;
+  lastNormalAnnouncement = announcement;
+  lastNormalDraftStatus = state.draftStatus;
+}
+
+function refreshNonStructuralUi() {
+  app.querySelectorAll('[data-sync-presentation]').forEach((presentation) => {
+    const label = presentation.querySelector('span');
+    if (label) label.textContent = draftStatusLabel(state.draftStatus, t);
+    const retry = presentation.querySelector('[data-action="retry-sync"]');
+    const resolve = presentation.querySelector('[data-action="resolve-conflict-local"]');
+    if (retry) retry.hidden = ![DRAFT_STATUS_TEXT.FAILED, DRAFT_STATUS_TEXT.QUEUED].includes(state.draftStatus);
+    if (resolve) resolve.hidden = state.draftStatus !== DRAFT_STATUS_TEXT.CONFLICT;
+  });
+  const saveFeedback = app.querySelector('[data-save-feedback]');
+  if (saveFeedback) saveFeedback.textContent = state.saveFeedback;
+  const glassesSync = app.querySelector('.glasses-sync');
+  if (glassesSync) {
+    const presentation = glassesSyncState(state.draftStatus);
+    glassesSync.className = `glasses-sync is-${presentation.tone}`;
+    glassesSync.textContent = t(presentation.key);
+  }
+  updateApplicationAnnouncement();
+}
+
+function getSummaryPresentation(blockers) {
+  const proposedStatus = blockers.length ? 'draft' : getPotentialRecordStatus();
+  const isRecorded = Boolean(state.session.finalizedAt);
+  const title = state.session.completedAt
+    ? t('summary.complete')
+    : isRecorded && proposedStatus === 'actions_open'
+      ? t('summary.actionsOpen')
+      : blockers.length
+        ? t('summary.blocked')
+        : proposedStatus === 'actions_open'
+          ? t('summary.readyActions')
+          : t('summary.readyFinalize');
+  const explanation = blockers.length
+    ? t('summary.blockedExplanation')
+    : proposedStatus === 'actions_open'
+      ? t('summary.actionsOpenExplanation')
+      : t('summary.completeExplanation');
+  return { proposedStatus, title, explanation };
+}
+
+function refreshSummaryDerivedUi() {
+  if (state.phase !== 'summary') return;
+  const blockers = getFinalizationBlockers(buildSessionLog());
+  const presentation = getSummaryPresentation(blockers);
+  const blockerPanel = app.querySelector('[data-finalization-blockers]');
+  if (blockerPanel) {
+    blockerPanel.innerHTML = blockers.length
+      ? `<ul>${blockers.map((blocker) => `<li>${escapeHtml(localizeFinalizationBlocker(blocker, t))}</li>`).join('')}</ul>`
+      : `<p>${t('summary.noBlockers')}</p>`;
+  }
+  const title = app.querySelector('[data-summary-title]');
+  const explanation = app.querySelector('[data-summary-explanation]');
+  if (title) title.textContent = presentation.title;
+  if (explanation) explanation.textContent = presentation.explanation;
+  const status = app.querySelector('.v2-summary-hero .v2-status-chip');
+  if (status) {
+    status.className = `v2-status-chip is-${blockers.length ? 'warning' : 'success'}`;
+    status.setAttribute('aria-label', `${t('common.status')}: ${presentation.proposedStatus}`);
+    const value = status.querySelector('strong');
+    if (value) value.innerHTML = `<b aria-hidden="true">${statusSymbol(blockers.length ? 'warning' : 'success')}</b> ${escapeHtml(presentation.proposedStatus)}`;
+  }
+  const finalize = app.querySelector('[data-action="finalize"]');
+  if (finalize) finalize.disabled = state.isSavingSession || blockers.length > 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -508,9 +673,9 @@ function makeStressHazards(hazards) {
   return [
     {
       id: 'open-floor-hole-stress',
-      name: 'Open floor hole with unusually long inspection title that must wrap across multiple lines without colliding with the progress bar or action controls',
+      name: '지하 3층 동측 자재 반입구 인근 임시 개구부 주변 추락 위험 방지 시설과 접근 통제 상태를 확인하는 매우 긴 점검 항목',
       location:
-        'Level 3 east wing corridor beside the temporary hoist landing and material staging zone near gridline C-12',
+        '지하 3층 동측 임시 호이스트 승강장 옆 자재 적치 구역과 C-12 그리드 사이의 매우 긴 작업 위치',
       category: 'fall_prevention',
       riskLevel: 'high',
       risk:
@@ -633,6 +798,7 @@ function updateSharing(field, value) {
   state.session.sharing = normalizeSharing(next);
   saveLocalDraft();
   void queueCurrentMutation('sharing_event', state.session.sessionId);
+  refreshSummaryDerivedUi();
 }
 
 function goTo(index) {
@@ -671,6 +837,9 @@ function setStatus(status) {
   };
 
   response.correctiveAction = normalizeCorrectiveAction(response.correctiveAction, response.status);
+  if (response.status === HAZARD_STATUS.ACTION_REQUIRED && !isGlassesMode) {
+    pendingFocusSelector = '[data-corrective-field="immediateControl"]';
+  }
 
   if (
     response.status === HAZARD_STATUS.CONTROLLED &&
@@ -692,28 +861,10 @@ function setStatus(status) {
 // ---------------------------------------------------------------------------
 // Glasses mode shares the same session, response, draft, save, and report model
 // as the normal dashboard; only the interaction layer is different.
-// Future Meta Web Apps integration points:
-// - Replace getMockEvidencePhoto/captureGlassesPhoto with camera/photo capture.
-// - Replace captureGlassesMemo with voice memo or speech-to-text capture.
-// - Add phone GPS / site-location APIs near session startup when available.
-// - Add local offline storage around shared session state before backend sync.
+// Memo and photo actions below are explicitly labeled prototype mocks.
 
 function getMockEvidencePhoto() {
   return createMockGlassesEvidence(getCurrentHazardNumber());
-}
-
-function captureGlassesMemo() {
-  if (!currentResponse()) return;
-
-  markRecordDirty();
-  // Future voice memo / speech-to-text hook: replace this fixed memo with transcript text.
-  const memo = 'Voice memo captured: supervisor requested follow-up before restart.';
-  state.memo = memo;
-  currentResponse().memo = memo;
-  state.glassesMemoFeedback = memo;
-  state.glassesStep = 'memo';
-  saveLocalDraft();
-  render();
 }
 
 function captureGlassesPhoto() {
@@ -721,47 +872,43 @@ function captureGlassesPhoto() {
   if (!response) return;
 
   markRecordDirty();
-  // Future camera/photo hook: replace this mock placeholder with device capture metadata.
   response.evidencePhotos = [...(response.evidencePhotos ?? []), getMockEvidencePhoto()];
   response.updatedAt = new Date().toISOString();
-  state.glassesPhotoFeedback = 'Mock photo evidence captured for this hazard.';
-  state.glassesStep = 'photo';
+  state.glassesPhotoFeedback = t('glasses.mockPhotoRecorded');
+  state.glassesStep = GLASSES_STEP.PHOTO_EVIDENCE;
+  state.glassesAnnouncement = t('glasses.photoCaptured');
   saveLocalDraft();
   render();
 }
 
 function startGlassesTbm() {
-  // Future phone GPS / site location hook can update state.session.gps here.
   markRecordDirty();
   if (!state.session.startedAt) state.session.startedAt = new Date().toISOString();
-  state.phase = 'participation';
-  state.glassesStep = 'workers';
+  state.glassesContext = {
+    observedAt: new Date().toISOString(), timeSource: 'device_time',
+    locationSource: state.session.gps?.latitude != null ? 'session_coordinates' : 'session_site'
+  };
+  state.glassesStep = GLASSES_STEP.CONTEXT_CONFIRMATION;
+  state.glassesAnnouncement = t('glasses.contextTitle');
   saveLocalDraft(DRAFT_STATUS_TEXT.DEVICE_ONLY);
   render();
 }
 
 function continueGlassesFromWorkers() {
+  const digits = state.glassesAttendanceDigits;
+  const summary = normalizeAttendanceSummary({ expectedCount: attendanceValue(digits.expectedTens, digits.expectedOnes),
+    presentCount: attendanceValue(digits.presentTens, digits.presentOnes), captureSource: ATTENDANCE_CAPTURE_SOURCE.GLASSES_COUNT_SELECTOR,
+    deviceObservedAt: new Date().toISOString() });
+  if (!summary) return;
   markRecordDirty();
-  state.workers = markAllWorkersPresent(state.workers);
+  state.session.attendanceSummary = summary;
   state.phase = 'checklist';
   state.index = 0;
   state.memo = currentResponse()?.memo ?? '';
-  state.glassesStep = 'hazard';
+  state.glassesStep = GLASSES_STEP.HAZARD_DECISION;
+  state.glassesAnnouncement = t('hazard.checklist');
   saveLocalDraft();
   void queueCurrentMutation('attendance_acknowledgment', state.session.sessionId);
-  render();
-}
-
-function continueGlassesReview() {
-  if (state.phase === 'summary' || state.glassesStep === 'summary') {
-    state.glassesStep = 'summary';
-    saveLocalDraft();
-    render();
-    return;
-  }
-
-  state.glassesStep = 'hazard';
-  saveLocalDraft();
   render();
 }
 
@@ -770,8 +917,11 @@ function exitGlassesMode() {
 }
 
 function handleGlassesAction(action) {
-  // This action router is the portability seam for future Neural Band gestures.
-  // Browser keyboard/buttons call it today; hardware input should call the same actions.
+  if (action === 'toggle-help') {
+    state.glassesHelpOpen = !state.glassesHelpOpen;
+    render();
+    return;
+  }
   if (action === 'exit') {
     exitGlassesMode();
     return;
@@ -781,68 +931,78 @@ function handleGlassesAction(action) {
     startGlassesTbm();
     return;
   }
-
-  if (action === 'workers') {
+  if (action === 'context-confirm') {
+    state.phase = 'participation'; state.glassesStep = GLASSES_STEP.ATTENDANCE; saveLocalDraft(); render(); return;
+  }
+  if (action === 'context-reject') {
+    state.glassesStep = GLASSES_STEP.START; saveLocalDraft(); render(); return;
+  }
+  if (action === 'attendance-continue') {
     continueGlassesFromWorkers();
     return;
   }
-
-  if (action === 'memo') {
-    captureGlassesMemo();
-    return;
-  }
-
-  if (action === 'photo') {
+  if (action === 'mock-photo') {
+    if (state.phase !== 'checklist') return;
     captureGlassesPhoto();
     return;
   }
+  if (action === 'evidence-continue') {
+    state.glassesStep = GLASSES_STEP.HAZARD_CONFIRMATION; saveLocalDraft(); render(); return;
+  }
 
   if (action === 'controlled') {
-    if (state.glassesStep !== 'hazard') return;
+    if (state.glassesStep !== GLASSES_STEP.HAZARD_DECISION) return;
     if (state.phase !== 'checklist') state.phase = 'checklist';
-    state.glassesStep = 'hazard';
-    state.glassesReviewFeedback = `Recorded on device: Hazard ${getCurrentHazardNumber()} controlled — reviewed and safe to proceed.`;
-    setStatus(HAZARD_STATUS.CONTROLLED);
+    state.glassesProvisionalDecision = HAZARD_STATUS.CONTROLLED;
+    state.glassesStep = GLASSES_STEP.PHOTO_EVIDENCE;
+    state.glassesReviewFeedback = t('glasses.controlledFeedback', { number: getCurrentHazardNumber() });
+    saveLocalDraft(); render();
     return;
   }
 
   if (action === 'action-required') {
-    if (state.glassesStep !== 'hazard') return;
+    if (state.glassesStep !== GLASSES_STEP.HAZARD_DECISION) return;
     if (state.phase !== 'checklist') state.phase = 'checklist';
-    state.glassesStep = 'hazard';
-    state.glassesReviewFeedback = `Hazard ${getCurrentHazardNumber()} requires action. Corrective-action details remain open.`;
-    setStatus(HAZARD_STATUS.ACTION_REQUIRED);
+    state.glassesProvisionalDecision = HAZARD_STATUS.ACTION_REQUIRED;
+    state.glassesStep = GLASSES_STEP.CORRECTIVE_ACTION;
+    state.glassesReviewFeedback = t('glasses.actionFeedback', { number: getCurrentHazardNumber() });
+    const response = currentResponse(); response.status = HAZARD_STATUS.ACTION_REQUIRED;
+    response.correctiveAction = normalizeCorrectiveAction(response.correctiveAction, response.status);
+    saveLocalDraft(); render();
     return;
   }
-
-  if (action === 'save-session') {
-    // Future offline-first sync hook: queue locally first, then call backend save.
-    saveCurrentSession('draft');
-    return;
+  if (action === 'corrective-continue') { state.glassesStep = GLASSES_STEP.PHOTO_EVIDENCE; saveLocalDraft(); render(); return; }
+  if (action === 'hazard-confirm') {
+    const response = currentResponse(); const reviewedAt = new Date().toISOString();
+    response.status = state.glassesProvisionalDecision; response.updatedAt = reviewedAt;
+    response.humanReview = { reviewed: true, decision: response.status, reviewedBy: state.session.supervisorName, reviewedAt };
+    response.correctiveAction = normalizeCorrectiveAction(response.correctiveAction, response.status);
+    state.glassesProvisionalDecision = null;
+    if (state.index < state.hazards.length - 1) { state.index += 1; state.glassesStep = GLASSES_STEP.HAZARD_DECISION; }
+    else { state.phase = 'summary'; state.glassesStep = GLASSES_STEP.HAZARD_SUMMARY; }
+    saveLocalDraft(); void queueCurrentMutation('hazard_review', response.id); render(); return;
   }
-
-  if (action === 'finalize') {
-    saveCurrentSession('finalize');
-    return;
+  if (action === 'summary-continue') { state.glassesStep = GLASSES_STEP.SHARING_RECORD; saveLocalDraft(); render(); return; }
+  if (action === 'record-continue') {
+    if (getFinalizationBlockers(buildSessionLog()).length) return;
+    state.glassesStep = GLASSES_STEP.RECORDING; saveLocalDraft();
+    void saveCurrentSession('finalize').then(() => { if (state.glassesStep !== GLASSES_STEP.CONFLICT) state.glassesStep = GLASSES_STEP.COMPLETE; saveLocalDraft(); render(); });
+    render(); return;
   }
-
-  if (action === 'next') {
-    if (state.glassesStep === 'start') startGlassesTbm();
-    else if (state.glassesStep === 'workers') continueGlassesFromWorkers();
-    else if (state.glassesStep === 'memo' || state.glassesStep === 'photo') continueGlassesReview();
-    else if (state.phase === 'checklist') goTo(state.index + 1);
-    else state.glassesStep = 'summary';
-    return;
-  }
+  if (action === 'done') { state.glassesStep = GLASSES_STEP.START; state.phase = 'start'; saveLocalDraft(); render(); return; }
 
   if (action === 'prev') {
-    if (state.glassesStep === 'workers') state.glassesStep = 'start';
-    else if (state.glassesStep === 'hazard' && state.index > 0) goTo(state.index - 1);
-    else if (state.glassesStep === 'memo' || state.glassesStep === 'photo') state.glassesStep = 'hazard';
-    else if (state.glassesStep === 'summary') {
-      state.phase = 'checklist';
-      state.glassesStep = 'hazard';
-    }
+    if (state.glassesStep === GLASSES_STEP.CONTEXT_CONFIRMATION) state.glassesStep = GLASSES_STEP.START;
+    else if (state.glassesStep === GLASSES_STEP.ATTENDANCE) state.glassesStep = GLASSES_STEP.CONTEXT_CONFIRMATION;
+    else if (state.glassesStep === GLASSES_STEP.HAZARD_DECISION && state.index > 0) goTo(state.index - 1);
+    else if (state.glassesStep === GLASSES_STEP.HAZARD_DECISION) {
+      state.phase = 'participation';
+      state.glassesStep = GLASSES_STEP.ATTENDANCE;
+    } else if (state.glassesStep === GLASSES_STEP.CORRECTIVE_ACTION) state.glassesStep = GLASSES_STEP.HAZARD_DECISION;
+    else if (state.glassesStep === GLASSES_STEP.PHOTO_EVIDENCE) state.glassesStep = state.glassesProvisionalDecision === HAZARD_STATUS.ACTION_REQUIRED ? GLASSES_STEP.CORRECTIVE_ACTION : GLASSES_STEP.HAZARD_DECISION;
+    else if (state.glassesStep === GLASSES_STEP.HAZARD_CONFIRMATION) state.glassesStep = GLASSES_STEP.PHOTO_EVIDENCE;
+    else if (state.glassesStep === GLASSES_STEP.HAZARD_SUMMARY) { state.phase = 'checklist'; state.index = Math.max(0, state.responses.length - 1); state.glassesStep = GLASSES_STEP.HAZARD_CONFIRMATION; state.glassesProvisionalDecision = currentResponse().status; }
+    else if (state.glassesStep === GLASSES_STEP.SHARING_RECORD) state.glassesStep = GLASSES_STEP.HAZARD_SUMMARY;
     saveLocalDraft();
     render();
   }
@@ -883,7 +1043,7 @@ function getCurrentHazardNumber() {
 }
 
 function getHazardProgressText() {
-  return `Hazard ${getCurrentHazardNumber()} / ${state.hazards.length}`;
+  return t('hazard.progress', { current: getCurrentHazardNumber(), total: state.hazards.length });
 }
 
 function getPotentialRecordStatus() {
@@ -892,6 +1052,10 @@ function getPotentialRecordStatus() {
 
 function getSessionStatus() {
   return state.session.finalizedAt ? getPotentialRecordStatus() : 'draft';
+}
+
+function recordStatusLabel(status) {
+  return t(`status.${status}`);
 }
 
 function getHumanReview(item) {
@@ -927,6 +1091,7 @@ function openManualEntry() {
   state.manualEntryFeedback = '';
   state.manualAiSuggestion = null;
   state.manualAiDecision = null;
+  state.manualUploadedEvidence = [];
   state.phase = 'manual-entry';
   render();
 }
@@ -934,6 +1099,18 @@ function openManualEntry() {
 function cancelManualEntry() {
   state.phase = state.returnPhase;
   render();
+}
+
+function manualEntryHasUnsavedValues() {
+  const form = app.querySelector('#manual-entry-form');
+  if (!form) return false;
+  return hasUnsavedManualEntry({
+    title: form.elements.title?.value,
+    location: form.elements.location?.value,
+    description: form.elements.description?.value,
+    actionText: form.elements.actionText?.value,
+    evidencePhotos: Array.from(form.elements.evidencePhotos?.files ?? [])
+  });
 }
 
 async function uploadEvidencePhotos(files) {
@@ -972,18 +1149,21 @@ function renderAiSuggestion() {
     return;
   }
 
-  const suggestion = state.manualAiSuggestion;
+  const analysis = state.manualAiSuggestion;
+  const suggestion = analysis.suggestion ?? analysis;
   const decisionText =
     state.manualAiDecision === 'accepted'
-      ? 'Accepted'
+      ? t('ai.accepted')
+      : state.manualAiDecision === 'edited'
+        ? t('ai.edited')
       : state.manualAiDecision === 'rejected'
-        ? 'Rejected'
-        : 'Human review required';
+        ? t('ai.rejected')
+        : t('ai.reviewRequired');
   const confidencePercent = `${Math.round(suggestion.confidence * 100)}%`;
 
   container.innerHTML = `
-    <section class="v2-card v2-ai-card ai-suggestion-card ${state.manualAiDecision ? `is-${state.manualAiDecision}` : ''}" aria-label="Mock AI Suggestion">
-      <div class="v2-ai-header"><h3>AI Suggestion</h3><span>Beta</span></div>
+    <section class="v2-card v2-ai-card ai-suggestion-card ${state.manualAiDecision ? `is-${state.manualAiDecision}` : ''}" aria-label="${t('ai.simulatedSuggestion')}">
+      <div class="v2-ai-header"><h3>${t('ai.simulatedSuggestion')}</h3><span>${t('ai.simulated')}</span></div>
       <div class="v2-ai-hero">
         <div class="v2-warning-tile">!</div>
         <div>
@@ -992,51 +1172,63 @@ function renderAiSuggestion() {
         </div>
       </div>
       <dl class="v2-ai-facts">
-        <div><dt>Category</dt><dd>${escapeHtml(suggestion.category)}</dd></div>
-        <div><dt>Risk Level</dt><dd>${escapeHtml(suggestion.riskLevel)}</dd></div>
-        <div><dt>Confidence</dt><dd>${confidencePercent}</dd></div>
-        <div><dt>Status</dt><dd>${decisionText}</dd></div>
+        <div><dt>${t('ai.category')}</dt><dd>${escapeHtml(suggestion.category)}</dd></div>
+        <div><dt>${t('ai.riskLevel')}</dt><dd>${escapeHtml(suggestion.riskLevel)}</dd></div>
+        <div><dt>${t('ai.confidence')}</dt><dd>${confidencePercent}</dd></div>
+        <div><dt>${t('common.status')}</dt><dd>${decisionText}</dd></div>
       </dl>
-      <p class="v2-ai-note">Human review required before this suggestion can affect the saved TBM record.</p>
+      <p class="v2-ai-note"><strong>${t('ai.mockPixelsNotRead')}</strong></p>
+      <p class="v2-ai-note">${t('ai.reviewNote')}</p>
       <p class="v2-ai-note">${escapeHtml(suggestion.recommendedAction)}</p>
       <section class="v2-ai-actions">
-        <button class="focusable v2-key-button v2-key-primary v2-key-small" type="button" data-action="accept-ai">Accept Suggestion</button>
-        <button class="focusable v2-key-button v2-key-small" type="button" data-action="reject-ai">Reject Suggestion</button>
+        <button class="focusable v2-key-button v2-key-primary v2-key-small" type="button" data-action="accept-ai">${t('ai.accept')}</button>
+        <button class="focusable v2-key-button v2-key-small" type="button" data-action="edit-ai">${t('ai.edit')}</button>
+        <button class="focusable v2-key-button v2-key-small" type="button" data-action="reject-ai">${t('ai.reject')}</button>
       </section>
     </section>
   `;
 
-  container.querySelector('button[data-action="accept-ai"]').addEventListener('click', () => {
-    acceptManualAiSuggestion(app.querySelector('#manual-entry-form'));
+  container.querySelector('button[data-action="accept-ai"]').addEventListener('click', async () => {
+    await acceptManualAiSuggestion(app.querySelector('#manual-entry-form'));
   });
-  container.querySelector('button[data-action="reject-ai"]').addEventListener('click', () => {
-    rejectManualAiSuggestion();
+  container.querySelector('button[data-action="edit-ai"]').addEventListener('click', async () => {
+    await editManualAiSuggestion(app.querySelector('#manual-entry-form'));
+  });
+  container.querySelector('button[data-action="reject-ai"]').addEventListener('click', async () => {
+    await rejectManualAiSuggestion();
   });
 }
 
-function getSelectedPhotoMetadata(files) {
-  return files.map((file) => ({
-    originalName: file.name,
-    size: file.size,
-    type: file.type
-  }));
+async function uploadEvidenceForAnalysis(file) {
+  const existing = state.manualUploadedEvidence.find((item) => item.originalName === file.name && item.size === file.size);
+  if (existing) return existing;
+  const formData = new FormData();
+  formData.append('photos', file, file.name);
+  const response = await apiFetch('/api/uploads', { method: 'POST', body: formData });
+  const payload = await response.json().catch(() => ([]));
+  if (!response.ok || !Array.isArray(payload) || !payload[0]?.uploadId) {
+    throw new Error(payload.error ?? `Evidence upload failed (${response.status})`);
+  }
+  state.manualUploadedEvidence = [...state.manualUploadedEvidence, payload[0]];
+  return payload[0];
 }
 
 async function analyzeManualPhoto(form) {
   const files = Array.from(form.elements.evidencePhotos?.files ?? []);
   if (!files.length) {
-    state.manualEntryFeedback = 'Attach a photo before running mock analysis.';
+    state.manualEntryFeedback = t('feedback.photoRequired');
     app.querySelector('#manual-entry-feedback').textContent = state.manualEntryFeedback;
     return;
   }
 
   const analyzeButton = app.querySelector('#analyze-photo-button');
-  state.manualEntryFeedback = 'Requesting mock backend AI analysis...';
+  state.manualEntryFeedback = t('feedback.aiRequest');
   app.querySelector('#manual-entry-feedback').textContent = state.manualEntryFeedback;
   analyzeButton.disabled = true;
-  analyzeButton.textContent = 'Analyzing...';
+  analyzeButton.textContent = t('feedback.analyzing');
 
   try {
+    const uploadedEvidence = await uploadEvidenceForAnalysis(files[0]);
     const response = await apiFetch('/api/ai/analyze-hazard', {
       method: 'POST',
       headers: {
@@ -1044,7 +1236,8 @@ async function analyzeManualPhoto(form) {
       },
       body: JSON.stringify({
         entryType: form.elements.type.value,
-        photos: getSelectedPhotoMetadata(files)
+        uploadId: uploadedEvidence.uploadId,
+        sessionId: state.session.sessionId
       })
     });
     const payload = await response.json().catch(() => ({}));
@@ -1055,56 +1248,121 @@ async function analyzeManualPhoto(form) {
 
     state.manualAiSuggestion = payload;
     state.manualAiDecision = null;
-    state.manualEntryFeedback = 'Mock backend AI suggestion generated. Human review required.';
+    state.manualEntryFeedback = t('feedback.aiGenerated');
     app.querySelector('#manual-entry-feedback').textContent = state.manualEntryFeedback;
     renderAiSuggestion();
   } catch (error) {
     state.manualAiSuggestion = null;
     state.manualAiDecision = null;
-    state.manualEntryFeedback = getApiErrorMessage(error, 'Mock AI analysis failed.');
+    state.manualEntryFeedback = getApiErrorMessage(error, t('feedback.aiFailed'));
     app.querySelector('#manual-entry-feedback').textContent = state.manualEntryFeedback;
     renderAiSuggestion();
   } finally {
     analyzeButton.disabled = false;
-    analyzeButton.textContent = 'Analyze Photo';
+    analyzeButton.textContent = t('hazard.generateMockSuggestion');
   }
 }
 
-function getManualAiMetadata() {
-  if (!state.manualAiSuggestion || !state.manualAiDecision) return null;
-  const accepted = state.manualAiDecision === 'accepted';
-
-  // Mock AI metadata is saved only after an explicit human accept/reject step.
+function currentManualSuggestion(form) {
   return {
-    source: state.manualAiSuggestion.source ?? 'mock_ai',
-    accepted,
-    rejected: !accepted,
-    confidence: state.manualAiSuggestion.confidence,
-    suggestedAt: state.manualAiSuggestion.suggestedAt,
-    reviewedAt: new Date().toISOString()
+    title: form.elements.title.value.trim(), category: form.elements.category.value.trim(),
+    riskLevel: form.elements.riskLevel.value, description: form.elements.description.value.trim(),
+    recommendedAction: form.elements.actionText.value.trim()
   };
 }
 
-function acceptManualAiSuggestion(form) {
+function suggestionMatchesForm(form) {
+  const original = state.manualAiSuggestion?.suggestion;
+  if (!original) return false;
+  const current = currentManualSuggestion(form);
+  return ['title', 'category', 'riskLevel', 'description', 'recommendedAction']
+    .every((key) => current[key] === original[key]);
+}
+
+async function persistManualAiDecision(form, decision = state.manualAiDecision) {
+  if (!state.manualAiSuggestion?.analysisId || !decision) return null;
+  const response = await apiFetch(`/api/ai/analyses/${encodeURIComponent(state.manualAiSuggestion.analysisId)}/review`, {
+    method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ decision, ...(decision === 'edited' ? { editedSuggestion: currentManualSuggestion(form) } : {}) })
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(payload.error ?? `Suggestion review failed (${response.status})`);
+  state.manualAiSuggestion = { ...state.manualAiSuggestion, ...payload };
+  return payload;
+}
+
+function getManualAiMetadata(form) {
+  if (!state.manualAiSuggestion || !state.manualAiDecision) return null;
+  const accepted = state.manualAiDecision === 'accepted';
+  return {
+    analysisId: state.manualAiSuggestion.analysisId,
+    uploadId: state.manualAiSuggestion.uploadId,
+    uploadHash: state.manualAiSuggestion.uploadHash,
+    source: state.manualAiSuggestion.mode === 'mock' ? 'mock_ai' : 'ai_provider',
+    mode: state.manualAiSuggestion.mode,
+    provider: state.manualAiSuggestion.provider,
+    modelVersion: state.manualAiSuggestion.modelVersion,
+    simulated: state.manualAiSuggestion.simulated,
+    pixelInterpretation: state.manualAiSuggestion.pixelInterpretation,
+    disclaimer: state.manualAiSuggestion.disclaimer,
+    requestedAt: state.manualAiSuggestion.requestedAt,
+    completedAt: state.manualAiSuggestion.completedAt,
+    rawSuggestion: state.manualAiSuggestion.suggestion,
+    humanDecision: state.manualAiDecision,
+    accepted,
+    edited: state.manualAiDecision === 'edited',
+    rejected: state.manualAiDecision === 'rejected',
+    reviewer: state.manualAiSuggestion.reviewer,
+    confidence: state.manualAiSuggestion.suggestion?.confidence,
+    reviewedAt: state.manualAiSuggestion.reviewedAt,
+    finalHumanSuggestion: state.manualAiDecision === 'rejected' ? null : currentManualSuggestion(form)
+  };
+}
+
+async function acceptManualAiSuggestion(form) {
   if (!state.manualAiSuggestion) return;
 
-  const suggestion = state.manualAiSuggestion;
+  const suggestion = state.manualAiSuggestion.suggestion ?? state.manualAiSuggestion;
   form.elements.title.value = suggestion.title;
   form.elements.category.value = suggestion.category;
   form.elements.riskLevel.value = suggestion.riskLevel;
   form.elements.description.value = suggestion.description;
   form.elements.actionText.value = suggestion.recommendedAction;
   state.manualAiDecision = 'accepted';
-  state.manualEntryFeedback = 'Mock AI suggestion accepted. You can still edit before saving.';
+  try {
+    await persistManualAiDecision(form, 'accepted');
+    state.manualEntryFeedback = t('feedback.aiAccepted');
+  } catch (error) {
+    state.manualEntryFeedback = getApiErrorMessage(error, t('feedback.aiReviewFailed'));
+  }
   app.querySelector('#manual-entry-feedback').textContent = state.manualEntryFeedback;
   renderAiSuggestion();
 }
 
-function rejectManualAiSuggestion() {
+async function editManualAiSuggestion(form) {
+  if (!state.manualAiSuggestion) return;
+  const suggestion = state.manualAiSuggestion.suggestion ?? state.manualAiSuggestion;
+  form.elements.title.value = suggestion.title;
+  form.elements.category.value = suggestion.category;
+  form.elements.riskLevel.value = suggestion.riskLevel;
+  form.elements.description.value = suggestion.description;
+  form.elements.actionText.value = suggestion.recommendedAction;
+  state.manualAiDecision = 'edited';
+  state.manualEntryFeedback = t('feedback.aiEditing');
+  app.querySelector('#manual-entry-feedback').textContent = state.manualEntryFeedback;
+  renderAiSuggestion();
+}
+
+async function rejectManualAiSuggestion() {
   if (!state.manualAiSuggestion) return;
 
   state.manualAiDecision = 'rejected';
-  state.manualEntryFeedback = 'Mock AI suggestion rejected. Manual inputs were kept.';
+  try {
+    await persistManualAiDecision(app.querySelector('#manual-entry-form'), 'rejected');
+    state.manualEntryFeedback = t('feedback.aiRejected');
+  } catch (error) {
+    state.manualEntryFeedback = getApiErrorMessage(error, t('feedback.aiReviewFailed'));
+  }
   app.querySelector('#manual-entry-feedback').textContent = state.manualEntryFeedback;
   renderAiSuggestion();
 }
@@ -1121,7 +1379,19 @@ async function saveManualEntry(form) {
   const actionText = String(formData.get('actionText') ?? '').trim();
   const photoInput = form.elements.evidencePhotos;
   const evidencePhotoFiles = photoInput?.files ? Array.from(photoInput.files) : [];
-  const aiSuggestion = getManualAiMetadata();
+  if (state.manualAiDecision === 'accepted' && !suggestionMatchesForm(form)) state.manualAiDecision = 'edited';
+  try {
+    if (state.manualAiDecision && state.manualAiSuggestion?.humanDecision !== state.manualAiDecision) {
+      await persistManualAiDecision(form, state.manualAiDecision);
+    } else if (state.manualAiDecision === 'edited') {
+      await persistManualAiDecision(form, 'edited');
+    }
+  } catch (error) {
+    state.manualEntryFeedback = getApiErrorMessage(error, t('feedback.aiReviewFailed'));
+    app.querySelector('#manual-entry-feedback').textContent = state.manualEntryFeedback;
+    return;
+  }
+  const aiSuggestion = getManualAiMetadata(form);
 
   if (!title || !location) return;
 
@@ -1132,19 +1402,21 @@ async function saveManualEntry(form) {
   const submitButton = app.querySelector('button[form="manual-entry-form"]');
 
   try {
-    state.manualEntryFeedback = evidencePhotoFiles.length ? 'Recording photo evidence on this device...' : 'Recording entry on this device...';
+    state.manualEntryFeedback = evidencePhotoFiles.length ? t('feedback.recordingPhoto') : t('feedback.recordingEntry');
     if (feedback) feedback.textContent = state.manualEntryFeedback;
     if (submitButton) {
       submitButton.disabled = true;
-      submitButton.textContent = 'Recording...';
+      submitButton.textContent = t('feedback.recording');
     }
-    evidencePhotos = await uploadEvidencePhotos(evidencePhotoFiles);
+    const uploadedKeys = new Set(state.manualUploadedEvidence.map((item) => `${item.originalName}\u0000${item.size}`));
+    const remainingFiles = evidencePhotoFiles.filter((file) => !uploadedKeys.has(`${file.name}\u0000${file.size}`));
+    evidencePhotos = [...state.manualUploadedEvidence, ...(await uploadEvidencePhotos(remainingFiles))];
   } catch (error) {
-    state.manualEntryFeedback = getApiErrorMessage(error, 'Photo upload failed.');
+    state.manualEntryFeedback = getApiErrorMessage(error, t('feedback.photoFailed'));
     if (feedback) feedback.textContent = state.manualEntryFeedback;
     if (submitButton) {
       submitButton.disabled = false;
-      submitButton.textContent = 'Save';
+      submitButton.textContent = t('common.save');
     }
     return;
   }
@@ -1196,6 +1468,7 @@ async function saveManualEntry(form) {
   state.manualEntryFeedback = '';
   state.manualAiSuggestion = null;
   state.manualAiDecision = null;
+  state.manualUploadedEvidence = [];
   state.phase = state.returnPhase;
   saveLocalDraft();
   void queueCurrentMutation('session_upsert', state.session.sessionId);
@@ -1209,15 +1482,13 @@ function formatKoreanList(items, emptyText) {
 }
 
 function formatReportPreviewItem(item, actionText = '') {
-  const photos = item.evidencePhotos?.length ? ` / 사진 ${item.evidencePhotos.length}건` : '';
+  const photos = item.evidencePhotos?.length ? t('report.photoCount', { count: item.evidencePhotos.length }) : '';
   const ai =
-    item.aiSuggestion?.accepted === true
-      ? ' / Mock AI 참고 의견 수락'
-      : item.aiSuggestion?.rejected === true
-        ? ' / Mock AI 참고 의견 거부'
-        : '';
+    item.aiSuggestion
+      ? ` / ${item.aiSuggestion.simulated ? t('report.aiMockOrigin', { provider: item.aiSuggestion.provider ?? 'deterministic_fixture' }) : t('report.aiProviderOrigin', { provider: item.aiSuggestion.provider ?? 'unknown' })} / ${item.aiSuggestion.edited ? t('report.aiEdited') : item.aiSuggestion.accepted ? t('report.aiAccepted') : item.aiSuggestion.rejected ? t('report.aiRejected') : t('report.aiPending')}`
+      : '';
   const action = actionText ? ` - ${actionText}` : '';
-  return `${item.title} (${item.location}, 위험도: ${item.riskLevel})${action}${photos}${ai}`;
+  return `${t('report.riskSummary', { title: item.title, location: item.location, risk: item.riskLevel })}${action}${photos}${ai}`;
 }
 
 function buildKoreanReportHtml() {
@@ -1234,107 +1505,107 @@ function buildKoreanReportHtml() {
   const sharing = normalizeSharing(state.session.sharing);
   const hazardLines = state.responses.map((item) => formatReportPreviewItem(item));
   const nearMissLines = state.nearMisses.map((item) =>
-    formatReportPreviewItem(item, item.actionTaken || '조치 내용 미입력')
+    formatReportPreviewItem(item, item.actionTaken || t('report.actionMissing'))
   );
   const manualHazardLines = state.responses
     .filter((item) => item.source === 'manual_entry')
     .map((item) => formatReportPreviewItem(item));
 
   return `
-    <section class="report-preview" aria-label="Korean TBM report preview">
-      <h2>작업 전 안전회의(TBM) 보고서 미리보기</h2>
+    <section class="report-preview" aria-label="${t('report.preview')}">
+      <h2>${t('report.preview')}</h2>
       <dl class="report-meta">
         <div>
-          <dt>현장명</dt>
+          <dt>${t('report.siteName')}</dt>
           <dd>${escapeHtml(state.session.siteName)}</dd>
         </div>
         <div>
-          <dt>작업구역</dt>
+          <dt>${t('report.siteArea')}</dt>
           <dd>${escapeHtml(state.session.siteArea)}</dd>
         </div>
         <div>
-          <dt>작업명</dt>
+          <dt>${t('report.taskName')}</dt>
           <dd>${escapeHtml(state.session.taskName)}</dd>
         </div>
         <div>
-          <dt>TBM 실시자</dt>
+          <dt>${t('report.conductor')}</dt>
           <dd>${escapeHtml(state.session.supervisorName)} / ${escapeHtml(state.session.supervisorRole)}</dd>
         </div>
         <div>
-          <dt>기록 상태</dt>
-          <dd>${escapeHtml(getSessionStatus())}</dd>
+          <dt>${t('report.recordStatus')}</dt>
+          <dd>${escapeHtml(recordStatusLabel(getSessionStatus()))}</dd>
         </div>
       </dl>
 
       <section>
-        <h3>참석 근로자</h3>
+        <h3>${t('report.attendance')}</h3>
         <ul>${formatKoreanList(
           presentWorkers.map((worker) => `${worker.name} (${worker.role})`),
-          '참석 근로자 없음'
+          t('report.noneAttendance')
         )}</ul>
       </section>
 
-      <section><h3>감독자 기록 TBM 확인</h3><ul>${formatKoreanList(
-        supervisorAcknowledgedWorkers.map((worker) => `${worker.name} — 감독자 기록, 근로자 독립 검증 아님`),
-        '감독자 기록 확인 없음'
+      <section><h3>${t('report.supervisorAcknowledgment')}</h3><ul>${formatKoreanList(
+        supervisorAcknowledgedWorkers.map((worker) => t('report.supervisorNotIndependent', { name: worker.name })),
+        t('report.noneSupervisorAck')
       )}</ul></section>
 
-      <section><h3>독립적으로 검증된 근로자 확인</h3><ul>${formatKoreanList(
+      <section><h3>${t('report.independentAcknowledgment')}</h3><ul>${formatKoreanList(
         independentlyVerifiedWorkers.map((worker) => worker.name),
-        '독립 검증 확인 없음'
+        t('report.noneIndependentAck')
       )}</ul></section>
 
       <section>
-        <h3>전체 유해위험요인</h3>
-        <ul>${formatKoreanList(hazardLines, '등록된 유해위험요인 없음')}</ul>
+        <h3>${t('report.allHazards')}</h3>
+        <ul>${formatKoreanList(hazardLines, t('report.noneHazards'))}</ul>
       </section>
 
       <section>
-        <h3>수기 입력 유해위험요인</h3>
-        <ul>${formatKoreanList(manualHazardLines, '수기 입력 유해위험요인 없음')}</ul>
+        <h3>${t('report.manualHazards')}</h3>
+        <ul>${formatKoreanList(manualHazardLines, t('report.noneManualHazards'))}</ul>
       </section>
 
       <section>
-        <h3>아차사고 및 Near-miss 기록</h3>
-        <ul>${formatKoreanList(nearMissLines, '아차사고 기록 없음')}</ul>
+        <h3>${t('report.nearMisses')}</h3>
+        <ul>${formatKoreanList(nearMissLines, t('report.noneNearMiss'))}</ul>
       </section>
 
       <section>
-        <h3>통제 확인 항목(Controlled)</h3>
+        <h3>${t('report.controlled')}</h3>
         <ul>${formatKoreanList(
           controlled.map((item) => item.title),
-          '통제 확인 항목 없음'
+          t('report.noneControlled')
         )}</ul>
       </section>
 
       <section>
-        <h3>미종결 시정조치</h3>
+        <h3>${t('report.openActions')}</h3>
         <ul>${formatKoreanList(
           openActions.map((item) => formatReportPreviewItem(item, getCorrectiveAction(item).immediateControl)),
-          '미종결 시정조치 없음'
+          t('report.noneOpenActions')
         )}</ul>
       </section>
 
-      <section><h3>검증 완료 시정조치</h3><ul>${formatKoreanList(
-        closedActions.map((item) => formatReportPreviewItem(item, `검증자: ${getCorrectiveAction(item).verifiedBy}`)),
-        '검증 완료 시정조치 없음'
+      <section><h3>${t('report.closedActions')}</h3><ul>${formatKoreanList(
+        closedActions.map((item) => formatReportPreviewItem(item, t('report.verifierSummary', { name: getCorrectiveAction(item).verifiedBy }))),
+        t('report.noneClosedActions')
       )}</ul></section>
 
       <section>
-        <h3>미확인 항목(Not Checked)</h3>
+        <h3>${t('report.unchecked')}</h3>
         <ul>${formatKoreanList(
           unchecked.map((item) => item.title),
-          '미확인 항목 없음'
+          t('report.noneUnchecked')
         )}</ul>
       </section>
 
-      <section><h3>근로자 공유 증빙</h3><ul>${formatKoreanList(
+      <section><h3>${t('report.sharing')}</h3><ul>${formatKoreanList(
         sharing.status === SHARING_STATUS.SHARED
-          ? [`방법: ${sharing.method} / 수신: ${sharing.recipients} / 서버 기록: ${sharing.sharedAt ?? '저장 후 기록'}`]
+          ? [t('report.sharingSummary', { method: sharing.method, recipients: sharing.recipients, recordedAt: sharing.sharedAt ?? t('report.afterSave') })]
           : sharing.status === SHARING_STATUS.NOT_SHARED
-            ? ['공유하지 않음으로 기록']
+            ? [t('report.notShared')]
             : [],
-        '공유 여부 미기록'
+        t('report.sharingNotRecorded')
       )}</ul></section>
     </section>
   `;
@@ -1345,13 +1616,13 @@ async function copySessionLog(button) {
 
   try {
     await navigator.clipboard.writeText(payload);
-    button.textContent = 'Copied';
+    button.textContent = t('common.copied');
   } catch {
-    button.textContent = 'Copy failed';
+    button.textContent = t('common.copyFailed');
   }
 
   window.setTimeout(() => {
-    button.textContent = 'Copy JSON';
+    button.textContent = t('common.copyJson');
   }, 1400);
 }
 
@@ -1360,12 +1631,12 @@ function getSavedSessionDate(session) {
 }
 
 function getSavedSessionSiteName(session) {
-  return session.site?.siteName ?? session.siteName ?? 'Unknown site';
+  return session.site?.siteName ?? session.siteName ?? t('sessions.unknownSite');
 }
 
 function formatSavedSessionDate(session) {
   const savedDate = new Date(getSavedSessionDate(session) ?? 0);
-  if (Number.isNaN(savedDate.getTime())) return 'Unknown date';
+  if (Number.isNaN(savedDate.getTime())) return t('sessions.unknownDate');
   return formatDateTime(savedDate);
 }
 
@@ -1375,23 +1646,23 @@ async function saveCurrentSession(saveMode = 'draft') {
   const sessionLog = buildSessionLog();
   const blockers = saveMode === 'finalize' ? getFinalizationBlockers(sessionLog) : [];
   if (blockers.length) {
-    state.saveFeedback = `Cannot finalize: ${blockers.join(' ')}`;
+    state.saveFeedback = t('feedback.cannotFinalize', { reasons: blockers.map((blocker) => localizeFinalizationBlocker(blocker, t)).join(' ') });
     render();
     return;
   }
 
   state.isSavingSession = true;
-  state.saveFeedback = 'Recording on this device and queuing synchronization...';
+  state.saveFeedback = t('feedback.queueing');
   render();
 
   try {
     await queueCurrentMutation('session_upsert', state.session.sessionId, saveMode);
     if (navigator.onLine) await synchronizeNow();
     state.saveFeedback = state.draftStatus === DRAFT_STATUS_TEXT.SYNCED
-      ? 'Synchronized to server. No completion is claimed unless finalization requirements were met.'
-      : 'Recorded on this device and queued for synchronization.';
+      ? t('feedback.synced')
+      : t('feedback.queued');
   } catch (error) {
-    state.saveFeedback = `${getApiErrorMessage(error, 'Synchronization failed.')} The local record was retained.`;
+    state.saveFeedback = `${getApiErrorMessage(error, t('feedback.syncFailed'))} ${t('feedback.localRetained')}`;
   } finally {
     state.isSavingSession = false;
     render();
@@ -1416,7 +1687,7 @@ async function loadSavedSessions({ silent = false } = {}) {
     state.savedSessionsStatus = 'ready';
   } catch (error) {
     state.savedSessionsStatus = 'error';
-    state.savedSessionsError = getApiErrorMessage(error, 'Could not load saved sessions.');
+    state.savedSessionsError = getApiErrorMessage(error, t('sessions.loadFailed'));
   }
 }
 
@@ -1433,7 +1704,7 @@ function closeSavedSessions() {
 
 function openSessionReport(sessionId) {
   if (!sessionId) return;
-  window.open(`/api/sessions/${encodeURIComponent(sessionId)}/report`, '_blank', 'noopener');
+  window.open(`/api/sessions/${encodeURIComponent(sessionId)}/report?lang=${locale}`, '_blank', 'noopener');
 }
 
 function buildSessionLog() {
@@ -1463,6 +1734,7 @@ function buildSessionLog() {
       name: state.session.supervisorName,
       role: state.session.supervisorRole
     },
+    attendanceSummary: normalizeAttendanceSummary(state.session.attendanceSummary),
     workers: state.workers.map(normalizeWorker).map((worker) => ({
       id: worker.id,
       name: worker.name,
@@ -1501,15 +1773,15 @@ function buildSessionLog() {
 
 function renderAuthChecking() {
   app.innerHTML = `
-    <section class="v2-screen is-auth auth-shell">
+    <section class="v2-screen is-auth auth-shell" role="main"><h1 class="sr-only" tabindex="-1" data-view-heading>${t('auth.checking')}</h1>
       <div class="auth-brand-large">
         ${v2Logo()}
-        <p>Worksite Awareness. Safer Outcomes.</p>
+        <p>${t('brand.tagline')}</p>${languageControl()}
       </div>
       <section class="v2-card v2-loading-card">
         ${v2Icon('info')}
-        <h2>Checking Login</h2>
-        <p>Preparing protected local access...</p>
+        <h2>${t('auth.checking')}</h2>
+        <p>${t('auth.preparing')}</p>
       </section>
     </section>
   `;
@@ -1517,18 +1789,18 @@ function renderAuthChecking() {
 
 function renderAuth() {
   const isRegister = state.authMode === 'register';
-  const submitText = state.isAuthSubmitting ? 'Please wait...' : isRegister ? 'Register' : 'Login';
+  const submitText = state.isAuthSubmitting ? t('auth.wait') : isRegister ? t('common.register') : t('common.login');
 
   app.innerHTML = `
-    <section class="v2-screen is-auth auth-shell">
+    <section class="v2-screen is-auth auth-shell" role="main"><h1 class="sr-only" tabindex="-1" data-view-heading>${t('auth.mode')}</h1>
       <div class="auth-brand-large">
         ${v2Logo()}
-        <p>Worksite Awareness. Safer Outcomes.</p>
+        <p>${t('brand.tagline')}</p>${languageControl()}
       </div>
 
-      <section class="auth-tabs" aria-label="Authentication mode">
-        <button class="focusable ${!isRegister ? 'is-active' : ''}" data-action="auth-login" type="button">${v2Icon('login')} Login</button>
-        <button class="focusable ${isRegister ? 'is-active' : ''}" data-action="auth-register" type="button">${v2Icon('register')} Register</button>
+      <section class="auth-tabs" role="tablist" aria-label="${t('auth.mode')}">
+        <button class="focusable ${!isRegister ? 'is-active' : ''}" data-auth-tab role="tab" aria-selected="${!isRegister}" aria-controls="auth-form" data-action="auth-login" type="button">${v2Icon('login')} ${t('common.login')}</button>
+        <button class="focusable ${isRegister ? 'is-active' : ''}" data-auth-tab role="tab" aria-selected="${isRegister}" aria-controls="auth-form" data-action="auth-register" type="button">${v2Icon('register')} ${t('common.register')}</button>
       </section>
 
       <form class="v2-card auth-form" id="auth-form">
@@ -1538,8 +1810,8 @@ function renderAuth() {
               <div class="auth-field">
                 ${v2Icon('user')}
                 <label>
-                  <span>Name</span>
-                  <input class="focusable" name="name" autocomplete="name" placeholder="Your name" />
+                  <span>${t('auth.name')}</span>
+                  <input class="focusable" name="name" autocomplete="name" placeholder="${t('auth.namePlaceholder')}" />
                 </label>
               </div>
             `
@@ -1548,17 +1820,17 @@ function renderAuth() {
         <div class="auth-field">
           ${v2Icon('email')}
           <label>
-            <span>Email</span>
+            <span>${t('auth.email')}</span>
             <input class="focusable" name="email" type="email" autocomplete="email" placeholder="name@company.com" required />
           </label>
         </div>
         <div class="auth-field">
           ${v2Icon('lock')}
           <label>
-            <span>Password</span>
+            <span>${t('auth.password')}</span>
             <input class="focusable" name="password" type="password" autocomplete="${
               isRegister ? 'new-password' : 'current-password'
-            }" placeholder="Enter your password" minlength="8" required />
+            }" placeholder="${t('auth.passwordPlaceholder')}" minlength="8" required />
           </label>
         </div>
         ${
@@ -1567,14 +1839,14 @@ function renderAuth() {
               <div class="auth-field">
                 ${v2Icon('user')}
                 <label>
-                  <span>Role</span>
+                  <span>${t('auth.role')}</span>
                   <input class="focusable" name="role" value="supervisor" />
                 </label>
               </div>
               <div class="auth-field">
                 ${v2Icon('key')}
                 <label>
-                  <span>Registration key</span>
+                  <span>${t('auth.registrationKey')}</span>
                   <input class="focusable" name="registrationKey" type="password" required />
                 </label>
               </div>
@@ -1587,7 +1859,7 @@ function renderAuth() {
         }>${submitText}</button>
       </form>
 
-      <footer class="auth-footer"><span>Your safety data is protected.</span><span>Need help? <strong>Contact support</strong></span></footer>
+      <footer class="auth-footer"><span>${t('auth.protected')}</span><span>${t('auth.help')} <strong>${t('auth.contact')}</strong></span></footer>
     </section>
   `;
 
@@ -1600,15 +1872,15 @@ function renderAuth() {
 
 function renderLoading() {
   app.innerHTML = `
-    <section class="v2-screen is-auth auth-shell">
+    <section class="v2-screen is-auth auth-shell" role="main"><h1 class="sr-only" tabindex="-1" data-view-heading>${t('loading.tbm')}</h1>
       <div class="auth-brand-large">
         ${v2Logo()}
-        <p>Worksite Awareness. Safer Outcomes.</p>
+        <p>${t('brand.tagline')}</p>${languageControl()}
       </div>
       <section class="v2-card v2-loading-card">
         ${v2Icon('info')}
-        <h2>Loading TBM</h2>
-        <p>Loading hazard controls...</p>
+        <h2>${t('loading.tbm')}</h2>
+        <p>${t('loading.hazards')}</p>
       </section>
     </section>
   `;
@@ -1616,16 +1888,16 @@ function renderLoading() {
 
 function renderError() {
   app.innerHTML = `
-    <section class="v2-screen is-auth auth-shell">
+    <section class="v2-screen is-auth auth-shell" role="main"><h1 class="sr-only" tabindex="-1" data-view-heading>${t('error.hazardsUnavailable')}</h1>
       <div class="auth-brand-large">
         ${v2Logo()}
-        <p>Worksite Awareness. Safer Outcomes.</p>
+        <p>${t('brand.tagline')}</p>${languageControl()}
       </div>
       <section class="v2-card v2-loading-card">
         <div class="v2-warning-tile">!</div>
-        <h2>Hazards unavailable</h2>
+        <h2>${t('error.hazardsUnavailable')}</h2>
         <p>${escapeHtml(state.error)}</p>
-        <button class="focusable v2-key-button v2-key-primary" data-action="retry">Retry</button>
+        <button class="focusable v2-key-button v2-key-primary" data-action="retry">${t('common.retry')}</button>
       </section>
     </section>
   `;
@@ -1636,40 +1908,40 @@ function renderDraftRestore() {
   const draft = state.pendingDraft;
   const savedAt = draft?.deviceUpdatedAt || draft?.deviceObservedAt
     ? formatDateTime(new Date(draft.deviceUpdatedAt ?? draft.deviceObservedAt))
-    : 'Recently';
+    : t('common.recently');
   const siteName = draft?.session?.siteName ?? state.session.siteName;
   const phaseLabel = draft?.phase ? draft.phase.replace('-', ' ') : 'in-progress TBM';
 
   app.innerHTML = `
-    <section class="v2-screen">
-      ${v2Header('Local Draft')}
-      <section class="v2-card v2-draft-card" aria-label="Local draft found">
+    <section class="v2-screen" role="main">
+      ${v2Header(t('draft.local'))}
+      <section class="v2-card v2-draft-card" aria-label="${t('draft.found')}">
         <div class="v2-screen-intro">
           <div class="v2-warning-tile">↻</div>
           <div>
-            <h2>Local draft found</h2>
-            <p>A device-local draft is available for this active TBM session.</p>
+            <h2>${t('draft.found')}</h2>
+            <p>${t('draft.available')}</p>
           </div>
         </div>
         <dl class="v2-draft-meta">
           <div>
-            <dt>Site</dt>
+            <dt>${t('draft.site')}</dt>
             <dd>${escapeHtml(siteName)}</dd>
           </div>
           <div>
-            <dt>Last recorded on device</dt>
+            <dt>${t('draft.lastDevice')}</dt>
             <dd>${escapeHtml(savedAt)}</dd>
           </div>
           <div>
-            <dt>Screen</dt>
+            <dt>${t('draft.screen')}</dt>
             <dd>${escapeHtml(phaseLabel)}</dd>
           </div>
         </dl>
         ${draftStatusHtml()}
       </section>
-      <section class="v2-action-row">
-        <button class="focusable v2-key-button" data-action="discard-draft">Start New</button>
-        <button class="focusable v2-key-button v2-key-primary" data-action="restore-draft">Restore Draft</button>
+      <section class="v2-action-row" aria-label="${t('common.actions')}">
+        <button class="focusable v2-key-button" data-action="discard-draft">${t('draft.startNew')}</button>
+        <button class="focusable v2-key-button v2-key-primary" data-action="restore-draft">${t('draft.restore')}</button>
       </section>
     </section>
   `;
@@ -1679,14 +1951,14 @@ function renderDraftRestore() {
 
 function renderStart() {
   app.innerHTML = `
-    <section class="v2-screen">
-      ${v2Header('Start TBM', v2WorkflowProgress(1))}
-      <section class="v2-card v2-form-card" aria-label="TBM session details">
+    <section class="v2-screen" role="main">
+      ${v2Header(t('tbm.start'), v2WorkflowProgress(1))}
+      <section class="v2-card v2-form-card" aria-label="${t('tbm.start')}">
         <div class="v2-screen-intro">
           <div class="v2-warning-tile">▶</div>
           <div>
-            <h2>Start TBM</h2>
-            <p>Kick off a Toolbox Meeting to promote safety and alignment.</p>
+            <h2>${t('tbm.start')}</h2>
+            <p>${t('tbm.startDescription')}</p>
           </div>
         </div>
         ${buildUserBadge()}
@@ -1694,35 +1966,35 @@ function renderStart() {
         <div class="v2-form-grid">
           <label class="v2-field-row">
             ${v2Icon('site')}
-            <span>Site name</span>
+            <span>${t('tbm.siteName')}</span>
             <input class="focusable" name="siteName" value="${escapeHtml(state.session.siteName)}" />
           </label>
           <label class="v2-field-row">
             ${v2Icon('task')}
-            <span>Task name</span>
+            <span>${t('tbm.taskName')}</span>
             <input class="focusable" name="taskName" value="${escapeHtml(state.session.taskName)}" />
           </label>
           <label class="v2-field-row">
             ${v2Icon('user')}
-            <span>Supervisor</span>
+            <span>${t('tbm.supervisor')}</span>
             <input class="focusable" name="supervisorName" value="${escapeHtml(state.session.supervisorName)}" />
           </label>
           <div class="v2-field-row">
             ${v2Icon('calendar')}
-            <span>Date / time</span>
+            <span>${t('tbm.dateTime')}</span>
             <strong>${escapeHtml(formatDateTime(state.session.scheduledAt))}</strong>
           </div>
         </div>
-        <section class="v2-action-row">
-          <button class="focusable v2-key-button v2-key-primary" data-action="start">▶ Start TBM</button>
-          <button class="focusable v2-key-button" data-action="save-draft">Save Draft</button>
+        <section class="v2-action-row" aria-label="${t('common.actions')}">
+          <button class="focusable v2-key-button v2-key-primary" data-action="start">▶ ${t('tbm.start')}</button>
+          <button class="focusable v2-key-button" data-action="save-draft">${t('draft.record')}</button>
         </section>
       </section>
     </section>
   `;
 
   app.querySelectorAll('input[name]').forEach((input) => {
-    input.addEventListener('input', (event) => saveStartField(input.name, event.target.value));
+    bindCompositionSafeInput(input, (value) => saveStartField(input.name, value));
   });
   bindButtons();
 }
@@ -1734,24 +2006,24 @@ function renderParticipation() {
   ).length;
 
   app.innerHTML = `
-    <section class="v2-screen">
-      ${v2Header('Worker Participation', v2WorkflowProgress(2))}
+    <section class="v2-screen" role="main">
+      ${v2Header(t('attendance.participation'), v2WorkflowProgress(2))}
       <section class="v2-card v2-participation-card">
         <div class="v2-section-heading">
-          <h2>Worker Attendance</h2>
-          <p>Record attendance and supervisor-recorded acknowledgment as separate facts.</p>
+          <h2>${t('attendance.title')}</h2>
+          <p>${t('attendance.separateFacts')}</p>
         </div>
         ${draftStatusHtml()}
 
         <form class="v2-add-worker" id="add-worker-form">
           <div class="v2-input-with-icon">
             ${v2Icon('add')}
-            <input class="focusable" id="worker-name" autocomplete="off" placeholder="Add worker name..." />
+            <input class="focusable" id="worker-name" autocomplete="off" aria-label="${t('attendance.addPlaceholder')}" placeholder="${t('attendance.addPlaceholder')}" />
           </div>
-          <button class="focusable v2-key-button" type="submit">Add</button>
+          <button class="focusable v2-key-button" type="submit">${t('attendance.add')}</button>
         </form>
 
-        <section class="v2-worker-list" aria-label="Attendance list">
+        <section class="v2-worker-list" aria-label="${t('attendance.list')}">
           ${state.workers
             .map((worker) => {
               const initials = worker.name
@@ -1768,53 +2040,55 @@ function renderParticipation() {
                     <strong>${escapeHtml(worker.name)}</strong>
                     <em>${escapeHtml(worker.role)}</em>
                     <label class="v2-worker-fact">
-                    <input class="focusable" type="checkbox" data-attendance-worker="${escapeHtml(worker.id)}" ${
+                    <input class="focusable" type="checkbox" aria-label="${escapeHtml(`${worker.name}: ${t('attendance.present')}`)}" data-attendance-worker="${escapeHtml(worker.id)}" ${
                       worker.present ? 'checked' : ''
                     } />
-                    <span>Present</span>
+                    <span>${t('attendance.present')}</span>
                     </label>
                     <label class="v2-worker-fact">
-                    <input class="focusable" type="checkbox" data-ack-worker="${escapeHtml(worker.id)}" ${
+                    <input class="focusable" type="checkbox" aria-label="${escapeHtml(`${worker.name}: ${t('attendance.ackSupervisor')}`)}" data-ack-worker="${escapeHtml(worker.id)}" ${
                       normalizeWorker(worker).acknowledgment.supervisorRecorded ? 'checked' : ''
                     } />
-                    <span>TBM acknowledgment — supervisor recorded</span>
+                    <span>${t('attendance.ackSupervisor')}</span>
                     </label>
                   </div>
-                  <button class="focusable v2-key-button v2-key-small" data-action="remove-worker" data-worker="${escapeHtml(
+                  <button class="focusable v2-key-button v2-key-small" aria-label="${escapeHtml(`${t('attendance.remove')}: ${worker.name}`)}" data-action="remove-worker" data-worker="${escapeHtml(
                     worker.id
-                  )}">Remove</button>
+                  )}">${t('attendance.remove')}</button>
                 </div>
               `;
             })
             .join('')}
         </section>
 
-        <p class="v2-attendance-count"><strong>${presentCount}</strong> present · <strong>${supervisorAcknowledgedCount}</strong> acknowledgments recorded by supervisor · 0 independently verified by this prototype</p>
+        <p class="v2-attendance-count">${t('attendance.counts', { present: presentCount, acknowledged: supervisorAcknowledgedCount })}</p>
       </section>
-
-      <section class="v2-action-row">
-        <button class="focusable v2-key-button" data-action="mark-all">Mark All Present</button>
-        <button class="focusable v2-key-button" data-action="save-draft">Record Draft</button>
-        <button class="focusable v2-key-button v2-key-primary" data-action="continue">Continue →</button>
+      <section class="v2-action-row" aria-label="${t('common.actions')}">
+        <button class="focusable v2-key-button" data-action="mark-all">${t('attendance.markAll')}</button>
+        <button class="focusable v2-key-button" data-action="save-draft">${t('draft.record')}</button>
+        <button class="focusable v2-key-button v2-key-primary" data-action="continue">${t('common.continue')} →</button>
       </section>
     </section>
   `;
 
   app.querySelector('#add-worker-form').addEventListener('submit', (event) => {
     event.preventDefault();
+    pendingFocusSelector = '#worker-name';
     addWorker(app.querySelector('#worker-name').value);
   });
 
   app.querySelectorAll('input[data-attendance-worker]').forEach((checkbox) => {
-    checkbox.addEventListener('change', () =>
-      setWorkerPresent(checkbox.dataset.attendanceWorker, checkbox.checked)
-    );
+    checkbox.addEventListener('change', () => {
+      pendingFocusSelector = `[data-attendance-worker="${checkbox.dataset.attendanceWorker}"]`;
+      setWorkerPresent(checkbox.dataset.attendanceWorker, checkbox.checked);
+    });
   });
 
   app.querySelectorAll('input[data-ack-worker]').forEach((checkbox) => {
-    checkbox.addEventListener('change', () =>
-      setWorkerAcknowledgment(checkbox.dataset.ackWorker, checkbox.checked)
-    );
+    checkbox.addEventListener('change', () => {
+      pendingFocusSelector = `[data-ack-worker="${checkbox.dataset.ackWorker}"]`;
+      setWorkerAcknowledgment(checkbox.dataset.ackWorker, checkbox.checked);
+    });
   });
 
   bindButtons();
@@ -1822,67 +2096,67 @@ function renderParticipation() {
 
 function renderManualEntry() {
   app.innerHTML = `
-    <section class="v2-screen">
-      ${v2Header('Log New Hazard')}
+    <section class="v2-screen" role="main">
+      ${v2Header(t('hazard.logNew'))}
 
       <form class="v2-manual-layout manual-entry-form" id="manual-entry-form">
         <section class="v2-card v2-manual-main">
           <div class="v2-two-col">
             <label class="v2-field-block">
-              <span>Type *</span>
+              <span>${t('hazard.type')} *</span>
               <select class="focusable" name="type">
-                <option value="new_hazard">new_hazard</option>
-                <option value="near_miss">near_miss</option>
+                <option value="new_hazard">${t('hazard.newHazard')}</option>
+                <option value="near_miss">${t('hazard.nearMiss')}</option>
               </select>
             </label>
 
             <label class="v2-field-block">
-              <span>Category *</span>
+              <span>${t('hazard.category')} *</span>
               <input class="focusable" name="category" maxlength="80" value="manual_entry" />
             </label>
           </div>
 
           <label class="v2-field-block">
-            <span>Title *</span>
-            <input class="focusable" name="title" maxlength="120" placeholder="Example: Temporary ladder blocked" required />
+            <span>${t('hazard.title')} *</span>
+            <input class="focusable" name="title" maxlength="120" placeholder="${t('hazard.titlePlaceholder')}" required />
           </label>
 
           <label class="v2-field-block">
-            <span>Location *</span>
-            <input class="focusable" name="location" maxlength="120" placeholder="Example: Level 2 west stair" required />
+            <span>${t('hazard.location')} *</span>
+            <input class="focusable" name="location" maxlength="120" placeholder="${t('hazard.locationPlaceholder')}" required />
           </label>
 
           <label class="v2-field-block">
-            <span>Risk level *</span>
+            <span>${t('hazard.riskLevel')} *</span>
             <select class="focusable" name="riskLevel">
-              <option value="low">low</option>
-              <option value="medium" selected>medium</option>
-              <option value="high">high</option>
+              <option value="low">${t('hazard.low')}</option>
+              <option value="medium" selected>${t('hazard.medium')}</option>
+              <option value="high">${t('hazard.high')}</option>
             </select>
           </label>
 
           <label class="v2-field-block">
-            <span>Description *</span>
-            <textarea class="v2-textarea focusable flexible-memo" name="description" maxlength="260" placeholder="Describe what was observed"></textarea>
+            <span>${t('hazard.description')} *</span>
+            <textarea class="v2-textarea focusable flexible-memo" name="description" maxlength="260" placeholder="${t('hazard.descriptionPlaceholder')}"></textarea>
           </label>
 
           <label class="v2-field-block">
-            <span>Action Taken / Recommended Action *</span>
-            <textarea class="v2-textarea focusable flexible-memo" name="actionText" maxlength="260" placeholder="Action taken or recommended action"></textarea>
+            <span>${t('hazard.actionTaken')} *</span>
+            <textarea class="v2-textarea focusable flexible-memo" name="actionText" maxlength="260" placeholder="${t('hazard.actionPlaceholder')}"></textarea>
           </label>
         </section>
 
         <aside class="v2-manual-side">
           <section class="v2-card v2-upload-card">
-            <h3>Attach Photo</h3>
+            <h3>${t('hazard.attachPhoto')}</h3>
             <label class="v2-upload-zone">
               ${v2Icon('photo')}
-              <span id="photo-preview">No photo selected</span>
+              <span id="photo-preview">${t('hazard.noPhoto')}</span>
               <input class="focusable" name="evidencePhotos" type="file" accept="image/jpeg,image/png,image/webp" multiple />
             </label>
-            <p class="photo-preview">JPG, PNG, WEBP evidence photos</p>
+            <p class="photo-preview">${t('hazard.photoTypes')}</p>
             <button class="focusable v2-key-button v2-key-primary" id="analyze-photo-button" data-action="analyze-photo" type="button" hidden disabled>
-              Analyze Photo
+              ${t('hazard.generateMockSuggestion')}
             </button>
           </section>
           <div id="ai-suggestion-panel"></div>
@@ -1890,9 +2164,9 @@ function renderManualEntry() {
         </aside>
       </form>
 
-      <section class="v2-action-row">
-        <button class="focusable v2-key-button" data-action="cancel-manual">← Cancel</button>
-        <button class="focusable v2-key-button v2-key-primary" form="manual-entry-form" type="submit">Save</button>
+      <section class="v2-action-row" aria-label="${t('common.actions')}">
+        <button class="focusable v2-key-button" data-action="cancel-manual">← ${t('common.cancel')}</button>
+        <button class="focusable v2-key-button v2-key-primary" form="manual-entry-form" type="submit">${t('common.save')}</button>
       </section>
     </section>
   `;
@@ -1903,12 +2177,13 @@ function renderManualEntry() {
     const analyzeButton = app.querySelector('#analyze-photo-button');
     preview.textContent = files.length
       ? files.map((file) => `${file.name} (${Math.ceil(file.size / 1024)} KB)`).join(', ')
-      : 'No photo selected';
+      : t('hazard.noPhoto');
     analyzeButton.hidden = files.length === 0;
     analyzeButton.disabled = files.length === 0;
     state.manualAiSuggestion = null;
     state.manualAiDecision = null;
-    state.manualEntryFeedback = files.length ? 'Photo changed. Run mock analysis again if needed.' : '';
+    state.manualUploadedEvidence = [];
+    state.manualEntryFeedback = files.length ? t('feedback.photoChanged') : '';
     app.querySelector('#manual-entry-feedback').textContent = state.manualEntryFeedback;
     renderAiSuggestion();
   });
@@ -1941,7 +2216,7 @@ function renderGlassesActions(actions) {
       ${actions
         .map(
           (action) => `
-            <button class="focusable v2-key-button ${action.primary ? 'v2-key-primary' : ''}" data-glasses-action="${escapeHtml(
+            <button class="focusable v2-key-button ${action.primary ? 'v2-key-primary' : ''}" ${action.primary ? 'data-primary-action' : ''} ${action.disabled ? 'disabled' : ''} data-glasses-action="${escapeHtml(
               action.action
             )}">${escapeHtml(action.label)}</button>
           `
@@ -1958,144 +2233,129 @@ function bindGlassesButtons() {
 }
 
 function renderGlasses() {
-  if (state.phase === 'summary') state.glassesStep = 'summary';
-
-  const presentCount = state.workers.filter((worker) => worker.present).length;
-  const supervisorAcknowledgedCount = state.workers.filter(
-    (worker) => normalizeWorker(worker).acknowledgment.supervisorRecorded
-  ).length;
-  const { controlled, actionRequired, unchecked } = getHazardReviewCounts();
+  if (state.draftStatus === DRAFT_STATUS_TEXT.CONFLICT) state.glassesStep = GLASSES_STEP.CONFLICT;
   const hazard = currentHazard();
   const response = currentResponse();
-
+  const primaryHazard = buildPrimaryHazardModel({
+    title: hazard?.name ?? t('hazard.none'),
+    location: hazard?.location ?? '',
+    current: getCurrentHazardNumber(),
+    total: state.hazards.length
+  });
+  const { title, location } = primaryHazard;
+  const syncPresentation = glassesSyncState(state.draftStatus);
   let body = '';
   let actions = [];
 
-  if (state.glassesStep === 'start') {
-    body = `
-      <p class="glasses-kicker">Glasses HUD Mode</p>
-      <h1>Start TBM</h1>
-      <p class="glasses-large">${escapeHtml(state.session.siteName)}</p>
-      <p class="glasses-muted">${escapeHtml(state.session.taskName)}</p>
-      <div class="glasses-hint">Enter or ArrowRight to begin</div>
-    `;
+  if (state.glassesStep === GLASSES_STEP.START) {
+    body = `<p class="glasses-kicker">${t('glasses.mode')}</p><h1>${t('tbm.start')}</h1>
+      <p class="glasses-large">${escapeHtml(state.session.siteName)}</p>`;
+    actions = [{ action: 'start', label: t('glasses.start'), primary: true }];
+  } else if (state.glassesStep === GLASSES_STEP.CONTEXT_CONFIRMATION) {
+    const observed = state.glassesContext?.observedAt ?? new Date().toISOString();
+    const locationSource = state.session.gps?.latitude != null ? t('glasses.deviceLocation') : t('glasses.sessionSite');
+    body = `<p class="glasses-kicker">${t('glasses.contextTitle')}</p><h1>${escapeHtml(state.currentUser?.name)}</h1>
+      <dl class="glasses-detail-list"><div><dt>${t('auth.role')}</dt><dd>${escapeHtml(state.currentUser?.role)}</dd></div>
+      <div><dt>${t('tbm.siteName')}</dt><dd>${escapeHtml(state.session.siteName)}</dd></div><div><dt>${t('tbm.taskName')}</dt><dd>${escapeHtml(state.session.taskName)}</dd></div>
+      <div><dt>${t('hazard.location')}</dt><dd>${escapeHtml(state.session.siteArea)} · ${locationSource}</dd></div>
+      <div><dt>${t('tbm.dateTime')}</dt><dd>${escapeHtml(formatDateTime(new Date(observed)))} · ${t('glasses.deviceTime')}</dd></div></dl>`;
+    actions = [{ action: 'context-confirm', label: t('glasses.confirm'), primary: true }, { action: 'context-reject', label: t('glasses.reject') }];
+  } else if (state.glassesStep === GLASSES_STEP.ATTENDANCE) {
+    const d = state.glassesAttendanceDigits; const expected = attendanceValue(d.expectedTens, d.expectedOnes); const present = attendanceValue(d.presentTens, d.presentOnes);
+    const valid = isAttendanceSummaryValid({ expectedCount: expected, presentCount: present });
+    const editor = (kind, label) => `<fieldset class="glasses-digit-editor"><legend>${label}</legend>${['Tens','Ones'].map((part) => {
+      const key = `${kind}${part}`; return `<label><span>${part === 'Tens' ? t('glasses.tens') : t('glasses.ones')}</span><select data-attendance-digit="${key}" aria-label="${label} ${part}">${Array.from({length:10},(_,i)=>`<option value="${i}" ${d[key]===i?'selected':''}>${i}</option>`).join('')}</select></label>`;
+    }).join('')}</fieldset>`;
+    body = `<p class="glasses-kicker">${t('attendance.title')}</p><h1>${present} / ${expected}</h1><div class="glasses-attendance-editors">${editor('expected', t('glasses.expectedWorkers'))}${editor('present', t('glasses.workersPresent'))}</div>
+      <p class="glasses-muted">${t('glasses.countOnlyNotice')}</p>`;
+    actions = [{ action: 'attendance-continue', label: t('common.continue'), primary: true, disabled: !valid }];
+  } else if (state.glassesStep === GLASSES_STEP.HAZARD_DECISION) {
+    body = `<p class="glasses-kicker">${escapeHtml(getHazardProgressText())}</p>
+      <h1 class="glasses-primary-title" aria-label="${escapeHtml(title.full)}">${escapeHtml(title.primary)}</h1>
+      <p class="glasses-location" aria-label="${escapeHtml(location.full)}">${escapeHtml(location.primary)}</p>
+      <h2 class="glasses-question">${t('glasses.reviewQuestion')}</h2>`;
     actions = [
-      { action: 'start', label: 'Start', primary: true },
-      { action: 'exit', label: 'Exit' }
+      { action: 'controlled', label: t('hazard.controlled'), primary: true },
+      { action: 'action-required', label: t('glasses.notControlled'), primary: true }
     ];
-  } else if (state.glassesStep === 'workers') {
-    body = `
-      <p class="glasses-kicker">Worker Attendance</p>
-      <h1>${presentCount} / ${state.workers.length} present</h1>
-      <p class="glasses-large">Mark all demo workers present?</p>
-      <p class="glasses-muted">${state.workers.map((worker) => escapeHtml(worker.name)).join(' · ')}</p>
-      <p class="glasses-muted">${supervisorAcknowledgedCount} supervisor-recorded acknowledgments. This shortcut records attendance only.</p>
-      <div class="glasses-hint">Enter marks present; it does not acknowledge</div>
-    `;
-    actions = [
-      { action: 'workers', label: 'Mark Present', primary: true },
-      { action: 'prev', label: 'Back' }
-    ];
-  } else if (state.glassesStep === 'memo') {
-    body = `
-      <p class="glasses-kicker">Voice Memo Mock</p>
-      <h1>Memo Captured</h1>
-      <p class="glasses-large">${escapeHtml(state.glassesMemoFeedback)}</p>
-      <p class="glasses-muted">Recorded on this device for Hazard ${getCurrentHazardNumber()}.</p>
-    `;
-    actions = [
-      { action: 'next', label: 'Continue', primary: true },
-      { action: 'photo', label: 'Photo' }
-    ];
-  } else if (state.glassesStep === 'photo') {
-    body = `
-      <p class="glasses-kicker">Photo Evidence Mock</p>
-      <h1>Photo Captured</h1>
-      <p class="glasses-large">${escapeHtml(state.glassesPhotoFeedback)}</p>
-      <p class="glasses-muted">${response?.evidencePhotos?.length ?? 0} evidence item${
-        (response?.evidencePhotos?.length ?? 0) === 1 ? '' : 's'
-      } on this hazard.</p>
-    `;
-    actions = [
-      { action: 'next', label: 'Continue', primary: true },
-      { action: 'memo', label: 'Memo' }
-    ];
-  } else if (state.glassesStep === 'summary') {
-    const blockers = getFinalizationBlockers(buildSessionLog());
-    const glassesTitle = blockers.length
-      ? 'TBM Draft'
-      : getPotentialRecordStatus() === 'actions_open'
-        ? state.session.finalizedAt
-          ? 'TBM recorded — actions open'
-          : 'Ready to record — actions open'
-        : 'Ready to finalize';
-    body = `
-      <p class="glasses-kicker">TBM Record</p>
-      <h1>${escapeHtml(glassesTitle)}</h1>
-      ${state.glassesReviewFeedback ? `<p class="glasses-toast">${escapeHtml(state.glassesReviewFeedback)}</p>` : ''}
-      <section class="glasses-stats" aria-label="Glasses summary counts">
-        <div><strong>${controlled}</strong><span>Controlled</span></div>
-        <div><strong>${actionRequired}</strong><span>Action Required</span></div>
-        <div><strong>${unchecked}</strong><span>Not Checked</span></div>
-      </section>
-      <p class="glasses-muted">${escapeHtml(
-        blockers.length ? blockers.join(' ') : state.saveFeedback || 'Ready to record without fabricating closure.'
-      )}</p>
-    `;
-    actions = [
-      { action: 'save-session', label: state.isSavingSession ? 'Queuing...' : 'Record Draft', primary: true },
-      ...(blockers.length ? [] : [{ action: 'finalize', label: 'Finalize' }]),
-      { action: 'exit', label: 'Exit' }
-    ];
-  } else {
-    const status = response?.status ?? 'Not Marked';
-    body = `
-      <p class="glasses-kicker">${escapeHtml(getHazardProgressText())}</p>
-      <h1>${escapeHtml(hazard?.name ?? 'No hazard')}</h1>
-      ${state.glassesReviewFeedback ? `<p class="glasses-toast">${escapeHtml(state.glassesReviewFeedback)}</p>` : ''}
-      <dl class="glasses-hazard-facts">
-        <div><dt>Location</dt><dd>${escapeHtml(hazard?.location ?? '')}</dd></div>
-        <div><dt>Risk</dt><dd>${escapeHtml(hazard?.riskLevel ?? 'medium')}</dd></div>
-        <div><dt>Status</dt><dd>${escapeHtml(status)}</dd></div>
-      </dl>
-      <p class="glasses-muted">${escapeHtml(hazard?.action ?? '')}</p>
-      <div class="glasses-hint">1 Controlled · 2 Action Required · M Memo · P Photo</div>
-    `;
-    actions = [
-      { action: 'controlled', label: 'Controlled', primary: true },
-      { action: 'action-required', label: 'Action Required' },
-      { action: 'memo', label: 'Memo' }
-    ];
+  } else if (state.glassesStep === GLASSES_STEP.CORRECTIVE_ACTION) {
+    const corrective = normalizeCorrectiveAction(response?.correctiveAction, HAZARD_STATUS.ACTION_REQUIRED);
+    const select = (field, label, values) => `<label>${label}<select data-corrective-field="${field}"><option value="">${t('corrective.selectStatus')}</option>${values.map(([v,l])=>`<option value="${v}" ${corrective[field]===v?'selected':''}>${l}</option>`).join('')}</select></label>`;
+    body = `<p class="glasses-kicker">${t('glasses.notControlled')}</p><h1>${t('corrective.title')}</h1><div class="glasses-compact-form">
+      ${select('immediateResponseCategory',t('corrective.immediateControl'),Object.values(IMMEDIATE_RESPONSE_CATEGORY).map(v=>[v,t(`glasses.control.${v}`)]))}
+      ${select('responsibleParty',t('corrective.assignedPerson'),Object.values(RESPONSIBLE_PARTY).map(v=>[v,t(`glasses.party.${v}`)]))}
+      ${select('workStatus',t('corrective.workStatus'),[[WORK_STATUS.STOPPED,t('corrective.stopped')],[WORK_STATUS.PERMITTED_WITH_CONTROLS,t('corrective.permitted')]])}
+      ${select('duePeriod',t('corrective.dueAt'),Object.values(DUE_PERIOD).map(v=>[v,t(`glasses.due.${v}`)]))}
+      <label>${t('corrective.verificationStatus')}<select data-corrective-field="verificationStatus"><option value="open">${t('corrective.open')}</option></select></label></div>`;
+    const valid = corrective.immediateResponseCategory && corrective.responsibleParty && corrective.workStatus && corrective.duePeriod;
+    actions = [{ action: 'corrective-continue', label: t('common.continue'), primary: true, disabled: !valid }];
+  } else if (state.glassesStep === GLASSES_STEP.PHOTO_EVIDENCE) {
+    const photos = response?.evidencePhotos ?? [];
+    body = `<p class="glasses-kicker">${t('glasses.photoEvidence')}</p><h1>${t('report.photoCount',{count:photos.length})}</h1>
+      <ul>${photos.map(p=>`<li>${escapeHtml(evidenceSourceLabel(p.source))}</li>`).join('') || `<li>${t('report.noPhoto')}</li>`}</ul><p class="glasses-muted">${t('glasses.previewEvidenceDisclaimer')}</p>`;
+    actions = [{ action: 'mock-photo', label: t('glasses.photoMock'), primary: true }, { action: 'evidence-continue', label: t('common.continue') }];
+  } else if (state.glassesStep === GLASSES_STEP.HAZARD_CONFIRMATION) {
+    const corrective = normalizeCorrectiveAction(response?.correctiveAction, state.glassesProvisionalDecision);
+    const complete = state.glassesProvisionalDecision === HAZARD_STATUS.CONTROLLED || Boolean(corrective.immediateResponseCategory && corrective.responsibleParty && corrective.workStatus && corrective.duePeriod);
+    body = `<p class="glasses-kicker">${t('glasses.confirmHazard')}</p><h1>${escapeHtml(response?.title)}</h1><dl class="glasses-detail-list"><div><dt>${t('common.status')}</dt><dd>${state.glassesProvisionalDecision===HAZARD_STATUS.CONTROLLED?t('hazard.controlled'):t('glasses.notControlled')}</dd></div><div><dt>${t('report.photoEvidence')}</dt><dd>${response?.evidencePhotos?.length ?? 0}</dd></div></dl>`;
+    actions = [{ action: 'hazard-confirm', label: t('glasses.confirm'), primary: true, disabled: !complete }];
+  } else if (state.glassesStep === GLASSES_STEP.HAZARD_SUMMARY) {
+    body = `<p class="glasses-kicker">${t('glasses.hazardSummary')}</p><h1>${t('summary.review')}</h1><ol class="glasses-summary-list">${state.responses.map((r,i)=>`<li><strong>${i+1}. ${escapeHtml(r.title)}</strong><span>${normalizeHazardStatus(r.status)===HAZARD_STATUS.CONTROLLED?t('hazard.controlled'):t('glasses.notControlled')} · ${r.evidencePhotos?.length??0} ${t('report.photoEvidence')}</span></li>`).join('')}</ol>`;
+    actions = [{ action: 'summary-continue', label: t('common.continue'), primary: true }];
+  } else if (state.glassesStep === GLASSES_STEP.SHARING_RECORD) {
+    const sharing = normalizeSharing(state.session.sharing); const ready = sharing.status===SHARING_STATUS.SHARED && sharing.method && sharing.proofType;
+    const options = (values,selected,prefix)=>`<option value=""></option>${values.map(v=>`<option value="${v}" ${selected===v?'selected':''}>${t(`${prefix}.${v}`)}</option>`).join('')}`;
+    body = `<p class="glasses-kicker">${t('sharing.title')}</p><h1>${t('glasses.sharingRecord')}</h1><div class="glasses-compact-form">
+      <label><input type="checkbox" data-sharing-field="shared" ${sharing.status===SHARING_STATUS.SHARED?'checked':''}/> ${t('glasses.resultsShared')}</label>
+      <label>${t('sharing.method')}<select data-sharing-field="method">${options(Object.values(SHARING_METHOD),sharing.method,'glasses.share')}</select></label>
+      <label>${t('glasses.proofType')}<select data-sharing-field="proofType">${options(Object.values(SHARING_PROOF_TYPE),sharing.proofType,'glasses.proof')}</select></label></div>`;
+    actions = [{ action: 'record-continue', label: t('common.continue'), primary: true, disabled: !ready || getFinalizationBlockers(buildSessionLog()).length>0 }];
+  } else if (state.glassesStep === GLASSES_STEP.RECORDING) {
+    body = `<p class="glasses-kicker">${t('glasses.recording')}</p><h1>${t('feedback.queueing')}</h1><p>${t('feedback.localRetained')}</p>`; actions = [];
+  } else if (state.glassesStep === GLASSES_STEP.CONFLICT) {
+    body = `<p class="glasses-kicker">${t('sync.conflict')}</p><h1>${t('glasses.conflictTitle')}</h1><p class="glasses-large">${t('glasses.conflictBody')}</p>`;
+    actions = [{ action: 'exit', label: t('glasses.reviewInBrowser'), primary: true }];
+  } else if (state.glassesStep === GLASSES_STEP.COMPLETE) {
+    const counts=getHazardReviewCounts(); const evidence=state.responses.reduce((n,r)=>n+(r.evidencePhotos?.length??0),0);
+    body = `<p class="glasses-kicker">${t(syncPresentation.key)}</p><h1>${t('glasses.localRecordSafe')}</h1><dl class="glasses-detail-list"><div><dt>${t('hazard.controlled')}</dt><dd>${counts.controlled}</dd></div><div><dt>${t('glasses.notControlled')}</dt><dd>${counts.actionRequired}</dd></div><div><dt>${t('report.openActions')}</dt><dd>${counts.actionRequired}</dd></div><div><dt>${t('report.photoEvidence')}</dt><dd>${evidence}</dd></div></dl>`;
+    actions = [{ action: 'done', label: t('glasses.done'), primary: true }];
   }
 
   app.innerHTML = `
-    <section class="glasses-screen">
+    <section class="glasses-screen is-${escapeHtml(state.glassesStep)}">
       <header class="glasses-topline">
         ${v2Logo()}
-        <button class="focusable glasses-exit" data-glasses-action="exit">Exit</button>
+        <nav aria-label="${t('glasses.secondaryNavigation')}">
+          ${![GLASSES_STEP.START, GLASSES_STEP.RECORDING, GLASSES_STEP.COMPLETE].includes(state.glassesStep) ? `<button class="focusable glasses-exit" data-glasses-action="prev">${t('common.back')}</button>` : ''}
+          <button class="focusable glasses-exit" data-glasses-action="exit">${t('glasses.quit')}</button>
+        </nav>
       </header>
-      <main class="glasses-card" aria-live="polite">
+      <main class="glasses-card" tabindex="-1">
         ${body}
       </main>
       ${renderGlassesActions(actions)}
-      <footer class="glasses-shortcuts">
-        ${draftStatusHtml()}
-        ${
-          state.glassesStep === 'summary'
-            ? ''
-            : '<button class="focusable glasses-exit" data-glasses-action="save-session">Save Draft</button>'
-        }
-        <span>←/→ Navigate · Enter Continue · Esc Exit</span>
-      </footer>
+      <footer class="glasses-shortcuts"><span class="glasses-sync is-${syncPresentation.tone}">${t(syncPresentation.key)}</span>
+        <button class="focusable glasses-help-button" data-glasses-action="toggle-help" aria-expanded="${state.glassesHelpOpen}">${t('glasses.previewHelp')}</button></footer>
+      <p class="sr-only" role="status" aria-live="polite" aria-atomic="true">${escapeHtml(state.glassesAnnouncement)}</p>
+      ${state.glassesHelpOpen ? `<aside class="glasses-help-overlay" role="dialog" aria-modal="true" aria-labelledby="glasses-help-title">
+        <h2 id="glasses-help-title">${t('glasses.previewTooling')}</h2><p>${t('glasses.previewDisclaimer')}</p>
+        <ul><li>Enter — ${t('common.continue')}</li><li>← — ${t('common.back')}</li><li>1 — ${t('hazard.controlled')}</li><li>2 — ${t('glasses.notControlled')}</li><li>H / ? — ${t('glasses.previewHelp')}</li></ul>
+        <button class="focusable v2-key-button v2-key-primary" data-glasses-action="toggle-help" data-primary-action>${t('common.close')}</button></aside>` : ''}
     </section>
   `;
 
-  app.querySelectorAll('button[data-action]').forEach((button) => {
-    button.addEventListener('click', async () => {
-      if (button.dataset.action === 'save-session') saveCurrentSession();
+  app.querySelectorAll('[data-corrective-field]').forEach((field) => {
+    field.addEventListener('change', () => {
+      const labels = { immediateResponseCategory: 'immediateControl', responsibleParty: 'assignedTo', duePeriod: 'dueAt' };
+      updateCorrectiveAction(field.dataset.correctiveField, field.value);
+      if (labels[field.dataset.correctiveField]) updateCorrectiveAction(labels[field.dataset.correctiveField], field.value);
+      render();
     });
   });
+  app.querySelectorAll('[data-attendance-digit]').forEach((field)=>field.addEventListener('change',()=>{state.glassesAttendanceDigits[field.dataset.attendanceDigit]=Number(field.value);saveLocalDraft();render();}));
+  app.querySelectorAll('[data-sharing-field]').forEach((field)=>field.addEventListener('change',()=>{const key=field.dataset.sharingField;if(key==='shared'){state.session.sharing={...normalizeSharing(state.session.sharing),status:field.checked?SHARING_STATUS.SHARED:SHARING_STATUS.NOT_RECORDED,recipients:field.checked?'All expected workers':''};}else updateSharing(key,field.value);saveLocalDraft();render();}));
   bindGlassesButtons();
+  requestAnimationFrame(() => app.querySelector('[data-primary-action]')?.focus());
 }
 
 function renderCorrectiveActionEditor(response) {
@@ -2104,29 +2364,29 @@ function renderCorrectiveActionEditor(response) {
   const closureEvidence = action.closureEvidence.join(', ');
 
   return `
-    <section class="v2-card v2-corrective-card" aria-label="Corrective action details">
+    <section class="v2-card v2-corrective-card" aria-label="${t('corrective.title')}">
       <div class="v2-section-heading">
-        <h2>Corrective Action Required</h2>
-        <p>This action remains open until verification, verifiedBy, and verifiedAt are explicitly recorded.</p>
+        <h2>${t('corrective.title')}</h2>
+        <p>${t('corrective.openExplanation')}</p>
       </div>
       <div class="v2-two-col">
-        <label class="v2-field-block"><span>Immediate control taken *</span><input data-corrective-field="immediateControl" value="${escapeHtml(action.immediateControl)}" /></label>
-        <label class="v2-field-block"><span>Assigned person *</span><input data-corrective-field="assignedTo" value="${escapeHtml(action.assignedTo)}" /></label>
-        <label class="v2-field-block"><span>Due date/time *</span><input type="datetime-local" data-corrective-field="dueAt" value="${escapeHtml(action.dueAt)}" /></label>
-        <label class="v2-field-block"><span>Work status *</span><select data-corrective-field="workStatus">
-          <option value="">Select status</option>
-          <option value="${WORK_STATUS.STOPPED}" ${action.workStatus === WORK_STATUS.STOPPED ? 'selected' : ''}>Work stopped</option>
-          <option value="${WORK_STATUS.PERMITTED_WITH_CONTROLS}" ${action.workStatus === WORK_STATUS.PERMITTED_WITH_CONTROLS ? 'selected' : ''}>Permitted with controls</option>
+        <label class="v2-field-block"><span>${t('corrective.immediateControl')} *</span><input data-corrective-field="immediateControl" value="${escapeHtml(action.immediateControl)}" /></label>
+        <label class="v2-field-block"><span>${t('corrective.assignedPerson')} *</span><input data-corrective-field="assignedTo" value="${escapeHtml(action.assignedTo)}" /></label>
+        <label class="v2-field-block"><span>${t('corrective.dueAt')} *</span><input type="datetime-local" data-corrective-field="dueAt" value="${escapeHtml(action.dueAt)}" /></label>
+        <label class="v2-field-block"><span>${t('corrective.workStatus')} *</span><select data-corrective-field="workStatus">
+          <option value="">${t('corrective.selectStatus')}</option>
+          <option value="${WORK_STATUS.STOPPED}" ${action.workStatus === WORK_STATUS.STOPPED ? 'selected' : ''}>${t('corrective.stopped')}</option>
+          <option value="${WORK_STATUS.PERMITTED_WITH_CONTROLS}" ${action.workStatus === WORK_STATUS.PERMITTED_WITH_CONTROLS ? 'selected' : ''}>${t('corrective.permitted')}</option>
         </select></label>
-        <label class="v2-field-block"><span>Verification status *</span><select data-corrective-field="verificationStatus">
-          <option value="${VERIFICATION_STATUS.OPEN}" ${action.verificationStatus === VERIFICATION_STATUS.OPEN ? 'selected' : ''}>Open — not verified</option>
-          <option value="${VERIFICATION_STATUS.VERIFIED}" ${action.verificationStatus === VERIFICATION_STATUS.VERIFIED ? 'selected' : ''}>Verified</option>
+        <label class="v2-field-block"><span>${t('corrective.verificationStatus')} *</span><select data-corrective-field="verificationStatus">
+          <option value="${VERIFICATION_STATUS.OPEN}" ${action.verificationStatus === VERIFICATION_STATUS.OPEN ? 'selected' : ''}>${t('corrective.open')}</option>
+          <option value="${VERIFICATION_STATUS.VERIFIED}" ${action.verificationStatus === VERIFICATION_STATUS.VERIFIED ? 'selected' : ''}>${t('corrective.verified')}</option>
         </select></label>
-        <label class="v2-field-block"><span>Optional closure evidence reference</span><input data-corrective-field="closureEvidence" value="${escapeHtml(closureEvidence)}" placeholder="Photo ID, note, or evidence reference" /></label>
+        <label class="v2-field-block"><span>${t('corrective.closureEvidence')}</span><input data-corrective-field="closureEvidence" value="${escapeHtml(closureEvidence)}" /></label>
         ${
           action.verificationStatus === VERIFICATION_STATUS.VERIFIED
-            ? `<label class="v2-field-block"><span>Verified by *</span><input data-corrective-field="verifiedBy" value="${escapeHtml(action.verifiedBy ?? '')}" /></label>
-               <label class="v2-field-block"><span>Verified at *</span><input type="datetime-local" data-corrective-field="verifiedAt" value="${escapeHtml(action.verifiedAt ?? '')}" /></label>`
+            ? `<label class="v2-field-block"><span>${t('corrective.verifiedBy')} *</span><input data-corrective-field="verifiedBy" value="${escapeHtml(action.verifiedBy ?? '')}" /></label>
+               <label class="v2-field-block"><span>${t('corrective.verifiedAt')} *</span><input type="datetime-local" data-corrective-field="verifiedAt" value="${escapeHtml(action.verifiedAt ?? '')}" /></label>`
             : ''
         }
       </div>
@@ -2140,30 +2400,30 @@ function renderChecklist() {
   const statusTone = getChecklistStatusTone(response.status);
 
   app.innerHTML = `
-    <section class="v2-screen ${normalizeHazardStatus(response.status) === HAZARD_STATUS.ACTION_REQUIRED ? 'is-corrective' : ''}">
-      ${v2Header('TBM Checklist', v2ChecklistProgress())}
-      <section class="v2-card v2-hazard-card" aria-label="Current hazard">
+    <section class="v2-screen ${normalizeHazardStatus(response.status) === HAZARD_STATUS.ACTION_REQUIRED ? 'is-corrective' : ''}" role="main">
+      ${v2Header(t('hazard.checklist'), v2ChecklistProgress())}
+      <section class="v2-card v2-hazard-card" aria-label="${t('hazard.current')}">
         <div class="v2-hazard-hero">
           <div class="v2-warning-tile">!</div>
           <div class="v2-hazard-title">
-            <p class="v2-kicker">Hazard</p>
+            <p class="v2-kicker">${t('hazard.current')}</p>
             <h2>${escapeHtml(hazard.name)}</h2>
           </div>
-          ${v2StatusChip('Status', response.status ?? 'Not Marked', statusTone)}
+          ${v2StatusChip(t('common.status'), response.status ? t(`hazard.${response.status === HAZARD_STATUS.CONTROLLED ? 'controlled' : response.status === HAZARD_STATUS.ACTION_REQUIRED ? 'actionRequired' : 'notChecked'}`) : t('hazard.notMarked'), statusTone)}
         </div>
 
         <div class="v2-detail-list">
-          <div class="v2-detail-row">${v2Icon('location')}<p>Location</p><strong>${escapeHtml(hazard.location)}</strong></div>
-          <div class="v2-detail-row">${v2Icon('status')}<p>Risk Level</p><strong>${escapeHtml(hazard.riskLevel ?? response.riskLevel ?? 'medium')}</strong></div>
-          <div class="v2-detail-row">${v2Icon('category')}<p>Category</p><strong>${escapeHtml(hazard.category ?? response.category ?? 'general')}</strong></div>
-          <div class="v2-detail-row">${v2Icon('risk')}<p>Risk</p><strong>${escapeHtml(hazard.risk)}</strong></div>
-          <div class="v2-detail-row">${v2Icon('action')}<p>Recommended Action</p><strong>${escapeHtml(hazard.action)}</strong></div>
+          <div class="v2-detail-row">${v2Icon('location')}<p>${t('hazard.location')}</p><strong>${escapeHtml(hazard.location)}</strong></div>
+          <div class="v2-detail-row">${v2Icon('status')}<p>${t('hazard.riskLevel')}</p><strong>${escapeHtml(hazard.riskLevel ?? response.riskLevel ?? 'medium')}</strong></div>
+          <div class="v2-detail-row">${v2Icon('category')}<p>${t('hazard.category')}</p><strong>${escapeHtml(hazard.category ?? response.category ?? 'general')}</strong></div>
+          <div class="v2-detail-row">${v2Icon('risk')}<p>${t('hazard.risk')}</p><strong>${escapeHtml(hazard.risk)}</strong></div>
+          <div class="v2-detail-row">${v2Icon('action')}<p>${t('hazard.recommendedAction')}</p><strong>${escapeHtml(hazard.action)}</strong></div>
         </div>
       </section>
 
       <section class="v2-card v2-memo-card">
-        <label for="memo">Memo <span>Optional</span></label>
-        <textarea id="memo" class="v2-textarea focusable" rows="2" maxlength="220" placeholder="Add notes, details, or follow-up actions...">${escapeHtml(
+        <label for="memo">${t('hazard.memo')} <span>${t('common.optional')}</span></label>
+        <textarea id="memo" class="v2-textarea focusable" rows="2" maxlength="220" placeholder="${t('hazard.memoPlaceholder')}">${escapeHtml(
         state.memo
       )}</textarea>
         ${draftStatusHtml()}
@@ -2171,27 +2431,30 @@ function renderChecklist() {
 
       ${renderCorrectiveActionEditor(response)}
 
-      <section class="v2-action-row" aria-label="Checklist actions">
-        <button class="focusable v2-key-button v2-key-primary" data-action="controlled">✓ Controlled — safe to proceed</button>
-        <button class="focusable v2-key-button" data-action="action-required">Action Required</button>
+      <section class="v2-action-row" aria-label="${t('hazard.checklist')}">
+        <button class="focusable v2-key-button v2-key-primary" data-action="controlled">✓ ${t('hazard.controlledProceed')}</button>
+        <button class="focusable v2-key-button" data-action="action-required">${t('hazard.actionRequired')}</button>
       </section>
 
-      <section class="v2-action-row v2-action-row-nav" aria-label="Navigation">
-        <button class="focusable v2-key-button" data-action="prev">← Previous</button>
-        <button class="focusable v2-key-button" data-action="log-new">＋ Log New Hazard</button>
-        <button class="focusable v2-key-button" data-action="save-draft">Save Draft</button>
-        <button class="focusable v2-key-button" data-action="next">Next →</button>
+      <section class="v2-action-row v2-action-row-nav" aria-label="${t('common.next')}">
+        <button class="focusable v2-key-button" data-action="prev">← ${t('common.back')}</button>
+        <button class="focusable v2-key-button" data-action="log-new">＋ ${t('hazard.logNew')}</button>
+        <button class="focusable v2-key-button" data-action="save-draft">${t('draft.record')}</button>
+        <button class="focusable v2-key-button" data-action="next">${t('common.next')} →</button>
       </section>
     </section>
   `;
 
-  app.querySelector('#memo').addEventListener('input', (event) => saveMemo(event.target.value));
+  bindCompositionSafeInput(app.querySelector('#memo'), (value) => saveMemo(value));
   app.querySelectorAll('[data-corrective-field]').forEach((field) => {
-    const eventName = field.tagName === 'SELECT' ? 'change' : 'input';
-    field.addEventListener(eventName, () => {
-      updateCorrectiveAction(field.dataset.correctiveField, field.value);
-      if (field.dataset.correctiveField === 'verificationStatus') render();
-    });
+    if (field.tagName === 'SELECT') {
+      field.addEventListener('change', () => {
+        updateCorrectiveAction(field.dataset.correctiveField, field.value);
+        if (field.dataset.correctiveField === 'verificationStatus') render();
+      });
+    } else {
+      bindCompositionSafeInput(field, (value) => updateCorrectiveAction(field.dataset.correctiveField, value));
+    }
   });
   bindButtons();
 }
@@ -2199,26 +2462,26 @@ function renderChecklist() {
 function renderSharingEditor() {
   const sharing = normalizeSharing(state.session.sharing);
   return `
-    <section class="v2-card v2-sharing-card" aria-label="Worker sharing evidence">
+    <section class="v2-card v2-sharing-card" aria-label="${t('sharing.title')}">
       <div class="v2-section-heading">
-        <h2>Worker Sharing Evidence</h2>
-        <p>Reaching this screen does not mean results were shared. Record the actual outcome.</p>
+        <h2>${t('sharing.title')}</h2>
+        <p>${t('sharing.explanation')}</p>
       </div>
       <div class="v2-two-col">
-        <label class="v2-field-block"><span>Were results shared? *</span><select data-sharing-field="status">
-          <option value="${SHARING_STATUS.NOT_RECORDED}" ${sharing.status === SHARING_STATUS.NOT_RECORDED ? 'selected' : ''}>Not recorded yet</option>
-          <option value="${SHARING_STATUS.NOT_SHARED}" ${sharing.status === SHARING_STATUS.NOT_SHARED ? 'selected' : ''}>No — not shared</option>
-          <option value="${SHARING_STATUS.SHARED}" ${sharing.status === SHARING_STATUS.SHARED ? 'selected' : ''}>Supervisor reports shared</option>
+        <label class="v2-field-block"><span>${t('sharing.question')} *</span><select data-sharing-field="status">
+          <option value="${SHARING_STATUS.NOT_RECORDED}" ${sharing.status === SHARING_STATUS.NOT_RECORDED ? 'selected' : ''}>${t('sharing.notRecorded')}</option>
+          <option value="${SHARING_STATUS.NOT_SHARED}" ${sharing.status === SHARING_STATUS.NOT_SHARED ? 'selected' : ''}>${t('sharing.notShared')}</option>
+          <option value="${SHARING_STATUS.SHARED}" ${sharing.status === SHARING_STATUS.SHARED ? 'selected' : ''}>${t('sharing.supervisorReports')}</option>
         </select></label>
         ${
           sharing.status === SHARING_STATUS.SHARED
-            ? `<label class="v2-field-block"><span>Sharing method *</span><input data-sharing-field="method" value="${escapeHtml(sharing.method)}" placeholder="Briefing, message, posted notice..." /></label>
-               <label class="v2-field-block"><span>Recipients or group *</span><input data-sharing-field="recipients" value="${escapeHtml(sharing.recipients)}" placeholder="Electrical crew, all attendees..." /></label>`
+            ? `<label class="v2-field-block"><span>${t('sharing.method')} *</span><input data-sharing-field="method" value="${escapeHtml(sharing.method)}" /></label>
+               <label class="v2-field-block"><span>${t('sharing.recipients')} *</span><input data-sharing-field="recipients" value="${escapeHtml(sharing.recipients)}" /></label>`
             : ''
         }
-        <label class="v2-field-block"><span>Optional acknowledgment results</span><textarea class="v2-textarea" data-sharing-field="acknowledgmentResults" placeholder="Record actual responses only">${escapeHtml(sharing.acknowledgmentResults)}</textarea></label>
+        <label class="v2-field-block"><span>${t('sharing.ackResults')}</span><textarea class="v2-textarea" data-sharing-field="acknowledgmentResults">${escapeHtml(sharing.acknowledgmentResults)}</textarea></label>
       </div>
-      <p class="draft-status">Offline selection records only the supervisor's device-observed claim. Server shared-at proves recording time, not delivery; acknowledgment results must reflect real responses.</p>
+      <p class="draft-status">${t('sharing.offlineEvidenceNote')}</p>
     </section>
   `;
 }
@@ -2226,92 +2489,80 @@ function renderSharingEditor() {
 function renderSummary() {
   const { controlled, actionRequired, unchecked } = getHazardReviewCounts();
   const blockers = getFinalizationBlockers(buildSessionLog());
-  const proposedStatus = blockers.length ? 'draft' : getPotentialRecordStatus();
-  const isRecorded = Boolean(state.session.finalizedAt);
-  const title =
-    state.session.completedAt
-      ? 'TBM Complete — all actions verified'
-      : isRecorded && proposedStatus === 'actions_open'
-        ? 'TBM recorded — actions open'
-        : blockers.length
-          ? 'TBM Draft — finalization blocked'
-          : proposedStatus === 'actions_open'
-            ? 'Ready to record — actions open'
-            : 'Ready to finalize';
-  const explanation = blockers.length
-    ? 'This draft can be recorded without claiming completion. Resolve every blocking reason before finalizing.'
-    : proposedStatus === 'actions_open'
-      ? 'All hazards are reviewed and required action fields are recorded, but one or more actions still await verification.'
-      : 'All hazards are reviewed, required fields are recorded, and corrective actions are verified.';
+  const { proposedStatus, title, explanation } = getSummaryPresentation(blockers);
 
   app.innerHTML = `
-    <section class="v2-screen">
-      ${v2Header('TBM Record', v2WorkflowProgress(4))}
+    <section class="v2-screen" role="main">
+      ${v2Header(t('summary.record'), v2WorkflowProgress(4))}
       <section class="v2-card v2-summary-card">
         <div class="v2-summary-hero">
           <div class="${blockers.length ? 'v2-warning-tile' : 'v2-success-tile'}">${blockers.length ? '!' : '✓'}</div>
           <div>
-            <h2>${escapeHtml(title)}</h2>
-            <p>${escapeHtml(explanation)}</p>
+            <h2 data-summary-title>${escapeHtml(title)}</h2>
+            <p data-summary-explanation>${escapeHtml(explanation)}</p>
           </div>
-          ${v2StatusChip('Status', proposedStatus, blockers.length ? 'warning' : 'success')}
+          ${v2StatusChip(t('common.status'), proposedStatus, blockers.length ? 'warning' : 'success')}
         </div>
 
         <div class="v2-summary-stats">
           <div class="v2-stat-card">
             <div class="v2-warning-tile">✓</div>
-            <p>Controlled</p>
+            <p>${t('hazard.controlled')}</p>
             <strong>${controlled}</strong>
-            <span>Safe to proceed</span>
+            <span>${t('summary.safeProceed')}</span>
           </div>
           <div class="v2-stat-card">
             <div class="v2-warning-tile">□</div>
-            <p>Action Required</p>
+            <p>${t('hazard.actionRequired')}</p>
             <strong>${actionRequired}</strong>
-            <span>Corrective actions</span>
+            <span>${t('summary.correctiveActions')}</span>
           </div>
-          <div class="v2-stat-card"><p>Not Checked</p><strong>${unchecked}</strong><span>Finalization blockers</span></div>
+          <div class="v2-stat-card"><p>${t('hazard.notChecked')}</p><strong>${unchecked}</strong><span>${t('summary.finalizationBlockers')}</span></div>
         </div>
 
         ${renderSharingEditor()}
 
-        <section class="v2-report-preview">
-          <h3>Finalization blockers</h3>
+        <section class="v2-report-preview" data-finalization-blockers>
+          <h3>${t('summary.blockers')}</h3>
           ${
             blockers.length
-              ? `<ul>${blockers.map((blocker) => `<li>${escapeHtml(blocker)}</li>`).join('')}</ul>`
-              : '<p>No finalization blockers.</p>'
+              ? `<ul>${blockers.map((blocker) => `<li>${escapeHtml(localizeFinalizationBlocker(blocker, t))}</li>`).join('')}</ul>`
+              : `<p>${t('summary.noBlockers')}</p>`
           }
         </section>
 
         <section class="v2-report-preview">
-          <h3>Report Preview</h3>
+          <h3>${t('summary.reportPreview')}</h3>
           ${buildKoreanReportHtml()}
         </section>
       </section>
-      ${state.saveFeedback ? `<p class="save-feedback">${escapeHtml(state.saveFeedback)}</p>` : ''}
+      <p class="save-feedback" data-save-feedback>${escapeHtml(state.saveFeedback)}</p>
       ${draftStatusHtml()}
-      <div class="v2-action-grid">
-        <button class="focusable v2-key-button v2-key-primary" data-action="review">Review</button>
-        <button class="focusable v2-key-button" data-action="log-new">＋ Log New Hazard</button>
+      <div class="v2-action-grid" role="group" aria-label="${t('common.actions')}">
+        <button class="focusable v2-key-button v2-key-primary" data-action="review">${t('summary.review')}</button>
+        <button class="focusable v2-key-button" data-action="log-new">＋ ${t('hazard.logNew')}</button>
         <button class="focusable v2-key-button" data-action="save-draft" ${
           state.isSavingSession ? 'disabled' : ''
-        }>${state.isSavingSession ? 'Queuing...' : 'Record Draft'}</button>
+        }>${state.isSavingSession ? t('sync.queued') : t('draft.record')}</button>
         <button class="focusable v2-key-button" data-action="finalize" ${
           state.isSavingSession || blockers.length ? 'disabled' : ''
-        }>Finalize</button>
-        <button class="focusable v2-key-button" data-action="saved-sessions">Saved Sessions</button>
-        <button class="focusable v2-key-button" data-action="copy">Copy JSON</button>
+        }>${t('summary.finalize')}</button>
+        <button class="focusable v2-key-button" data-action="saved-sessions">${t('sessions.saved')}</button>
+        <button class="focusable v2-key-button" data-action="copy">${t('common.copyJson')}</button>
       </div>
     </section>
   `;
 
   app.querySelectorAll('[data-sharing-field]').forEach((field) => {
-    const eventName = field.tagName === 'SELECT' ? 'change' : 'input';
-    field.addEventListener(eventName, () => {
-      updateSharing(field.dataset.sharingField, field.value);
-      if (field.dataset.sharingField === 'status') render();
-    });
+    if (field.tagName === 'SELECT') {
+      field.addEventListener('change', () => {
+        pendingFocusSelector = '[data-sharing-field="status"]';
+        updateSharing(field.dataset.sharingField, field.value);
+        render();
+      });
+    } else {
+      bindCompositionSafeInput(field, (value) => updateSharing(field.dataset.sharingField, value));
+    }
   });
   bindButtons();
 }
@@ -2328,22 +2579,22 @@ function renderSavedSessions() {
               ${v2Icon('calendar')}
               <div class="v2-session-date">
                 <strong>${escapeHtml(formatSavedSessionDate(session))}</strong>
-                <span>${escapeHtml(session.status ?? 'unknown')}</span>
+                <span>${escapeHtml(session.status ? recordStatusLabel(session.status) : t('common.unknown'))}</span>
               </div>
               <div class="v2-session-site">
                 ${v2Icon('site')}
                 <div>
                   <strong>${escapeHtml(getSavedSessionSiteName(session))}</strong>
-                  <span>${escapeHtml(session.site?.siteArea ?? session.siteArea ?? 'Saved TBM session')}</span>
+                  <span>${escapeHtml(session.site?.siteArea ?? session.siteArea ?? t('sessions.fallback'))}</span>
                 </div>
               </div>
               <div class="v2-session-status">
-                <span>Status</span>
-                <strong>${escapeHtml(session.status ?? 'unknown')}</strong>
+                  <span>${t('common.status')}</span>
+                  <strong>${escapeHtml(session.status ? recordStatusLabel(session.status) : t('common.unknown'))}</strong>
               </div>
               <button class="focusable v2-key-button v2-key-small" data-action="open-report" data-session="${escapeHtml(
                 session.sessionId
-              )}">Open Report</button>
+              )}">${t('sessions.openReport')}</button>
             </li>
           `
         )
@@ -2351,32 +2602,32 @@ function renderSavedSessions() {
     : '';
 
   app.innerHTML = `
-    <section class="v2-screen">
-      ${v2Header('Saved Sessions')}
-      <section class="v2-card v2-saved-card" aria-label="Saved TBM sessions">
+    <section class="v2-screen" role="main">
+      ${v2Header(t('sessions.saved'))}
+      <section class="v2-card v2-saved-card" aria-label="${t('sessions.saved')}">
         <div class="v2-section-heading v2-section-heading-row">
           <div>
-            <h2>Saved Sessions</h2>
-            <p>You have ${state.savedSessions.length} saved session${state.savedSessions.length === 1 ? '' : 's'}.</p>
+            <h2>${t('sessions.saved')}</h2>
+            <p>${t('sessions.count', { count: state.savedSessions.length })}</p>
           </div>
-          <button class="focusable v2-key-button v2-key-small" data-action="refresh-saved">Refresh</button>
+          <button class="focusable v2-key-button v2-key-small" data-action="refresh-saved">${t('common.refresh')}</button>
         </div>
         <section class="v2-saved-panel">
         ${
           state.savedSessionsStatus === 'loading'
-            ? '<div class="v2-empty-state">Loading saved sessions...</div>'
+            ? `<div class="v2-empty-state">${t('sessions.loading')}</div>`
             : state.savedSessionsStatus === 'error'
               ? `<div class="v2-empty-state">${escapeHtml(state.savedSessionsError)}</div>`
               : sortedSessions.length
                 ? `<ul class="saved-session-list">${sessionsHtml}</ul>`
-                : '<div class="v2-empty-state">No saved sessions. Start by saving a completed TBM.</div>'
+                : `<div class="v2-empty-state">${t('sessions.empty')}</div>`
         }
         </section>
       </section>
 
-      <section class="v2-action-row">
-        <button class="focusable v2-key-button" data-action="back-from-saved">← Back</button>
-        <button class="focusable v2-key-button" data-action="refresh-saved">Refresh</button>
+      <section class="v2-action-row" aria-label="${t('common.actions')}">
+        <button class="focusable v2-key-button" data-action="back-from-saved">← ${t('common.back')}</button>
+        <button class="focusable v2-key-button" data-action="refresh-saved">${t('common.refresh')}</button>
       </section>
     </section>
   `;
@@ -2389,6 +2640,18 @@ function renderSavedSessions() {
 // ---------------------------------------------------------------------------
 
 function bindButtons() {
+  app.querySelectorAll('[data-language-selector]').forEach((selector) => {
+    selector.addEventListener('change', () => selectLanguage(selector.value));
+  });
+  app.querySelectorAll('[data-auth-tab]').forEach((tab) => {
+    tab.addEventListener('keydown', (event) => {
+      if (!['ArrowLeft', 'ArrowRight'].includes(event.key)) return;
+      event.preventDefault();
+      const tabs = Array.from(app.querySelectorAll('[data-auth-tab]'));
+      const nextIndex = (tabs.indexOf(tab) + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length;
+      tabs[nextIndex]?.click();
+    });
+  });
   app.querySelectorAll('button[data-action]').forEach((button) => {
     button.addEventListener('click', async () => {
       const action = button.dataset.action;
@@ -2396,11 +2659,13 @@ function bindButtons() {
       if (action === 'auth-login') {
         state.authMode = 'login';
         state.authFeedback = '';
+        pendingFocusSelector = '[data-auth-tab][aria-selected="true"]';
         render();
       }
       if (action === 'auth-register') {
         state.authMode = 'register';
         state.authFeedback = '';
+        pendingFocusSelector = '[data-auth-tab][aria-selected="true"]';
         render();
       }
       if (action === 'restore-draft') {
@@ -2429,11 +2694,19 @@ function bindButtons() {
         await synchronizeNow();
       }
       if (action === 'start') startTbm();
-      if (action === 'remove-worker') removeWorker(button.dataset.worker);
-      if (action === 'mark-all') markAllPresent();
+      if (action === 'remove-worker') {
+        pendingFocusSelector = '#worker-name';
+        removeWorker(button.dataset.worker);
+      }
+      if (action === 'mark-all') {
+        pendingFocusSelector = '[data-action="mark-all"]';
+        markAllPresent();
+      }
       if (action === 'continue') continueToChecklist();
       if (action === 'log-new') openManualEntry();
-      if (action === 'cancel-manual') cancelManualEntry();
+      if (action === 'cancel-manual') {
+        if (!manualEntryHasUnsavedValues() || window.confirm(t('hazard.discardManualConfirm'))) cancelManualEntry();
+      }
       if (action === 'prev') goTo(state.index - 1);
       if (action === 'next') goTo(state.index + 1);
       if (action === 'controlled') setStatus(HAZARD_STATUS.CONTROLLED);
@@ -2477,6 +2750,17 @@ function render() {
   if (state.phase === 'checklist') renderChecklist();
   if (state.phase === 'summary') renderSummary();
   if (state.phase === 'saved-sessions') renderSavedSessions();
+  enhanceNormalAccessibility();
+}
+
+function enhanceNormalAccessibility() {
+  const viewKey = state.phase === 'checklist' ? `${state.phase}:${state.index}` : state.phase;
+  updateApplicationAnnouncement();
+
+  const selector = pendingFocusSelector || (viewKey !== lastNormalViewKey ? viewFocusSelector(state.phase) : '');
+  pendingFocusSelector = '';
+  lastNormalViewKey = viewKey;
+  if (selector) requestAnimationFrame(() => app.querySelector(selector)?.focus());
 }
 
 // ---------------------------------------------------------------------------
@@ -2484,26 +2768,27 @@ function render() {
 // ---------------------------------------------------------------------------
 
 window.addEventListener('keydown', (event) => {
-  if (event.target.matches('input, textarea')) return;
   if (isGlassesMode && state.currentUser && state.hazards.length) {
-    // Browser keyboard mapping for future wearable gestures:
-    // ArrowRight / Enter -> next, select, or pinch confirm
-    // ArrowLeft -> previous or back gesture
-    // 1 -> controlled after review
-    // 2 -> action required (closure is never implied)
-    // M -> voice memo
-    // P -> photo capture
-    // Escape -> exit glasses mode
-    if (event.key === 'ArrowRight') handleGlassesAction('next');
+    const nextHelpState = reducePreviewHelp(state.glassesHelpOpen, event.key);
+    if (nextHelpState !== state.glassesHelpOpen) {
+      state.glassesHelpOpen = nextHelpState;
+      event.preventDefault();
+      render();
+      return;
+    }
+    if (state.glassesHelpOpen) return;
+    if (event.target.matches('input, textarea, select, button')) return;
+    if (event.key === 'ArrowRight' && state.glassesStep !== GLASSES_STEP.HAZARD_DECISION) handleGlassesAction('next');
     if (event.key === 'ArrowLeft') handleGlassesAction('prev');
     if (event.key === '1') handleGlassesAction('controlled');
     if (event.key === '2') handleGlassesAction('action-required');
     if (event.key.toLowerCase() === 'm') handleGlassesAction('memo');
     if (event.key.toLowerCase() === 'p') handleGlassesAction('photo');
-    if (event.key === 'Enter') handleGlassesAction('next');
-    if (event.key === 'Escape') handleGlassesAction('exit');
+    if (event.key === 'Enter' && state.glassesStep !== GLASSES_STEP.HAZARD_DECISION) handleGlassesAction('next');
+    if (event.key === 'Escape') handleGlassesAction('prev');
     return;
   }
+  if (event.target.matches('input, textarea, select, button')) return;
   if (state.phase !== 'checklist') return;
 
   if (event.key === 'ArrowRight') goTo(state.index + 1);
@@ -2534,8 +2819,13 @@ async function initializeOfflineFirstApp() {
         };
         state.draftStatus = labelByStatus[status] ?? state.draftStatus;
         state.syncConflict = conflict ?? (status === SYNC_STATUS.CONFLICT ? state.syncConflict : null);
-        if (lastError && status === SYNC_STATUS.FAILED) state.saveFeedback = `${lastError} Local data was retained.`;
-        render();
+        if (isGlassesMode && state.phase === 'summary') {
+          if (status === SYNC_STATUS.CONFLICT) state.glassesStep = GLASSES_STEP.CONFLICT;
+          state.glassesAnnouncement = t(glassesSyncState(status).key);
+        }
+        if (lastError && status === SYNC_STATUS.FAILED) state.saveFeedback = `${lastError} ${t('feedback.localRetained')}`;
+        if (isGlassesMode && state.phase === 'summary') render();
+        else refreshNonStructuralUi();
       }
     });
   } catch {
@@ -2548,8 +2838,8 @@ async function initializeOfflineFirstApp() {
   window.addEventListener('online', () => void synchronizeNow());
   window.addEventListener('offline', () => {
     if (state.currentUser) {
-      state.saveFeedback = 'Offline — new work will be recorded on this device and queued.';
-      render();
+      state.saveFeedback = t('feedback.offlineQueued');
+      refreshNonStructuralUi();
     }
   });
   await checkAuth();

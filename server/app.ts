@@ -13,7 +13,9 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openDatabase } from './repositories/database.ts';
 import { ALLOWED_IMAGE_TYPES, detectImageMimeType as detectUploadedImageMimeType } from './services/image-validation.ts';
+import { createAnalysisProvider, normalizeProviderResult } from './services/ai-provider.ts';
 import { validateSessionPayload } from './validation/session.ts';
+import { createTranslator, normalizeLocale } from '../src/i18n/index.ts';
 import {
   clearAuthCookie,
   getSessionUserId,
@@ -93,13 +95,13 @@ function escapeHtml(value) {
 // Report rendering helpers
 // ---------------------------------------------------------------------------
 
-function formatReportDate(value) {
+function formatReportDate(value, locale = 'ko') {
   if (!value) return '미입력';
 
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return '미입력';
 
-  return new Intl.DateTimeFormat('ko-KR', {
+  return new Intl.DateTimeFormat(locale === 'en' ? 'en-US' : 'ko-KR', {
     year: 'numeric',
     month: '2-digit',
     day: '2-digit',
@@ -131,20 +133,20 @@ function renderRows(items, columns, emptyText) {
     .join('');
 }
 
-function renderEvidencePhotos(item) {
+function renderEvidencePhotos(item, t = createTranslator()) {
   const photos = Array.isArray(item.evidencePhotos) ? item.evidencePhotos : [];
-  if (!photos.length) return '<span class="empty">사진 없음</span>';
+  if (!photos.length) return `<span class="empty">${t('report.noPhoto')}</span>`;
 
   return `
     <div class="photo-grid">
       ${photos
         .map((photo, index) => {
           const isMockEvidence = photo.source === 'glasses_mock_capture' || String(photo.url ?? '').startsWith('data:');
-          const mockLabel = isMockEvidence ? ' (Glasses HUD mock photo - prototype evidence)' : '';
+          const mockLabel = isMockEvidence ? ` (${t('report.mockPhoto')})` : '';
           return `
             <figure>
               <img src="${escapeHtml(photo.url)}" alt="${formatReportValue(photo.originalName ?? `Evidence ${index + 1}`)}" />
-              <figcaption>${formatReportValue(photo.originalName ?? `사진 ${index + 1}`)}${mockLabel}</figcaption>
+              <figcaption>${formatReportValue(photo.originalName ?? t('report.photoNumber', { number: index + 1 }))}${mockLabel}</figcaption>
             </figure>
           `;
         })
@@ -153,21 +155,27 @@ function renderEvidencePhotos(item) {
   `;
 }
 
-function renderAiSuggestionNote(item) {
+function renderAiSuggestionNote(item, t = createTranslator()) {
   if (!item.aiSuggestion) return '';
 
   const confidence = Number(item.aiSuggestion.confidence);
-  const confidenceText = Number.isFinite(confidence) ? ` / 신뢰도 ${Math.round(confidence * 100)}%` : '';
-  const decisionText = item.aiSuggestion.accepted
-    ? '작업자가 수락한 참고 의견'
+  const confidenceText = Number.isFinite(confidence) ? t('report.confidence', { percent: Math.round(confidence * 100) }) : '';
+  const decisionText = item.aiSuggestion.edited
+    ? t('report.aiEdited')
+    : item.aiSuggestion.accepted
+    ? t('report.aiAccepted')
     : item.aiSuggestion.rejected
-      ? '작업자가 거부한 참고 의견'
-      : '작업자 검토 전 참고 의견';
-  return `<p class="ai-note">Mock AI 분석: ${decisionText}${confidenceText}. 공식 기록은 작업자 검토 결과를 기준으로 합니다.</p>`;
+      ? t('report.aiRejected')
+      : t('report.aiPending');
+  const originText = item.aiSuggestion.simulated
+    ? t('report.aiMockOrigin', { provider: item.aiSuggestion.provider ?? 'deterministic_fixture' })
+    : t('report.aiProviderOrigin', { provider: item.aiSuggestion.provider ?? 'unknown' });
+  const rawTitle = item.aiSuggestion.rawSuggestion?.title ?? t('common.unknown');
+  return `<p class="ai-note">${originText}</p><p class="ai-note">${t('report.aiOriginContent', { title: rawTitle })}</p><p class="ai-note">${t('report.aiDecision', { decision: decisionText, confidence: confidenceText })}</p><p class="ai-note">${t('report.aiHumanContent', { title: item.title })}</p>`;
 }
 
-function renderReportTitle(item) {
-  return `${formatReportValue(item.title)}${renderAiSuggestionNote(item)}`;
+function renderReportTitle(item, t = createTranslator()) {
+  return `${formatReportValue(item.title)}${renderAiSuggestionNote(item, t)}`;
 }
 
 function getHazardStatus(hazard) {
@@ -177,17 +185,45 @@ function getHazardStatus(hazard) {
 function normalizeAiSuggestion(aiSuggestion) {
   if (!aiSuggestion) return null;
 
-  const accepted = aiSuggestion.accepted === true;
-  const rejected = accepted ? false : aiSuggestion.rejected === true;
+  const accepted = aiSuggestion.accepted === true || aiSuggestion.humanDecision === 'accepted';
+  const rejected = accepted ? false : aiSuggestion.rejected === true || aiSuggestion.humanDecision === 'rejected';
 
   return {
-    source: aiSuggestion.source ?? 'mock_ai',
+    analysisId: aiSuggestion.analysisId ?? null,
+    uploadId: aiSuggestion.uploadId ?? null,
+    uploadHash: aiSuggestion.uploadHash ?? null,
+    source: aiSuggestion.source ?? (aiSuggestion.mode === 'mock' ? 'mock_ai' : 'ai_provider'),
+    mode: aiSuggestion.mode ?? 'mock',
+    provider: aiSuggestion.provider ?? 'deterministic_fixture',
+    modelVersion: aiSuggestion.modelVersion ?? null,
+    simulated: aiSuggestion.simulated !== false,
+    pixelInterpretation: aiSuggestion.pixelInterpretation === true,
+    disclaimer: aiSuggestion.disclaimer ?? null,
+    requestedAt: aiSuggestion.requestedAt ?? aiSuggestion.suggestedAt ?? null,
+    completedAt: aiSuggestion.completedAt ?? aiSuggestion.suggestedAt ?? null,
+    rawSuggestion: aiSuggestion.rawSuggestion ?? aiSuggestion.suggestion ?? null,
+    finalHumanSuggestion: aiSuggestion.finalHumanSuggestion ?? null,
+    humanDecision: aiSuggestion.humanDecision ?? (accepted ? 'accepted' : rejected ? 'rejected' : 'pending'),
     accepted,
     rejected,
+    edited: aiSuggestion.edited === true || aiSuggestion.humanDecision === 'edited',
+    reviewer: aiSuggestion.reviewer ?? null,
     confidence: typeof aiSuggestion.confidence === 'number' ? aiSuggestion.confidence : null,
     suggestedAt: aiSuggestion.suggestedAt ?? null,
     reviewedAt: aiSuggestion.reviewedAt ?? null
   };
+}
+
+function normalizeEditedSuggestion(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const suggestion = {
+    title: String(value.title ?? '').trim(), category: String(value.category ?? '').trim(),
+    riskLevel: String(value.riskLevel ?? '').trim(), description: String(value.description ?? '').trim(),
+    recommendedAction: String(value.recommendedAction ?? '').trim(), confidence: null
+  };
+  if (![suggestion.title, suggestion.category, suggestion.description, suggestion.recommendedAction].every(Boolean)) return null;
+  if (!['low', 'medium', 'high'].includes(suggestion.riskLevel)) return null;
+  return suggestion;
 }
 
 function normalizeSession(session) {
@@ -206,80 +242,32 @@ function normalizeSession(session) {
   };
 }
 
-// ---------------------------------------------------------------------------
-// AI mock helpers
-// ---------------------------------------------------------------------------
-
-function createMockAiSuggestion(entryType) {
-  const suggestedAt = new Date().toISOString();
-
-  if (entryType === 'near_miss') {
-    return {
-      title: 'Near miss: struck-by risk observed',
-      category: 'near_miss_observation',
-      riskLevel: 'high',
-      description:
-        'Photo evidence may indicate a near-miss condition with workers or materials exposed to moving equipment or falling objects.',
-      recommendedAction:
-        'Pause related work, confirm exclusion zones, brief nearby workers, and document corrective action before restart.',
-      confidence: 0.78,
-      source: 'mock_ai',
-      isMock: true,
-      requiresHumanReview: true,
-      suggestedAt
-    };
-  }
-
-  return {
-    title: 'Potential blocked access or housekeeping hazard',
-    category: 'site_housekeeping',
-    riskLevel: 'medium',
-    description:
-      'Photo evidence may indicate clutter, blocked access, or an unsecured work area that should be reviewed before work continues.',
-    recommendedAction:
-      'Clear the access path, secure loose materials, add signage or barricades if needed, and verify the area with the supervisor.',
-    confidence: 0.74,
-    source: 'mock_ai',
-    isMock: true,
-    requiresHumanReview: true,
-    suggestedAt
-  };
-}
-
-async function analyzeHazardImage({ entryType, photo, photos, imageUrl, aiMode }) {
-  if (aiMode === 'mock' || !aiMode) {
-    return createMockAiSuggestion(entryType);
-  }
-
-  // Future real vision providers should preserve this response contract so the
-  // frontend and saved-session schema do not need to change.
-  throw new Error(`Unsupported AI_MODE "${aiMode}". Set AI_MODE=mock until a real provider is implemented.`);
-}
-
-function renderCorrectiveAction(hazard) {
+function renderCorrectiveAction(hazard, t = createTranslator(), locale = 'ko') {
   const action = hazard.correctiveAction ?? {};
-  const closure = isCorrectiveActionClosed(action) ? '검증 완료' : '미검증 / 조치 진행 중';
-  const evidence = action.closureEvidence?.length ? action.closureEvidence.join(', ') : '없음';
-  return `즉시 통제: ${formatReportValue(action.immediateControl)}<br />담당: ${formatReportValue(
+  const closure = isCorrectiveActionClosed(action) ? t('report.verificationComplete') : t('report.verificationOpen');
+  const evidence = action.closureEvidence?.length ? action.closureEvidence.join(', ') : t('report.none');
+  return `${t('report.controlImmediate')}: ${formatReportValue(action.immediateControl)}<br />${t('report.assignee')}: ${formatReportValue(
     action.assignedTo
-  )}<br />기한: ${formatReportDate(action.dueAt)}<br />작업 상태: ${formatReportValue(
+  )}<br />${t('report.dueAt')}: ${formatReportDate(action.dueAt, locale)}<br />${t('report.workStatus')}: ${formatReportValue(
     action.workStatus
-  )}<br />검증: ${closure}<br />검증자: ${formatReportValue(action.verifiedBy)}<br />검증 시각: ${formatReportDate(
-    action.verifiedAt
-  )}<br />종결 증빙: ${formatReportValue(evidence)}`;
+  )}<br />${t('report.verification')}: ${closure}<br />${t('report.verifier')}: ${formatReportValue(action.verifiedBy)}<br />${t('report.verifiedAt')}: ${formatReportDate(
+    action.verifiedAt, locale
+  )}<br />${t('report.closureEvidence')}: ${formatReportValue(evidence)}`;
 }
 
-function renderSharingEvidence(sharing) {
-  if (sharing.status === SHARING_STATUS.NOT_SHARED) return '공유하지 않음으로 기록됨';
-  if (sharing.status !== SHARING_STATUS.SHARED) return '공유 여부 미기록';
-  return `공유 방법: ${formatReportValue(sharing.method)}<br />수신자/그룹: ${formatReportValue(
+function renderSharingEvidence(sharing, t = createTranslator(), locale = 'ko') {
+  if (sharing.status === SHARING_STATUS.NOT_SHARED) return t('report.notShared');
+  if (sharing.status !== SHARING_STATUS.SHARED) return t('report.sharingNotRecorded');
+  return `${t('report.shareMethod')}: ${formatReportValue(sharing.method)}<br />${t('report.recipients')}: ${formatReportValue(
     sharing.recipients
-  )}<br />서버 기록 시각: ${formatReportDate(sharing.sharedAt)}<br />선택적 확인 결과: ${formatReportValue(
+  )}<br />${t('report.serverRecordedAt')}: ${formatReportDate(sharing.sharedAt, locale)}<br />${t('report.optionalAck')}: ${formatReportValue(
     sharing.acknowledgmentResults
   )}`;
 }
 
-export function renderSessionReport(session) {
+export function renderSessionReport(session, localeValue = 'ko') {
+  const reportLocale = normalizeLocale(localeValue);
+  const t = createTranslator(reportLocale);
   const presentWorkers = session.workers.filter((worker) => worker.present);
   const supervisorAcknowledgedWorkers = session.workers.filter(
     (worker) => worker.acknowledgment?.supervisorRecorded
@@ -302,24 +290,24 @@ export function renderSessionReport(session) {
   const sharing = normalizeSharing(session.sharing);
 
   const hazardColumns = [
-    { key: 'title', label: '항목', render: (hazard) => renderReportTitle(hazard) },
-    { key: 'location', label: '위치' },
-    { key: 'riskLevel', label: '위험도' },
-    { key: 'recommendedAction', label: '권장 조치' },
-    { key: 'evidencePhotos', label: '사진 증빙', render: (hazard) => renderEvidencePhotos(hazard) }
+    { key: 'title', label: t('report.item'), render: (hazard) => renderReportTitle(hazard, t) },
+    { key: 'location', label: t('report.location') },
+    { key: 'riskLevel', label: t('report.riskLevel') },
+    { key: 'recommendedAction', label: t('report.recommendedAction') },
+    { key: 'evidencePhotos', label: t('report.photoEvidence'), render: (hazard) => renderEvidencePhotos(hazard, t) }
   ];
   const actionColumns = [
-    { key: 'title', label: '항목', render: (hazard) => renderReportTitle(hazard) },
-    { key: 'location', label: '위치' },
-    { key: 'correctiveAction', label: '시정조치 및 검증', render: (hazard) => renderCorrectiveAction(hazard) }
+    { key: 'title', label: t('report.item'), render: (hazard) => renderReportTitle(hazard, t) },
+    { key: 'location', label: t('report.location') },
+    { key: 'correctiveAction', label: t('report.correctiveVerification'), render: (hazard) => renderCorrectiveAction(hazard, t, reportLocale) }
   ];
 
   return `<!doctype html>
-<html lang="ko">
+<html lang="${reportLocale}">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>TBM 보고서 - ${formatReportValue(session.site?.siteName)}</title>
+    <title>${t('report.browserTitle', { site: session.site?.siteName ?? '' })}</title>
     <style>
       :root {
         color-scheme: light;
@@ -511,142 +499,143 @@ export function renderSessionReport(session) {
     <main>
       <header>
         <div>
-          <h1>작업 전 안전회의(TBM) 보고서</h1>
+          <h1>${t('report.title')}</h1>
           <p>${formatReportValue(session.work?.taskName)}</p>
         </div>
         <p class="meta-note">Session ID<br />${formatReportValue(session.sessionId)}</p>
       </header>
 
       <dl class="summary-grid">
-        <div class="summary-item"><dt>현장명</dt><dd>${formatReportValue(session.site?.siteName)}</dd></div>
-        <div class="summary-item"><dt>작업구역</dt><dd>${formatReportValue(session.site?.siteArea)}</dd></div>
-        <div class="summary-item"><dt>작업명</dt><dd>${formatReportValue(session.work?.taskName)}</dd></div>
-        <div class="summary-item"><dt>TBM 실시자</dt><dd>${formatReportValue(session.supervisor?.name)} / ${formatReportValue(
+        <div class="summary-item"><dt>${t('report.siteName')}</dt><dd>${formatReportValue(session.site?.siteName)}</dd></div>
+        <div class="summary-item"><dt>${t('report.siteArea')}</dt><dd>${formatReportValue(session.site?.siteArea)}</dd></div>
+        <div class="summary-item"><dt>${t('report.taskName')}</dt><dd>${formatReportValue(session.work?.taskName)}</dd></div>
+        <div class="summary-item"><dt>${t('report.conductor')}</dt><dd>${formatReportValue(session.supervisor?.name)} / ${formatReportValue(
           session.supervisor?.role
         )}</dd></div>
-        <div class="summary-item"><dt>실시 시간</dt><dd>${formatReportDate(conductedAt)}</dd></div>
-        <div class="summary-item"><dt>기록 상태</dt><dd>${formatReportValue(session.status)}</dd></div>
-        <div class="summary-item"><dt>근로자 공유</dt><dd>${renderSharingEvidence(sharing)}</dd></div>
+        <div class="summary-item"><dt>${t('report.conductedAt')}</dt><dd>${formatReportDate(conductedAt, reportLocale)}</dd></div>
+        <div class="summary-item"><dt>${t('report.recordStatus')}</dt><dd>${formatReportValue(t(`status.${session.status}`))}</dd></div>
+        <div class="summary-item"><dt>${t('report.workerSharing')}</dt><dd>${renderSharingEvidence(sharing, t, reportLocale)}</dd></div>
       </dl>
 
       <section>
-        <h2>참석 근로자</h2>
+        <h2>${t('report.attendance')}</h2>
+        ${session.attendanceSummary ? `<p>${t('report.countOnlyAttendance')}: ${session.attendanceSummary.presentCount} / ${session.attendanceSummary.expectedCount} (${formatReportValue(session.attendanceSummary.captureSource)})</p>` : ''}
         <table>
-          <thead><tr><th>이름</th><th>역할</th><th>출석</th></tr></thead>
+          <thead><tr><th>${t('report.name')}</th><th>${t('report.role')}</th><th>${t('report.present')}</th></tr></thead>
           <tbody>${renderRows(
             presentWorkers,
             [
               { key: 'name' },
               { key: 'role' },
-              { key: 'present', render: () => '출석' }
+              { key: 'present', render: () => t('report.present') }
             ],
-            '참석 근로자 없음'
+            t('report.noneAttendance')
           )}</tbody>
         </table>
       </section>
 
       <section>
-        <h2>감독자 기록 TBM 확인</h2>
+        <h2>${t('report.supervisorAcknowledgment')}</h2>
         <table>
-          <thead><tr><th>이름</th><th>기록자</th><th>기록 시각</th><th>근거</th></tr></thead>
+          <thead><tr><th>${t('report.name')}</th><th>${t('report.recorder')}</th><th>${t('report.recordedAt')}</th><th>${t('report.basis')}</th></tr></thead>
           <tbody>${renderRows(
             supervisorAcknowledgedWorkers,
             [
               { key: 'name' },
               { key: 'recordedBy', render: (worker) => formatReportValue(worker.acknowledgment?.supervisorRecordedBy) },
-              { key: 'recordedAt', render: (worker) => formatReportDate(worker.acknowledgment?.supervisorRecordedAt) },
+              { key: 'recordedAt', render: (worker) => formatReportDate(worker.acknowledgment?.supervisorRecordedAt, reportLocale) },
               { key: 'source', render: (worker) => formatReportValue(worker.acknowledgment?.source) }
             ],
-            '감독자가 기록한 확인 없음'
+            t('report.noneSupervisorAck')
           )}</tbody>
         </table>
       </section>
 
       <section>
-        <h2>독립적으로 검증된 근로자 확인</h2>
+        <h2>${t('report.independentAcknowledgment')}</h2>
         <table>
-          <thead><tr><th>이름</th><th>검증자</th><th>검증 시각</th><th>방법</th></tr></thead>
+          <thead><tr><th>${t('report.name')}</th><th>${t('report.verifier')}</th><th>${t('report.verifiedAt')}</th><th>${t('report.method')}</th></tr></thead>
           <tbody>${renderRows(
             independentlyVerifiedWorkers,
             [
               { key: 'name' },
               { key: 'verifiedBy', render: (worker) => formatReportValue(worker.acknowledgment?.independentlyVerifiedBy) },
-              { key: 'verifiedAt', render: (worker) => formatReportDate(worker.acknowledgment?.independentlyVerifiedAt) },
+              { key: 'verifiedAt', render: (worker) => formatReportDate(worker.acknowledgment?.independentlyVerifiedAt, reportLocale) },
               { key: 'method', render: (worker) => formatReportValue(worker.acknowledgment?.independentVerificationMethod) }
             ],
-            '독립적으로 검증된 확인 없음'
+            t('report.noneIndependentAck')
           )}</tbody>
         </table>
       </section>
 
       <section>
-        <h2>전체 유해위험요인</h2>
+        <h2>${t('report.allHazards')}</h2>
         <table>
           <thead><tr>${hazardColumns.map((column) => `<th>${column.label}</th>`).join('')}</tr></thead>
-          <tbody>${renderRows(session.hazards, hazardColumns, '등록된 유해위험요인 없음')}</tbody>
+          <tbody>${renderRows(session.hazards, hazardColumns, t('report.noneHazards'))}</tbody>
         </table>
       </section>
 
       <section>
-        <h2>통제 확인 항목(Controlled — 검토 후 작업 가능)</h2>
+        <h2>${t('report.controlled')}</h2>
         <table>
           <thead><tr>${hazardColumns.map((column) => `<th>${column.label}</th>`).join('')}</tr></thead>
-          <tbody>${renderRows(controlledHazards, hazardColumns, '통제 확인 항목 없음')}</tbody>
+          <tbody>${renderRows(controlledHazards, hazardColumns, t('report.noneControlled'))}</tbody>
         </table>
       </section>
 
       <section>
-        <h2>미종결 시정조치(Open Corrective Actions)</h2>
+        <h2>${t('report.openActions')}</h2>
         <table>
           <thead><tr>${actionColumns.map((column) => `<th>${column.label}</th>`).join('')}</tr></thead>
-          <tbody>${renderRows(openActionHazards, actionColumns, '미종결 시정조치 없음')}</tbody>
+          <tbody>${renderRows(openActionHazards, actionColumns, t('report.noneOpenActions'))}</tbody>
         </table>
       </section>
 
       <section>
-        <h2>검증 완료 시정조치(Closed Corrective Actions)</h2>
+        <h2>${t('report.closedActions')}</h2>
         <table>
           <thead><tr>${actionColumns.map((column) => `<th>${column.label}</th>`).join('')}</tr></thead>
-          <tbody>${renderRows(closedActionHazards, actionColumns, '검증 완료 시정조치 없음')}</tbody>
+          <tbody>${renderRows(closedActionHazards, actionColumns, t('report.noneClosedActions'))}</tbody>
         </table>
       </section>
 
       <section>
-        <h2>미확인 항목(Not Checked)</h2>
+        <h2>${t('report.unchecked')}</h2>
         <table>
           <thead><tr>${hazardColumns.map((column) => `<th>${column.label}</th>`).join('')}</tr></thead>
-          <tbody>${renderRows(uncheckedHazards, hazardColumns, '미확인 항목 없음')}</tbody>
+          <tbody>${renderRows(uncheckedHazards, hazardColumns, t('report.noneUnchecked'))}</tbody>
         </table>
       </section>
 
       <section>
-        <h2>아차사고 및 Near-miss 기록</h2>
+        <h2>${t('report.nearMisses')}</h2>
         <table>
-          <thead><tr><th>항목</th><th>위치</th><th>위험도</th><th>조치 내용</th><th>사진 증빙</th></tr></thead>
+          <thead><tr><th>${t('report.item')}</th><th>${t('report.location')}</th><th>${t('report.riskLevel')}</th><th>${t('report.actionDetails')}</th><th>${t('report.photoEvidence')}</th></tr></thead>
           <tbody>${renderRows(
             session.nearMisses ?? [],
             [
-              { key: 'title', render: (nearMiss) => renderReportTitle(nearMiss) },
+              { key: 'title', render: (nearMiss) => renderReportTitle(nearMiss, t) },
               { key: 'location' },
               { key: 'riskLevel' },
               { key: 'actionTaken' },
-              { key: 'evidencePhotos', render: (nearMiss) => renderEvidencePhotos(nearMiss) }
+              { key: 'evidencePhotos', render: (nearMiss) => renderEvidencePhotos(nearMiss, t) }
             ],
-            '아차사고 기록 없음'
+            t('report.noneNearMiss')
           )}</tbody>
         </table>
       </section>
 
       <section>
-        <h2>근로자 공유 증빙</h2>
+        <h2>${t('report.sharing')}</h2>
         <table>
-          <thead><tr><th>공유 상태와 근거</th></tr></thead>
-          <tbody><tr><td>${renderSharingEvidence(sharing)}</td></tr></tbody>
+          <thead><tr><th>${t('report.sharingBasis')}</th></tr></thead>
+          <tbody><tr><td>${renderSharingEvidence(sharing, t, reportLocale)}</td></tr></tbody>
         </table>
       </section>
 
       <div class="print-actions">
-        <button type="button" onclick="window.print()">인쇄</button>
+        <button type="button" onclick="window.print()">${t('report.print')}</button>
       </div>
     </main>
   </body>
@@ -661,9 +650,15 @@ function toPublicUpload(upload) {
     mimeType: upload.mimeType,
     size: upload.size,
     uploadedAt: upload.uploadedAt,
-    source: 'uploaded_evidence',
+    source: upload.source === 'sdk_raw_camera' ? 'sdk_raw_camera' : 'browser_file_picker',
     url: `/api/uploads/${encodeURIComponent(upload.id)}`
   };
+}
+
+function toPublicAiAnalysis(analysis) {
+  if (!analysis) return null;
+  const { ownerId, reviewerUserId, ...publicAnalysis } = analysis;
+  return publicAnalysis;
 }
 
 // ---------------------------------------------------------------------------
@@ -673,7 +668,7 @@ function toPublicUpload(upload) {
 export function createApp({
   dataDir = DEFAULT_DATA_DIR,
   databasePath = process.env.DATABASE_PATH ?? (dataDir === DEFAULT_DATA_DIR ? DEFAULT_DATABASE_PATH : path.join(dataDir, 'safety-lens.sqlite')),
-  uploadsDir = DEFAULT_UPLOADS_DIR,
+  uploadsDir = process.env.UPLOADS_DIR ?? DEFAULT_UPLOADS_DIR,
   registrationKey: configuredRegistrationKey = process.env.REGISTRATION_KEY,
   sessionSecret: configuredSessionSecret = process.env.SESSION_SECRET,
   nodeEnv = process.env.NODE_ENV ?? 'development',
@@ -682,11 +677,13 @@ export function createApp({
   authRateLimit = DEFAULT_AUTH_RATE_LIMIT,
   now = () => Date.now(),
   aiMode = process.env.AI_MODE ?? 'mock',
+  analysisProvider: configuredAnalysisProvider = null,
   staticDir = path.join(PROJECT_ROOT, 'dist')
 } = {}) {
   const sessionSecret = requireSecureSessionSecret(configuredSessionSecret, nodeEnv);
   const useSecureCookies = nodeEnv === 'production' || secureCookies === true;
   const app = express();
+  const analysisProvider = configuredAnalysisProvider ?? createAnalysisProvider(aiMode);
   const database = openDatabase({
     databasePath,
     migrationsDir: MIGRATIONS_DIR,
@@ -733,8 +730,8 @@ export function createApp({
 
   function sanitizeEvidencePhoto(photo, uploadsById, ownerId, strict) {
     const isMockEvidence =
-      photo?.source === 'glasses_mock_capture' && String(photo?.url ?? '').startsWith('data:image/svg+xml');
-    if (isMockEvidence) return photo;
+      photo?.source === 'browser_preview_mock' && String(photo?.url ?? '').startsWith('data:image/svg+xml');
+    if (isMockEvidence) return { ...photo, source: 'browser_preview_mock' };
 
     const uploadId = String(photo?.uploadId ?? photo?.id ?? '');
     const uploadRecord = uploadsById.get(uploadId);
@@ -1143,22 +1140,98 @@ export function createApp({
   });
 
   app.post('/api/ai/analyze-hazard', async (request, response, next) => {
-    const { entryType, photo, photos, imageUrl } = request.body ?? {};
-    const hasPhotoMetadata = Boolean(photo) || (Array.isArray(photos) && photos.length > 0);
-    const hasImageUrl = typeof imageUrl === 'string' && imageUrl.trim();
+    const { entryType, uploadId, sessionId } = request.body ?? {};
 
     if (!['new_hazard', 'near_miss'].includes(entryType)) {
       response.status(400).json({ error: 'entryType must be new_hazard or near_miss.' });
       return;
     }
 
-    if (!hasPhotoMetadata && !hasImageUrl) {
-      response.status(400).json({ error: 'Photo metadata or imageUrl is required for analysis.' });
+    if (typeof uploadId !== 'string' || !uploadId.trim()) {
+      response.status(400).json({ error: 'A valid owned uploadId is required for analysis.' });
       return;
     }
 
     try {
-      response.json(await analyzeHazardImage({ entryType, photo, photos, imageUrl, aiMode }));
+      const uploadRecord = database.getUploadForOwner(uploadId, request.user.id);
+      if (!uploadRecord) {
+        response.status(404).json({ error: 'Resource not found.' });
+        return;
+      }
+      let ownedSessionId = null;
+      if (sessionId) {
+        const sessionOwner = database.getSessionOwner(String(sessionId));
+        if (sessionOwner && sessionOwner !== request.user.id) {
+          response.status(404).json({ error: 'Resource not found.' });
+          return;
+        }
+        if (sessionOwner === request.user.id) ownedSessionId = String(sessionId);
+      }
+
+      let imageBytes;
+      try {
+        imageBytes = await readFile(path.join(uploadsDir, uploadRecord.filename));
+      } catch (error) {
+        if (error.code === 'ENOENT') {
+          response.status(404).json({ error: 'Resource not found.' });
+          return;
+        }
+        throw error;
+      }
+      const actualHash = `sha256:${createHash('sha256').update(imageBytes).digest('hex')}`;
+      if (actualHash !== uploadRecord.hash || detectUploadedImageMimeType(imageBytes) !== uploadRecord.mimeType) {
+        response.status(400).json({ error: 'Evidence image failed integrity validation.' });
+        return;
+      }
+
+      const requestedAt = new Date(now()).toISOString();
+      let providerResult;
+      try {
+        providerResult = normalizeProviderResult(await analysisProvider.analyze({ entryType, upload: uploadRecord, imageBytes }));
+      } catch (providerError) {
+        response.status(502).json({ error: 'Image suggestion provider failed. Original evidence was retained.' });
+        return;
+      }
+      const completedAt = new Date(now()).toISOString();
+      const analysis = database.createAiAnalysis({
+        analysisId: randomUUID(), ownerId: request.user.id, uploadId, sessionId: ownedSessionId,
+        entryType, mode: providerResult.mode, provider: providerResult.provider, modelVersion: providerResult.modelVersion,
+        requestedAt, completedAt, suggestion: providerResult.suggestion
+      }, request.user.id);
+      response.json({
+        ...toPublicAiAnalysis(analysis),
+        uploadHash: uploadRecord.hash,
+        simulated: providerResult.simulated,
+        pixelInterpretation: providerResult.pixelInterpretation,
+        disclaimer: providerResult.disclaimer,
+        requiresHumanReview: true
+      });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.patch('/api/ai/analyses/:analysisId/review', (request, response, next) => {
+    try {
+      const decision = String(request.body?.decision ?? '');
+      if (!['accepted', 'edited', 'rejected'].includes(decision)) {
+        response.status(400).json({ error: 'decision must be accepted, edited, or rejected.' });
+        return;
+      }
+      const editedSuggestion = decision === 'edited' ? normalizeEditedSuggestion(request.body?.editedSuggestion) : null;
+      if (decision === 'edited' && !editedSuggestion) {
+        response.status(400).json({ error: 'A complete editedSuggestion is required for an edited decision.' });
+        return;
+      }
+      const analysis = database.reviewAiAnalysis({
+        analysisId: request.params.analysisId, ownerId: request.user.id, decision, editedSuggestion,
+        reviewerUserId: request.user.id, reviewer: request.user.name
+      });
+      if (!analysis) {
+        response.status(404).json({ error: 'Resource not found.' });
+        return;
+      }
+      response.json(toPublicAiAnalysis(analysis));
     } catch (error) {
       next(error);
     }
@@ -1176,13 +1249,15 @@ export function createApp({
     try {
       const storedSession = database.getSessionForOwner(request.params.sessionId, request.user.id);
       const session = storedSession ? normalizeSession(storedSession) : null;
+      const reportLocale = normalizeLocale(request.query.lang);
+      const reportT = createTranslator(reportLocale);
 
       if (!session) {
         response.status(404).type('html').send(`<!doctype html>
-  <html lang="ko">
+  <html lang="${reportLocale}">
     <head>
       <meta charset="utf-8" />
-      <title>Report not found</title>
+      <title>${reportT('report.notFound')}</title>
       <style>
         body {
           margin: 40px;
@@ -1193,14 +1268,14 @@ export function createApp({
       </style>
     </head>
     <body>
-      <h1>Report not found</h1>
-      <p>The requested resource was not found.</p>
+      <h1>${reportT('report.notFound')}</h1>
+      <p>${reportT('report.notFoundDescription')}</p>
     </body>
   </html>`);
         return;
       }
 
-      response.type('html').send(renderSessionReport(session));
+      response.type('html').send(renderSessionReport(session, reportLocale));
     } catch (error) {
       next(error);
     }

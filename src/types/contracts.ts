@@ -95,6 +95,37 @@ export interface PersistedEvidenceUpload extends EvidenceRecord {
   uploadedAt: string;
 }
 
+export interface AiSuggestionRecord {
+  title: string;
+  category: string;
+  riskLevel: 'low' | 'medium' | 'high';
+  description: string;
+  recommendedAction: string;
+  confidence: number | null;
+}
+
+export interface AiAnalysisRecord {
+  analysisId: string;
+  uploadId: string;
+  uploadHash?: string;
+  sessionId?: string | null;
+  entryType: 'new_hazard' | 'near_miss';
+  mode: string;
+  provider: string;
+  modelVersion: string | null;
+  requestedAt: string;
+  completedAt: string;
+  suggestion: AiSuggestionRecord;
+  humanDecision: 'pending' | 'accepted' | 'edited' | 'rejected';
+  editedSuggestion?: AiSuggestionRecord | null;
+  reviewer?: string | null;
+  reviewedAt?: string | null;
+  simulated?: boolean;
+  pixelInterpretation?: boolean;
+  disclaimer?: string;
+  requiresHumanReview?: boolean;
+}
+
 export interface AttendanceRecord {
   sessionId: string;
   workerId: string;
@@ -125,6 +156,9 @@ export interface CorrectiveActionRecord {
   verifiedBy: string;
   verifiedAt: string | null;
   closureEvidence: string[];
+  immediateResponseCategory?: string;
+  responsibleParty?: string;
+  duePeriod?: string;
 }
 
 export interface HumanReviewRecord {
@@ -159,6 +193,7 @@ export interface SharingRecord {
   sharedAt: string | null;
   acknowledgmentResults: string;
   clientObservedSharedAt?: string | null;
+  proofType?: string;
 }
 
 export interface SharingEventRecord extends SharingRecord {
@@ -207,6 +242,7 @@ export interface TbmSessionRecord {
   work: Record<string, unknown> & { taskName?: string };
   supervisor: Record<string, unknown> & { name?: string; role?: string };
   workers: WorkerRecord[];
+  attendanceSummary?: { expectedCount: number; presentCount: number; captureSource: string; deviceObservedAt: string | null } | null;
   hazards: HazardRecord[];
   nearMisses: NearMissRecord[];
   sharing: SharingRecord;

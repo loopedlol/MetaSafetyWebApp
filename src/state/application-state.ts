@@ -13,6 +13,7 @@ export function createApplicationState({ stressMemo = '', appVersion }: { stress
       supervisorName: '김지훈', supervisorRole: '현장 안전관리자', scheduledAt: new Date(),
       startedAt: null, finalizedAt: null, completedAt: null,
       sharing: { status: SHARING_STATUS.NOT_RECORDED, method: '', recipients: '', sharedAt: null, acknowledgmentResults: '' },
+      attendanceSummary: null,
       device: { platform: 'browser_hud_prototype', appVersion, inputMode: 'keyboard_and_touch' }
     },
     workers: [
@@ -23,9 +24,12 @@ export function createApplicationState({ stressMemo = '', appVersion }: { stress
     ],
     responses: [], nearMisses: [], savedSessions: [], savedSessionsStatus: 'idle', saveFeedback: '',
     isSavingSession: false, manualEntryFeedback: '', manualAiSuggestion: null, manualAiDecision: null,
+    manualUploadedEvidence: [],
     returnPhase: 'checklist', draftStatus: '', pendingDraft: null, offlineStore: null, syncEngine: null,
-    serverRevision: 0, syncConflict: null, glassesStep: 'start', glassesMemoFeedback: '',
-    glassesPhotoFeedback: '', glassesReviewFeedback: ''
+    serverRevision: 0, syncConflict: null, glassesStep: 'start', glassesReturnStep: 'hazard_decision',
+    glassesAttendanceDigits: { expectedTens: 0, expectedOnes: 4, presentTens: 0, presentOnes: 0 },
+    glassesProvisionalDecision: null, glassesContext: null,
+    glassesHelpOpen: false, glassesAnnouncement: '', glassesMemoFeedback: '', glassesPhotoFeedback: '', glassesReviewFeedback: ''
   };
 }
 
