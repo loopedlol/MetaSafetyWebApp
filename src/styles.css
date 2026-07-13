@@ -711,12 +711,23 @@ span {
 .v2-worker-check {
   min-width: 0;
   display: grid;
-  grid-template-columns: 26px 34px minmax(0, 1fr) minmax(0, 0.8fr);
+  grid-template-columns: 34px minmax(0, 1fr) minmax(0, 0.8fr);
   align-items: center;
   gap: 8px;
 }
 
-.v2-worker-check input {
+.v2-worker-fact {
+  grid-column: 2 / -1;
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr);
+  align-items: center;
+  gap: 7px;
+  color: var(--v2-muted);
+  font-size: 11px;
+  font-weight: 850;
+}
+
+.v2-worker-fact input {
   width: 22px;
   height: 22px;
   accent-color: var(--v2-red);
@@ -950,7 +961,27 @@ span {
   display: grid;
   grid-template-rows: auto auto minmax(0, 1fr);
   gap: 12px;
-  overflow: hidden;
+  overflow: auto;
+}
+
+.v2-corrective-card,
+.v2-sharing-card {
+  padding: 14px;
+  display: grid;
+  gap: 12px;
+}
+
+.v2-screen.is-corrective {
+  display: block;
+  overflow: auto;
+}
+
+.v2-screen.is-corrective > * + * {
+  margin-top: 10px;
+}
+
+.v2-screen.is-corrective .v2-hazard-card {
+  min-height: 280px;
 }
 
 .v2-summary-hero {
@@ -1094,6 +1125,9 @@ span {
 .save-feedback:empty { display: none; }
 
 .draft-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   width: fit-content;
   max-width: 100%;
   margin: 0;

@@ -1,10 +1,38 @@
-import './styles.css';
+// @ts-nocheck
+import '../styles.css';
+import {
+  HAZARD_STATUS,
+  SHARING_STATUS,
+  VERIFICATION_STATUS,
+  WORK_STATUS,
+  createEmptyAcknowledgment,
+  getFinalizationBlockers,
+  getRecordStatus,
+  isCorrectiveActionClosed,
+  markAllWorkersPresent,
+  normalizeCorrectiveAction,
+  normalizeHazard,
+  normalizeHazardStatus,
+  normalizeSessionRecord,
+  normalizeSharing,
+  normalizeWorker,
+  setSupervisorRecordedAcknowledgment,
+  setWorkerAttendance
+} from '../domain/workflow.ts';
+import { openOfflineStore, SYNC_STATUS } from '../storage/offline-store.ts';
+import { createSyncEngine } from '../storage/sync-engine.ts';
+import { createApplicationState } from '../state/application-state.ts';
+import { escapeHtml, formatDateTime } from '../views/shared/format.ts';
+import { apiRequest } from '../api/client.ts';
+import { validatePublicUserBoundary, validateSessionBoundary } from '../domain/validation.ts';
+import { DRAFT_STATUS_TEXT, syncStatusForLabel } from '../views/dashboard/sync-status.ts';
+import { createMockGlassesEvidence, isGlassesPreview, normalBrowserUrl } from '../views/glasses/model.ts';
 
 // ---------------------------------------------------------------------------
 // Constants / config
 // ---------------------------------------------------------------------------
 
-const SCHEMA_VERSION = '1.0.0';
+const SCHEMA_VERSION = '2.0.0';
 const APP_VERSION = '0.1.0';
 
 const stressMemo =
@@ -12,93 +40,14 @@ const stressMemo =
 
 const isStressTest = new URLSearchParams(window.location.search).has('stress');
 // Glasses HUD Mode is a browser preview for a future Meta Display / wearable app.
-const isGlassesMode = new URLSearchParams(window.location.search).get('mode') === 'glasses';
-const LOCAL_DRAFT_VERSION = 1;
-const HAZARD_REVIEW_STATUS = {
-  CONFIRMED: 'Confirmed',
-  FIX_ORDERED: 'Fix Ordered'
-};
-const EXPORTED_HAZARD_STATUS = {
-  CONFIRMED: 'confirmed',
-  FIX_ORDERED: 'fix_ordered',
-  NOT_CHECKED: 'not_checked'
-};
-const DRAFT_STATUS_TEXT = {
-  CLEARED: 'Browser draft cleared',
-  SAVED: 'Draft saved in this browser',
-  UNAVAILABLE: 'Local draft unavailable',
-  RESTORED: 'Draft restored from this browser',
-  FOUND: 'Browser draft found',
-  PENDING_BACKEND: 'Draft pending backend save',
-  BACKEND_SAVED: 'Backend saved - browser draft cleared'
-};
+const isGlassesMode = isGlassesPreview(window.location.search);
+const LOCAL_DRAFT_VERSION = 2;
 
 // ---------------------------------------------------------------------------
 // App state
 // ---------------------------------------------------------------------------
 
-const state = {
-  phase: 'auth-check',
-  authMode: 'login',
-  authFeedback: '',
-  isAuthSubmitting: false,
-  currentUser: null,
-  hazards: [],
-  index: 0,
-  memo: isStressTest ? stressMemo : '',
-  session: {
-    sessionId: crypto.randomUUID(),
-    createdAt: new Date().toISOString(),
-    siteName: '서울 강동 스마트타워 신축공사',
-    siteArea: 'Tower A / Level 3 / Grid B-12',
-    gps: {
-      latitude: null,
-      longitude: null,
-      accuracyMeters: null
-    },
-    taskName: '전기 배선 및 자재 반입 전 TBM',
-    workType: 'Construction safety TBM',
-    plannedWorkDescription: '전기 배선, 케이블 트레이 설치, 자재 반입 전 유해위험요인 확인.',
-    supervisorName: '김지훈',
-    supervisorRole: '현장 안전관리자',
-    scheduledAt: new Date(),
-    startedAt: null,
-    completedAt: null,
-    sharing: {
-      sharedWithWorkers: false,
-      method: 'not_shared',
-      sharedAt: null
-    },
-    device: {
-      platform: 'browser_hud_prototype',
-      appVersion: APP_VERSION,
-      inputMode: 'keyboard_and_touch'
-    }
-  },
-  workers: [
-    { id: crypto.randomUUID(), name: '박민준', role: '전기공', present: false, acknowledged: false },
-    { id: crypto.randomUUID(), name: '이지수', role: '신호수', present: false, acknowledged: false },
-    { id: crypto.randomUUID(), name: '최하나', role: '자재 반입 담당', present: false, acknowledged: false },
-    { id: crypto.randomUUID(), name: '정도윤', role: '작업반장', present: false, acknowledged: false }
-  ],
-  responses: [],
-  nearMisses: [],
-  savedSessions: [],
-  savedSessionsStatus: 'idle',
-  saveFeedback: '',
-  isSavingSession: false,
-  manualEntryFeedback: '',
-  manualAiSuggestion: null,
-  manualAiDecision: null,
-  returnPhase: 'checklist',
-  draftStatus: '',
-  pendingDraft: null,
-  // Glasses HUD Mode state: intentionally small and layered on top of the shared TBM session.
-  glassesStep: 'start',
-  glassesMemoFeedback: '',
-  glassesPhotoFeedback: '',
-  glassesReviewFeedback: ''
-};
+const state = createApplicationState({ stressMemo: isStressTest ? stressMemo : '', appVersion: APP_VERSION });
 
 const app = document.querySelector('#app');
 
@@ -107,7 +56,7 @@ const app = document.querySelector('#app');
 // ---------------------------------------------------------------------------
 
 async function apiFetch(url, options = {}) {
-  const response = await fetch(url, options);
+  const response = await apiRequest(url, options);
   if (response.status === 401) {
     state.currentUser = null;
     state.authMode = 'login';
@@ -117,28 +66,6 @@ async function apiFetch(url, options = {}) {
   }
 
   return response;
-}
-
-function formatDateTime(date) {
-  const parsedDate = date instanceof Date ? date : new Date(date);
-  if (Number.isNaN(parsedDate.getTime())) return 'Unknown date';
-
-  return new Intl.DateTimeFormat('en-US', {
-    year: 'numeric',
-    month: 'short',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit'
-  }).format(parsedDate);
-}
-
-function escapeHtml(value) {
-  return String(value ?? '')
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;')
-    .replaceAll("'", '&#039;');
 }
 
 function getApiErrorMessage(error, fallback) {
@@ -255,10 +182,10 @@ async function checkAuth() {
   render();
 
   try {
-    const response = await fetch('/api/auth/me', { cache: 'no-store' });
+    const response = await apiRequest('/api/auth/me', { cache: 'no-store' });
     const payload = await response.json().catch(() => ({}));
 
-    if (!response.ok) {
+    if (!response.ok || !validatePublicUserBoundary(payload.user)) {
       state.currentUser = null;
       state.phase = 'auth';
       render();
@@ -266,12 +193,21 @@ async function checkAuth() {
     }
 
     state.currentUser = payload.user;
+    await state.offlineStore?.putProfile({ userId: payload.user.id, user: payload.user });
     await loadHazards();
   } catch (error) {
-    state.currentUser = null;
-    state.authFeedback = getApiErrorMessage(error, 'Could not check login status.');
-    state.phase = 'auth';
-    render();
+    const profiles = await state.offlineStore?.listProfiles().catch(() => []) ?? [];
+    const cached = profiles[0];
+    if (!navigator.onLine && cached?.user) {
+      state.currentUser = cached.user;
+      state.authFeedback = 'Offline mode — identity is cached on this device; server authentication will be rechecked online.';
+      await loadHazards();
+    } else {
+      state.currentUser = null;
+      state.authFeedback = getApiErrorMessage(error, 'Could not check login status.');
+      state.phase = 'auth';
+      render();
+    }
   }
 }
 
@@ -296,7 +232,7 @@ async function submitAuth(form) {
   render();
 
   try {
-    const response = await fetch(isRegister ? '/api/auth/register' : '/api/auth/login', {
+    const response = await apiRequest(isRegister ? '/api/auth/register' : '/api/auth/login', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json'
@@ -309,7 +245,9 @@ async function submitAuth(form) {
       throw new Error(result.error ?? 'Authentication failed.');
     }
 
+    if (!validatePublicUserBoundary(result.user)) throw new Error('Authentication response is invalid.');
     state.currentUser = result.user;
+    await state.offlineStore?.putProfile({ userId: result.user.id, user: result.user });
     state.authFeedback = '';
     await loadHazards();
   } catch (error) {
@@ -322,7 +260,7 @@ async function submitAuth(form) {
 }
 
 async function logout() {
-  await fetch('/api/auth/logout', { method: 'POST' }).catch(() => {});
+  await apiRequest('/api/auth/logout', { method: 'POST' }).catch(() => {});
   state.currentUser = null;
   state.authMode = 'login';
   state.authFeedback = 'Logged out.';
@@ -331,21 +269,19 @@ async function logout() {
 }
 
 // ---------------------------------------------------------------------------
-// Offline-first local draft helpers
+// Offline-first device storage and synchronization helpers
 // ---------------------------------------------------------------------------
-// This stores only the active TBM work state. Auth cookies, passwords,
-// registration keys, and login form values are intentionally never persisted.
-// Future backend sync/offline queue work can build on this layer without
-// replacing the existing /api/sessions save path.
-
-function getDraftKey() {
-  return 'safety-lens-active-draft-v1';
-}
+// IndexedDB stores structured drafts, queued operations, and photo blobs. Auth
+// cookies, passwords, registration keys, and login form values are never stored.
 
 function buildLocalDraft() {
   return {
+    id: state.session.sessionId,
+    ownerId: state.currentUser?.id,
     version: LOCAL_DRAFT_VERSION,
-    savedAt: new Date().toISOString(),
+    deviceObservedAt: new Date().toISOString(),
+    syncStatus: statusToSyncValue(state.draftStatus),
+    serverRevision: state.serverRevision,
     phase: state.phase,
     index: state.index,
     memo: state.memo,
@@ -365,7 +301,7 @@ function buildLocalDraft() {
 function isValidLocalDraft(draft) {
   return Boolean(
     draft &&
-      draft.version === LOCAL_DRAFT_VERSION &&
+      [1, LOCAL_DRAFT_VERSION].includes(draft.version) &&
       draft.session &&
       Array.isArray(draft.workers) &&
       Array.isArray(draft.responses) &&
@@ -373,49 +309,63 @@ function isValidLocalDraft(draft) {
   );
 }
 
-function clearLocalDraft(updateStatus = true) {
-  try {
-    localStorage.removeItem(getDraftKey());
-  } catch {
-    // Storage can be unavailable in restricted browser contexts.
-  }
-
+async function clearLocalDraft(updateStatus = true) {
+  await state.offlineStore?.deleteDraft(state.session.sessionId).catch(() => {});
   if (updateStatus) state.draftStatus = DRAFT_STATUS_TEXT.CLEARED;
 }
 
-function loadLocalDraft() {
-  try {
-    const rawDraft = localStorage.getItem(getDraftKey());
-    if (!rawDraft) return null;
-
-    const draft = JSON.parse(rawDraft);
-    if (!isValidLocalDraft(draft)) {
-      clearLocalDraft(false);
-      return null;
-    }
-
-    return draft;
-  } catch {
-    clearLocalDraft(false);
-    return null;
-  }
+async function loadLocalDraft() {
+  if (!state.offlineStore) return null;
+  const drafts = await state.offlineStore.listDrafts();
+  return drafts
+    .filter((draft) => isValidLocalDraft(draft) && (!draft.ownerId || draft.ownerId === state.currentUser?.id))
+    .sort((first, second) => String(second.deviceUpdatedAt).localeCompare(String(first.deviceUpdatedAt)))[0] ?? null;
 }
 
-function hasLocalDraft() {
-  return Boolean(loadLocalDraft());
+function statusToSyncValue(label) {
+  return syncStatusForLabel(label);
 }
 
-function saveLocalDraft(status = DRAFT_STATUS_TEXT.SAVED) {
+function saveLocalDraft(status = DRAFT_STATUS_TEXT.DEVICE_ONLY) {
   if (!state.currentUser || state.phase === 'draft-restore' || !state.hazards.length || !state.responses.length) {
     return;
   }
-
-  try {
-    localStorage.setItem(getDraftKey(), JSON.stringify(buildLocalDraft()));
-    state.draftStatus = status;
-  } catch {
+  state.draftStatus = status;
+  void state.offlineStore?.putDraft(buildLocalDraft()).catch(() => {
     state.draftStatus = DRAFT_STATUS_TEXT.UNAVAILABLE;
+    render();
+  });
+}
+
+async function queueCurrentMutation(type = 'session_upsert', entityId = state.session.sessionId, saveMode = 'draft') {
+  if (!state.offlineStore) return;
+  saveLocalDraft(DRAFT_STATUS_TEXT.QUEUED);
+  await state.offlineStore.queueSessionMutation({
+    ownerId: state.currentUser.id,
+    type,
+    entityId,
+    sessionId: state.session.sessionId,
+    payload: { ...buildSessionLog(), saveMode },
+    baseRevision: state.serverRevision
+  });
+  state.draftStatus = DRAFT_STATUS_TEXT.QUEUED;
+  if (navigator.onLine) void synchronizeNow();
+}
+
+async function synchronizeNow() {
+  if (!state.syncEngine) return;
+  await state.syncEngine.syncAll();
+  const draft = await state.offlineStore?.getDraft(state.session.sessionId);
+  if (draft) {
+    state.serverRevision = Number(draft.serverRevision) || state.serverRevision;
+    state.syncConflict = draft.conflict ?? state.syncConflict;
+    if (draft.serverSession) {
+      state.session.sharing = normalizeSharing(draft.serverSession.sharing);
+      state.session.finalizedAt = draft.serverSession.finalizedAt ?? null;
+      state.session.completedAt = draft.serverSession.completedAt ?? null;
+    }
   }
+  render();
 }
 
 function restoreLocalDraft(draft) {
@@ -432,10 +382,15 @@ function restoreLocalDraft(draft) {
     ? draft.phase
     : 'start';
 
-  state.session = { ...state.session, ...draft.session };
-  state.workers = draft.workers;
+  state.session = {
+    ...state.session,
+    ...draft.session,
+    completedAt: null,
+    sharing: normalizeSharing(draft.session.sharing)
+  };
+  state.workers = draft.workers.map(normalizeWorker);
   state.hazards = Array.isArray(draft.hazards) && draft.hazards.length ? draft.hazards : state.hazards;
-  state.responses = draft.responses;
+  state.responses = draft.responses.map(normalizeHazard);
   state.nearMisses = draft.nearMisses;
   state.index = Math.max(0, Math.min(state.responses.length - 1, Number(draft.index) || 0));
   state.phase = safePhase;
@@ -445,12 +400,21 @@ function restoreLocalDraft(draft) {
   state.glassesPhotoFeedback = draft.glassesPhotoFeedback ?? '';
   state.glassesReviewFeedback = draft.glassesReviewFeedback ?? '';
   state.saveFeedback = draft.saveFeedback ?? '';
+  state.serverRevision = Number(draft.serverRevision) || 0;
+  state.syncConflict = draft.conflict ?? null;
   state.pendingDraft = null;
   state.draftStatus = DRAFT_STATUS_TEXT.RESTORED;
 }
 
 function draftStatusHtml() {
-  return state.draftStatus ? `<p class="draft-status">${escapeHtml(state.draftStatus)}</p>` : '';
+  if (!state.draftStatus) return '';
+  const retry = [DRAFT_STATUS_TEXT.FAILED, DRAFT_STATUS_TEXT.QUEUED].includes(state.draftStatus)
+    ? '<button class="focusable v2-key-button v2-key-small" data-action="retry-sync">Retry sync</button>'
+    : '';
+  const resolve = state.draftStatus === DRAFT_STATUS_TEXT.CONFLICT
+    ? '<button class="focusable v2-key-button v2-key-small" data-action="resolve-conflict-local">Review and keep local changes</button>'
+    : '';
+  return `<div class="draft-status"><span>${escapeHtml(state.draftStatus)}</span>${retry}${resolve}</div>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -466,7 +430,7 @@ function currentResponse() {
 }
 
 function createResponses(hazards) {
-  return hazards.map((hazard) => ({
+  return hazards.map((hazard) => normalizeHazard({
     id: hazard.id,
     source: hazard.source ?? 'preloaded_checklist',
     title: hazard.title ?? hazard.name,
@@ -476,20 +440,21 @@ function createResponses(hazards) {
     riskDescription: hazard.risk,
     recommendedAction: hazard.recommendedAction ?? hazard.action,
     evidencePhotos: hazard.evidencePhotos ?? [],
-    status: null,
+    status: HAZARD_STATUS.NOT_CHECKED,
     memo: isStressTest ? stressMemo : '',
     updatedAt: null,
     humanReview: {
       reviewed: false,
-      decision: EXPORTED_HAZARD_STATUS.NOT_CHECKED,
+      decision: HAZARD_STATUS.NOT_CHECKED,
       reviewedBy: null,
       reviewedAt: null
-    }
+    },
+    correctiveAction: normalizeCorrectiveAction({}, HAZARD_STATUS.NOT_CHECKED)
   }));
 }
 
 function createManualHazardResponse(entry) {
-  return {
+  return normalizeHazard({
     id: entry.id,
     source: 'manual_entry',
     title: entry.title,
@@ -500,29 +465,30 @@ function createManualHazardResponse(entry) {
     recommendedAction: entry.recommendedAction,
     evidencePhotos: entry.evidencePhotos ?? [],
     aiSuggestion: entry.aiSuggestion ?? null,
-    status: null,
+    status: HAZARD_STATUS.NOT_CHECKED,
     memo: '',
     updatedAt: null,
     humanReview: {
       reviewed: false,
-      decision: EXPORTED_HAZARD_STATUS.NOT_CHECKED,
+      decision: HAZARD_STATUS.NOT_CHECKED,
       reviewedBy: null,
       reviewedAt: null
-    }
-  };
+    },
+    correctiveAction: normalizeCorrectiveAction({}, HAZARD_STATUS.NOT_CHECKED)
+  });
 }
 
 async function loadHazards() {
   renderLoading();
 
   try {
-    const response = await fetch('/hazards.json', { cache: 'no-store' });
+    const response = await apiRequest('/hazards.json', { cache: 'no-store' });
     if (!response.ok) throw new Error(`Could not load hazards.json (${response.status})`);
 
     const hazards = await response.json();
     state.hazards = isStressTest ? makeStressHazards(hazards) : hazards;
     state.responses = createResponses(state.hazards);
-    const draft = loadLocalDraft();
+    const draft = await loadLocalDraft();
     if (draft) {
       state.pendingDraft = draft;
       state.draftStatus = DRAFT_STATUS_TEXT.FOUND;
@@ -560,15 +526,22 @@ function makeStressHazards(hazards) {
 // Normal dashboard actions
 // ---------------------------------------------------------------------------
 
+function markRecordDirty() {
+  state.session.finalizedAt = null;
+  state.session.completedAt = null;
+}
+
 function saveStartField(name, value) {
+  markRecordDirty();
   state.session[name] = value.trim();
   saveLocalDraft();
 }
 
 function startTbm() {
+  markRecordDirty();
   state.session.startedAt = new Date().toISOString();
   state.phase = 'participation';
-  saveLocalDraft(DRAFT_STATUS_TEXT.PENDING_BACKEND);
+  saveLocalDraft(DRAFT_STATUS_TEXT.DEVICE_ONLY);
   render();
 }
 
@@ -576,35 +549,49 @@ function addWorker(name) {
   const trimmed = name.trim();
   if (!trimmed) return;
 
+  markRecordDirty();
   state.workers.push({
     id: crypto.randomUUID(),
     name: trimmed,
     role: 'Worker',
     present: true,
-    acknowledged: true
+    acknowledgment: createEmptyAcknowledgment()
   });
   saveLocalDraft();
   render();
 }
 
 function removeWorker(id) {
+  markRecordDirty();
   state.workers = state.workers.filter((worker) => worker.id !== id);
   saveLocalDraft();
   render();
 }
 
 function setWorkerPresent(id, present) {
-  const worker = state.workers.find((item) => item.id === id);
-  if (worker) {
-    worker.present = present;
-    worker.acknowledged = present;
-    saveLocalDraft();
-  }
+  markRecordDirty();
+  state.workers = setWorkerAttendance(state.workers, id, present);
+  saveLocalDraft();
+  void queueCurrentMutation('attendance_acknowledgment', id);
+  render();
+}
+
+function setWorkerAcknowledgment(id, recorded) {
+  markRecordDirty();
+  state.workers = setSupervisorRecordedAcknowledgment(state.workers, id, recorded, {
+    recordedBy: state.session.supervisorName,
+    recordedAt: new Date().toISOString()
+  });
+  saveLocalDraft();
+  void queueCurrentMutation('attendance_acknowledgment', id);
+  render();
 }
 
 function markAllPresent() {
-  state.workers = state.workers.map((worker) => ({ ...worker, present: true, acknowledged: true }));
+  markRecordDirty();
+  state.workers = markAllWorkersPresent(state.workers);
   saveLocalDraft();
+  void queueCurrentMutation('attendance_acknowledgment', state.session.sessionId);
   render();
 }
 
@@ -617,13 +604,49 @@ function continueToChecklist() {
 }
 
 function saveMemo(value) {
+  markRecordDirty();
   state.memo = value;
   currentResponse().memo = value.trim();
   saveLocalDraft();
 }
 
+function updateCorrectiveAction(field, value) {
+  const response = currentResponse();
+  if (!response) return;
+
+  markRecordDirty();
+  const current = normalizeCorrectiveAction(response.correctiveAction, response.status);
+  const nextValue = field === 'closureEvidence' ? (value.trim() ? [value.trim()] : []) : value;
+  response.correctiveAction = normalizeCorrectiveAction({ ...current, [field]: nextValue }, response.status);
+  saveLocalDraft();
+  void queueCurrentMutation('corrective_action', response.id);
+}
+
+function updateSharing(field, value) {
+  markRecordDirty();
+  const next = { ...normalizeSharing(state.session.sharing), [field]: value };
+  if (field === 'status' && value !== SHARING_STATUS.SHARED) {
+    next.method = '';
+    next.recipients = '';
+    next.sharedAt = null;
+  }
+  state.session.sharing = normalizeSharing(next);
+  saveLocalDraft();
+  void queueCurrentMutation('sharing_event', state.session.sessionId);
+}
+
 function goTo(index) {
   if (state.phase !== 'checklist') return;
+
+  if (
+    index >= state.hazards.length &&
+    state.responses.every((item) => normalizeHazardStatus(item.status) !== HAZARD_STATUS.NOT_CHECKED)
+  ) {
+    state.phase = 'summary';
+    saveLocalDraft();
+    render();
+    return;
+  }
 
   state.index = Math.max(0, Math.min(state.hazards.length - 1, index));
   state.memo = currentResponse().memo;
@@ -634,27 +657,33 @@ function goTo(index) {
 function setStatus(status) {
   if (state.phase !== 'checklist') return;
 
+  markRecordDirty();
   const response = currentResponse();
   const reviewedAt = new Date().toISOString();
-  response.status = status;
+  response.status = normalizeHazardStatus(status);
   response.memo = state.memo.trim();
   response.updatedAt = reviewedAt;
   response.humanReview = {
     reviewed: true,
-    decision: status === HAZARD_REVIEW_STATUS.FIX_ORDERED ? EXPORTED_HAZARD_STATUS.FIX_ORDERED : 'accepted',
+    decision: response.status,
     reviewedBy: state.session.supervisorName,
     reviewedAt
   };
 
-  if (state.index === state.hazards.length - 1) {
-    state.session.completedAt = new Date().toISOString();
+  response.correctiveAction = normalizeCorrectiveAction(response.correctiveAction, response.status);
+
+  if (
+    response.status === HAZARD_STATUS.CONTROLLED &&
+    state.responses.every((item) => normalizeHazardStatus(item.status) !== HAZARD_STATUS.NOT_CHECKED)
+  ) {
     state.phase = 'summary';
-  } else {
+  } else if (response.status === HAZARD_STATUS.CONTROLLED && state.index < state.hazards.length - 1) {
     state.index += 1;
     state.memo = currentResponse().memo;
   }
 
   saveLocalDraft();
+  void queueCurrentMutation('hazard_review', response.id);
   render();
 }
 
@@ -670,22 +699,13 @@ function setStatus(status) {
 // - Add local offline storage around shared session state before backend sync.
 
 function getMockEvidencePhoto() {
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="320" height="180" viewBox="0 0 320 180"><rect width="320" height="180" fill="#f2f4f6"/><rect x="22" y="22" width="276" height="136" rx="14" fill="#fff" stroke="#c7ccd3" stroke-width="4"/><circle cx="82" cy="78" r="22" fill="#ff4438" opacity=".88"/><path d="M54 136l62-48 44 34 36-28 70 42H54z" fill="#6f7782" opacity=".72"/><text x="160" y="162" text-anchor="middle" font-family="Arial" font-size="16" fill="#1f252c">Mock evidence</text></svg>`;
-
-  return {
-    uploadId: crypto.randomUUID(),
-    originalName: `glasses_mock_evidence_${getCurrentHazardNumber()}.svg`,
-    size: svg.length,
-    mimetype: 'image/svg+xml',
-    url: `data:image/svg+xml,${encodeURIComponent(svg)}`,
-    uploadedAt: new Date().toISOString(),
-    source: 'glasses_mock_capture'
-  };
+  return createMockGlassesEvidence(getCurrentHazardNumber());
 }
 
 function captureGlassesMemo() {
   if (!currentResponse()) return;
 
+  markRecordDirty();
   // Future voice memo / speech-to-text hook: replace this fixed memo with transcript text.
   const memo = 'Voice memo captured: supervisor requested follow-up before restart.';
   state.memo = memo;
@@ -700,6 +720,7 @@ function captureGlassesPhoto() {
   const response = currentResponse();
   if (!response) return;
 
+  markRecordDirty();
   // Future camera/photo hook: replace this mock placeholder with device capture metadata.
   response.evidencePhotos = [...(response.evidencePhotos ?? []), getMockEvidencePhoto()];
   response.updatedAt = new Date().toISOString();
@@ -711,20 +732,23 @@ function captureGlassesPhoto() {
 
 function startGlassesTbm() {
   // Future phone GPS / site location hook can update state.session.gps here.
+  markRecordDirty();
   if (!state.session.startedAt) state.session.startedAt = new Date().toISOString();
   state.phase = 'participation';
   state.glassesStep = 'workers';
-  saveLocalDraft(DRAFT_STATUS_TEXT.PENDING_BACKEND);
+  saveLocalDraft(DRAFT_STATUS_TEXT.DEVICE_ONLY);
   render();
 }
 
 function continueGlassesFromWorkers() {
-  state.workers = state.workers.map((worker) => ({ ...worker, present: true, acknowledged: true }));
+  markRecordDirty();
+  state.workers = markAllWorkersPresent(state.workers);
   state.phase = 'checklist';
   state.index = 0;
   state.memo = currentResponse()?.memo ?? '';
   state.glassesStep = 'hazard';
   saveLocalDraft();
+  void queueCurrentMutation('attendance_acknowledgment', state.session.sessionId);
   render();
 }
 
@@ -742,9 +766,7 @@ function continueGlassesReview() {
 }
 
 function exitGlassesMode() {
-  const url = new URL(window.location.href);
-  url.searchParams.delete('mode');
-  window.location.href = url.toString();
+  window.location.href = normalBrowserUrl(window.location.href);
 }
 
 function handleGlassesAction(action) {
@@ -775,27 +797,32 @@ function handleGlassesAction(action) {
     return;
   }
 
-  if (action === 'confirmed') {
+  if (action === 'controlled') {
     if (state.glassesStep !== 'hazard') return;
     if (state.phase !== 'checklist') state.phase = 'checklist';
     state.glassesStep = 'hazard';
-    state.glassesReviewFeedback = `Saved: Hazard ${getCurrentHazardNumber()} Confirmed.`;
-    setStatus(HAZARD_REVIEW_STATUS.CONFIRMED);
+    state.glassesReviewFeedback = `Recorded on device: Hazard ${getCurrentHazardNumber()} controlled — reviewed and safe to proceed.`;
+    setStatus(HAZARD_STATUS.CONTROLLED);
     return;
   }
 
-  if (action === 'fix') {
+  if (action === 'action-required') {
     if (state.glassesStep !== 'hazard') return;
     if (state.phase !== 'checklist') state.phase = 'checklist';
     state.glassesStep = 'hazard';
-    state.glassesReviewFeedback = `Saved: Hazard ${getCurrentHazardNumber()} Fix Ordered.`;
-    setStatus(HAZARD_REVIEW_STATUS.FIX_ORDERED);
+    state.glassesReviewFeedback = `Hazard ${getCurrentHazardNumber()} requires action. Corrective-action details remain open.`;
+    setStatus(HAZARD_STATUS.ACTION_REQUIRED);
     return;
   }
 
   if (action === 'save-session') {
     // Future offline-first sync hook: queue locally first, then call backend save.
-    saveCurrentSession();
+    saveCurrentSession('draft');
+    return;
+  }
+
+  if (action === 'finalize') {
+    saveCurrentSession('finalize');
     return;
   }
 
@@ -825,17 +852,13 @@ function handleGlassesAction(action) {
 // Session export and saved-session helpers
 // ---------------------------------------------------------------------------
 
-function toExportHazardStatus(status) {
-  if (status === HAZARD_REVIEW_STATUS.CONFIRMED) return EXPORTED_HAZARD_STATUS.CONFIRMED;
-  if (status === HAZARD_REVIEW_STATUS.FIX_ORDERED) return EXPORTED_HAZARD_STATUS.FIX_ORDERED;
-  return EXPORTED_HAZARD_STATUS.NOT_CHECKED;
-}
-
 function getHazardStatusGroups(responses = state.responses) {
   return {
-    confirmed: responses.filter((item) => toExportHazardStatus(item.status) === EXPORTED_HAZARD_STATUS.CONFIRMED),
-    fixOrdered: responses.filter((item) => toExportHazardStatus(item.status) === EXPORTED_HAZARD_STATUS.FIX_ORDERED),
-    unchecked: responses.filter((item) => toExportHazardStatus(item.status) === EXPORTED_HAZARD_STATUS.NOT_CHECKED)
+    controlled: responses.filter((item) => normalizeHazardStatus(item.status) === HAZARD_STATUS.CONTROLLED),
+    actionRequired: responses.filter(
+      (item) => normalizeHazardStatus(item.status) === HAZARD_STATUS.ACTION_REQUIRED
+    ),
+    unchecked: responses.filter((item) => normalizeHazardStatus(item.status) === HAZARD_STATUS.NOT_CHECKED)
   };
 }
 
@@ -843,15 +866,15 @@ function getHazardReviewCounts(responses = state.responses) {
   const groups = getHazardStatusGroups(responses);
 
   return {
-    confirmed: groups.confirmed.length,
-    fixOrdered: groups.fixOrdered.length,
+    controlled: groups.controlled.length,
+    actionRequired: groups.actionRequired.length,
     unchecked: groups.unchecked.length
   };
 }
 
 function getChecklistStatusTone(status) {
-  if (status === HAZARD_REVIEW_STATUS.CONFIRMED) return 'success';
-  if (status === HAZARD_REVIEW_STATUS.FIX_ORDERED) return 'warning';
+  if (normalizeHazardStatus(status) === HAZARD_STATUS.CONTROLLED) return 'success';
+  if (normalizeHazardStatus(status) === HAZARD_STATUS.ACTION_REQUIRED) return 'warning';
   return 'neutral';
 }
 
@@ -863,21 +886,21 @@ function getHazardProgressText() {
   return `Hazard ${getCurrentHazardNumber()} / ${state.hazards.length}`;
 }
 
-function getSessionStatus() {
-  const hasUncheckedHazard = getHazardStatusGroups().unchecked.length > 0;
+function getPotentialRecordStatus() {
+  return getRecordStatus({ hazards: state.responses, sharing: state.session.sharing });
+}
 
-  if (state.phase === 'summary' && !hasUncheckedHazard) return 'completed';
-  if (state.phase === 'summary' && hasUncheckedHazard) return 'incomplete';
-  return 'in_progress';
+function getSessionStatus() {
+  return state.session.finalizedAt ? getPotentialRecordStatus() : 'draft';
 }
 
 function getHumanReview(item) {
-  const hazardStatus = toExportHazardStatus(item.status);
+  const hazardStatus = normalizeHazardStatus(item.status);
 
-  if (hazardStatus === EXPORTED_HAZARD_STATUS.NOT_CHECKED) {
+  if (hazardStatus === HAZARD_STATUS.NOT_CHECKED) {
     return {
       reviewed: false,
-      decision: EXPORTED_HAZARD_STATUS.NOT_CHECKED,
+      decision: HAZARD_STATUS.NOT_CHECKED,
       reviewedBy: null,
       reviewedAt: null
     };
@@ -885,22 +908,14 @@ function getHumanReview(item) {
 
   return {
     reviewed: true,
-    decision: hazardStatus === EXPORTED_HAZARD_STATUS.FIX_ORDERED ? EXPORTED_HAZARD_STATUS.FIX_ORDERED : 'accepted',
+    decision: hazardStatus,
     reviewedBy: state.session.supervisorName,
     reviewedAt: item.humanReview.reviewedAt
   };
 }
 
 function getCorrectiveAction(item) {
-  const requiresAction = toExportHazardStatus(item.status) === EXPORTED_HAZARD_STATUS.FIX_ORDERED;
-
-  return {
-    required: requiresAction,
-    description: requiresAction ? item.recommendedAction : '',
-    assignedTo: null,
-    dueAt: null,
-    completedAt: null
-  };
+  return normalizeCorrectiveAction(item.correctiveAction, item.status);
 }
 
 // ---------------------------------------------------------------------------
@@ -923,21 +938,29 @@ function cancelManualEntry() {
 
 async function uploadEvidencePhotos(files) {
   if (!files.length) return [];
-
-  const formData = new FormData();
-  files.forEach((file) => formData.append('photos', file));
-
-  const response = await apiFetch('/api/uploads', {
-    method: 'POST',
-    body: formData
-  });
-  const payload = await response.json().catch(() => ({}));
-
-  if (!response.ok) {
-    throw new Error(payload.error ?? `Photo upload failed (${response.status})`);
+  if (!state.offlineStore) throw new Error('Offline photo storage is unavailable.');
+  const records = [];
+  for (const file of files) {
+    const evidence = await state.offlineStore.putEvidence({
+      ownerId: state.currentUser.id,
+      sessionId: state.session.sessionId,
+      blob: file,
+      originalName: file.name,
+      mimeType: file.type,
+      size: file.size
+    });
+    await state.offlineStore.queueEvidenceUpload(evidence);
+    records.push({
+      localEvidenceId: evidence.id,
+      originalName: evidence.originalName,
+      mimeType: evidence.mimeType,
+      size: evidence.size,
+      deviceObservedAt: evidence.deviceObservedAt,
+      source: 'device_evidence_pending_sync'
+    });
   }
-
-  return Array.isArray(payload) ? payload : [];
+  state.draftStatus = DRAFT_STATUS_TEXT.QUEUED;
+  return records;
 }
 
 function renderAiSuggestion() {
@@ -1102,16 +1125,18 @@ async function saveManualEntry(form) {
 
   if (!title || !location) return;
 
+  markRecordDirty();
+
   let evidencePhotos = [];
   const feedback = app.querySelector('#manual-entry-feedback');
   const submitButton = app.querySelector('button[form="manual-entry-form"]');
 
   try {
-    state.manualEntryFeedback = evidencePhotoFiles.length ? 'Uploading photo evidence...' : 'Saving entry...';
+    state.manualEntryFeedback = evidencePhotoFiles.length ? 'Recording photo evidence on this device...' : 'Recording entry on this device...';
     if (feedback) feedback.textContent = state.manualEntryFeedback;
     if (submitButton) {
       submitButton.disabled = true;
-      submitButton.textContent = evidencePhotoFiles.length ? 'Uploading...' : 'Saving...';
+      submitButton.textContent = 'Recording...';
     }
     evidencePhotos = await uploadEvidencePhotos(evidencePhotoFiles);
   } catch (error) {
@@ -1173,6 +1198,7 @@ async function saveManualEntry(form) {
   state.manualAiDecision = null;
   state.phase = state.returnPhase;
   saveLocalDraft();
+  void queueCurrentMutation('session_upsert', state.session.sessionId);
   render();
 }
 
@@ -1196,7 +1222,16 @@ function formatReportPreviewItem(item, actionText = '') {
 
 function buildKoreanReportHtml() {
   const presentWorkers = state.workers.filter((worker) => worker.present);
-  const { confirmed, fixOrdered, unchecked } = getHazardStatusGroups();
+  const supervisorAcknowledgedWorkers = state.workers.filter(
+    (worker) => normalizeWorker(worker).acknowledgment.supervisorRecorded
+  );
+  const independentlyVerifiedWorkers = state.workers.filter(
+    (worker) => normalizeWorker(worker).acknowledgment.independentlyVerified
+  );
+  const { controlled, actionRequired, unchecked } = getHazardStatusGroups();
+  const openActions = actionRequired.filter((item) => !isCorrectiveActionClosed(getCorrectiveAction(item)));
+  const closedActions = actionRequired.filter((item) => isCorrectiveActionClosed(getCorrectiveAction(item)));
+  const sharing = normalizeSharing(state.session.sharing);
   const hazardLines = state.responses.map((item) => formatReportPreviewItem(item));
   const nearMissLines = state.nearMisses.map((item) =>
     formatReportPreviewItem(item, item.actionTaken || '조치 내용 미입력')
@@ -1226,8 +1261,8 @@ function buildKoreanReportHtml() {
           <dd>${escapeHtml(state.session.supervisorName)} / ${escapeHtml(state.session.supervisorRole)}</dd>
         </div>
         <div>
-          <dt>근로자 공유 여부</dt>
-          <dd>${state.session.sharing.sharedWithWorkers ? '공유 완료' : '미공유'}</dd>
+          <dt>기록 상태</dt>
+          <dd>${escapeHtml(getSessionStatus())}</dd>
         </div>
       </dl>
 
@@ -1238,6 +1273,16 @@ function buildKoreanReportHtml() {
           '참석 근로자 없음'
         )}</ul>
       </section>
+
+      <section><h3>감독자 기록 TBM 확인</h3><ul>${formatKoreanList(
+        supervisorAcknowledgedWorkers.map((worker) => `${worker.name} — 감독자 기록, 근로자 독립 검증 아님`),
+        '감독자 기록 확인 없음'
+      )}</ul></section>
+
+      <section><h3>독립적으로 검증된 근로자 확인</h3><ul>${formatKoreanList(
+        independentlyVerifiedWorkers.map((worker) => worker.name),
+        '독립 검증 확인 없음'
+      )}</ul></section>
 
       <section>
         <h3>전체 유해위험요인</h3>
@@ -1255,20 +1300,25 @@ function buildKoreanReportHtml() {
       </section>
 
       <section>
-        <h3>확인 완료 항목(Confirmed)</h3>
+        <h3>통제 확인 항목(Controlled)</h3>
         <ul>${formatKoreanList(
-          confirmed.map((item) => item.title),
-          '확인 완료 항목 없음'
+          controlled.map((item) => item.title),
+          '통제 확인 항목 없음'
         )}</ul>
       </section>
 
       <section>
-        <h3>조치 필요 항목(Fix Ordered)</h3>
+        <h3>미종결 시정조치</h3>
         <ul>${formatKoreanList(
-          fixOrdered.map((item) => formatReportPreviewItem(item, item.recommendedAction)),
-          '조치 필요 항목 없음'
+          openActions.map((item) => formatReportPreviewItem(item, getCorrectiveAction(item).immediateControl)),
+          '미종결 시정조치 없음'
         )}</ul>
       </section>
+
+      <section><h3>검증 완료 시정조치</h3><ul>${formatKoreanList(
+        closedActions.map((item) => formatReportPreviewItem(item, `검증자: ${getCorrectiveAction(item).verifiedBy}`)),
+        '검증 완료 시정조치 없음'
+      )}</ul></section>
 
       <section>
         <h3>미확인 항목(Not Checked)</h3>
@@ -1277,6 +1327,15 @@ function buildKoreanReportHtml() {
           '미확인 항목 없음'
         )}</ul>
       </section>
+
+      <section><h3>근로자 공유 증빙</h3><ul>${formatKoreanList(
+        sharing.status === SHARING_STATUS.SHARED
+          ? [`방법: ${sharing.method} / 수신: ${sharing.recipients} / 서버 기록: ${sharing.sharedAt ?? '저장 후 기록'}`]
+          : sharing.status === SHARING_STATUS.NOT_SHARED
+            ? ['공유하지 않음으로 기록']
+            : [],
+        '공유 여부 미기록'
+      )}</ul></section>
     </section>
   `;
 }
@@ -1310,33 +1369,29 @@ function formatSavedSessionDate(session) {
   return formatDateTime(savedDate);
 }
 
-async function saveCurrentSession() {
+async function saveCurrentSession(saveMode = 'draft') {
   if (state.isSavingSession) return;
 
+  const sessionLog = buildSessionLog();
+  const blockers = saveMode === 'finalize' ? getFinalizationBlockers(sessionLog) : [];
+  if (blockers.length) {
+    state.saveFeedback = `Cannot finalize: ${blockers.join(' ')}`;
+    render();
+    return;
+  }
+
   state.isSavingSession = true;
-  state.saveFeedback = 'Saving session...';
+  state.saveFeedback = 'Recording on this device and queuing synchronization...';
   render();
 
   try {
-    const response = await apiFetch('/api/sessions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(buildSessionLog())
-    });
-    const payload = await response.json().catch(() => ({}));
-
-    if (!response.ok) {
-      throw new Error(payload.error ?? `Save failed (${response.status})`);
-    }
-
-    state.saveFeedback = 'Session saved to backend. Browser draft cleared.';
-    await loadSavedSessions({ silent: true });
-    clearLocalDraft(false);
-    state.draftStatus = DRAFT_STATUS_TEXT.BACKEND_SAVED;
+    await queueCurrentMutation('session_upsert', state.session.sessionId, saveMode);
+    if (navigator.onLine) await synchronizeNow();
+    state.saveFeedback = state.draftStatus === DRAFT_STATUS_TEXT.SYNCED
+      ? 'Synchronized to server. No completion is claimed unless finalization requirements were met.'
+      : 'Recorded on this device and queued for synchronization.';
   } catch (error) {
-    state.saveFeedback = getApiErrorMessage(error, 'Save session failed.');
+    state.saveFeedback = `${getApiErrorMessage(error, 'Synchronization failed.')} The local record was retained.`;
   } finally {
     state.isSavingSession = false;
     render();
@@ -1355,7 +1410,9 @@ async function loadSavedSessions({ silent = false } = {}) {
       throw new Error(payload.error ?? `Could not load saved sessions (${response.status})`);
     }
 
-    state.savedSessions = Array.isArray(payload) ? payload : [];
+    state.savedSessions = Array.isArray(payload)
+      ? payload.filter(validateSessionBoundary).map(normalizeSessionRecord)
+      : [];
     state.savedSessionsStatus = 'ready';
   } catch (error) {
     state.savedSessionsStatus = 'error';
@@ -1370,7 +1427,7 @@ async function openSavedSessions() {
 }
 
 function closeSavedSessions() {
-  state.phase = state.session.completedAt ? 'summary' : 'start';
+  state.phase = state.responses.length ? 'summary' : 'start';
   render();
 }
 
@@ -1381,7 +1438,6 @@ function openSessionReport(sessionId) {
 
 function buildSessionLog() {
   const exportedAt = new Date().toISOString();
-  const completedAt = state.session.completedAt ?? (state.phase === 'summary' ? exportedAt : null);
 
   return {
     schemaVersion: SCHEMA_VERSION,
@@ -1390,7 +1446,8 @@ function buildSessionLog() {
     status: getSessionStatus(),
     createdAt: state.session.createdAt,
     startedAt: state.session.startedAt,
-    completedAt,
+    finalizedAt: state.session.finalizedAt ?? null,
+    completedAt: state.session.completedAt ?? null,
     exportedAt,
     site: {
       siteName: state.session.siteName,
@@ -1406,11 +1463,12 @@ function buildSessionLog() {
       name: state.session.supervisorName,
       role: state.session.supervisorRole
     },
-    workers: state.workers.map((worker) => ({
+    workers: state.workers.map(normalizeWorker).map((worker) => ({
+      id: worker.id,
       name: worker.name,
       role: worker.role,
       present: worker.present,
-      acknowledged: worker.acknowledged
+      acknowledgment: worker.acknowledgment
     })),
     hazards: state.responses.map((item) => ({
       id: item.id,
@@ -1422,7 +1480,7 @@ function buildSessionLog() {
       recommendedAction: item.recommendedAction,
       evidencePhotos: item.evidencePhotos ?? [],
       aiSuggestion: item.aiSuggestion ?? null,
-      status: toExportHazardStatus(item.status),
+      status: normalizeHazardStatus(item.status),
       memo: item.memo,
       humanReview: getHumanReview(item),
       correctiveAction: getCorrectiveAction(item)
@@ -1432,7 +1490,7 @@ function buildSessionLog() {
       evidencePhotos: item.evidencePhotos ?? []
     })),
     workerFeedback: [],
-    sharing: state.session.sharing,
+    sharing: normalizeSharing(state.session.sharing),
     device: state.session.device
   };
 }
@@ -1576,7 +1634,9 @@ function renderError() {
 
 function renderDraftRestore() {
   const draft = state.pendingDraft;
-  const savedAt = draft?.savedAt ? formatDateTime(new Date(draft.savedAt)) : 'Recently';
+  const savedAt = draft?.deviceUpdatedAt || draft?.deviceObservedAt
+    ? formatDateTime(new Date(draft.deviceUpdatedAt ?? draft.deviceObservedAt))
+    : 'Recently';
   const siteName = draft?.session?.siteName ?? state.session.siteName;
   const phaseLabel = draft?.phase ? draft.phase.replace('-', ' ') : 'in-progress TBM';
 
@@ -1588,7 +1648,7 @@ function renderDraftRestore() {
           <div class="v2-warning-tile">↻</div>
           <div>
             <h2>Local draft found</h2>
-            <p>A saved browser draft is available for this active TBM session.</p>
+            <p>A device-local draft is available for this active TBM session.</p>
           </div>
         </div>
         <dl class="v2-draft-meta">
@@ -1597,7 +1657,7 @@ function renderDraftRestore() {
             <dd>${escapeHtml(siteName)}</dd>
           </div>
           <div>
-            <dt>Last saved</dt>
+            <dt>Last recorded on device</dt>
             <dd>${escapeHtml(savedAt)}</dd>
           </div>
           <div>
@@ -1653,7 +1713,10 @@ function renderStart() {
             <strong>${escapeHtml(formatDateTime(state.session.scheduledAt))}</strong>
           </div>
         </div>
-        <button class="focusable v2-key-button v2-key-primary v2-full-button" data-action="start">▶ Start TBM</button>
+        <section class="v2-action-row">
+          <button class="focusable v2-key-button v2-key-primary" data-action="start">▶ Start TBM</button>
+          <button class="focusable v2-key-button" data-action="save-draft">Save Draft</button>
+        </section>
       </section>
     </section>
   `;
@@ -1666,6 +1729,9 @@ function renderStart() {
 
 function renderParticipation() {
   const presentCount = state.workers.filter((worker) => worker.present).length;
+  const supervisorAcknowledgedCount = state.workers.filter(
+    (worker) => normalizeWorker(worker).acknowledgment.supervisorRecorded
+  ).length;
 
   app.innerHTML = `
     <section class="v2-screen">
@@ -1673,7 +1739,7 @@ function renderParticipation() {
       <section class="v2-card v2-participation-card">
         <div class="v2-section-heading">
           <h2>Worker Attendance</h2>
-          <p>Add workers below and mark who is present for this briefing.</p>
+          <p>Record attendance and supervisor-recorded acknowledgment as separate facts.</p>
         </div>
         ${draftStatusHtml()}
 
@@ -1697,14 +1763,23 @@ function renderParticipation() {
 
               return `
                 <div class="v2-worker-row">
-                  <label class="v2-worker-check">
-                    <input class="focusable" type="checkbox" data-worker="${escapeHtml(worker.id)}" ${
-                      worker.present ? 'checked' : ''
-                    } />
+                  <div class="v2-worker-check">
                     <span class="v2-avatar">${escapeHtml(initials)}</span>
                     <strong>${escapeHtml(worker.name)}</strong>
                     <em>${escapeHtml(worker.role)}</em>
-                  </label>
+                    <label class="v2-worker-fact">
+                    <input class="focusable" type="checkbox" data-attendance-worker="${escapeHtml(worker.id)}" ${
+                      worker.present ? 'checked' : ''
+                    } />
+                    <span>Present</span>
+                    </label>
+                    <label class="v2-worker-fact">
+                    <input class="focusable" type="checkbox" data-ack-worker="${escapeHtml(worker.id)}" ${
+                      normalizeWorker(worker).acknowledgment.supervisorRecorded ? 'checked' : ''
+                    } />
+                    <span>TBM acknowledgment — supervisor recorded</span>
+                    </label>
+                  </div>
                   <button class="focusable v2-key-button v2-key-small" data-action="remove-worker" data-worker="${escapeHtml(
                     worker.id
                   )}">Remove</button>
@@ -1714,11 +1789,12 @@ function renderParticipation() {
             .join('')}
         </section>
 
-        <p class="v2-attendance-count"><strong>${presentCount}</strong> of ${state.workers.length} workers marked present</p>
+        <p class="v2-attendance-count"><strong>${presentCount}</strong> present · <strong>${supervisorAcknowledgedCount}</strong> acknowledgments recorded by supervisor · 0 independently verified by this prototype</p>
       </section>
 
       <section class="v2-action-row">
         <button class="focusable v2-key-button" data-action="mark-all">Mark All Present</button>
+        <button class="focusable v2-key-button" data-action="save-draft">Record Draft</button>
         <button class="focusable v2-key-button v2-key-primary" data-action="continue">Continue →</button>
       </section>
     </section>
@@ -1729,8 +1805,16 @@ function renderParticipation() {
     addWorker(app.querySelector('#worker-name').value);
   });
 
-  app.querySelectorAll('input[data-worker]').forEach((checkbox) => {
-    checkbox.addEventListener('change', () => setWorkerPresent(checkbox.dataset.worker, checkbox.checked));
+  app.querySelectorAll('input[data-attendance-worker]').forEach((checkbox) => {
+    checkbox.addEventListener('change', () =>
+      setWorkerPresent(checkbox.dataset.attendanceWorker, checkbox.checked)
+    );
+  });
+
+  app.querySelectorAll('input[data-ack-worker]').forEach((checkbox) => {
+    checkbox.addEventListener('change', () =>
+      setWorkerAcknowledgment(checkbox.dataset.ackWorker, checkbox.checked)
+    );
   });
 
   bindButtons();
@@ -1877,7 +1961,10 @@ function renderGlasses() {
   if (state.phase === 'summary') state.glassesStep = 'summary';
 
   const presentCount = state.workers.filter((worker) => worker.present).length;
-  const { confirmed, fixOrdered, unchecked } = getHazardReviewCounts();
+  const supervisorAcknowledgedCount = state.workers.filter(
+    (worker) => normalizeWorker(worker).acknowledgment.supervisorRecorded
+  ).length;
+  const { controlled, actionRequired, unchecked } = getHazardReviewCounts();
   const hazard = currentHazard();
   const response = currentResponse();
 
@@ -1902,7 +1989,8 @@ function renderGlasses() {
       <h1>${presentCount} / ${state.workers.length} present</h1>
       <p class="glasses-large">Mark all demo workers present?</p>
       <p class="glasses-muted">${state.workers.map((worker) => escapeHtml(worker.name)).join(' · ')}</p>
-      <div class="glasses-hint">Enter marks all present</div>
+      <p class="glasses-muted">${supervisorAcknowledgedCount} supervisor-recorded acknowledgments. This shortcut records attendance only.</p>
+      <div class="glasses-hint">Enter marks present; it does not acknowledge</div>
     `;
     actions = [
       { action: 'workers', label: 'Mark Present', primary: true },
@@ -1913,7 +2001,7 @@ function renderGlasses() {
       <p class="glasses-kicker">Voice Memo Mock</p>
       <h1>Memo Captured</h1>
       <p class="glasses-large">${escapeHtml(state.glassesMemoFeedback)}</p>
-      <p class="glasses-muted">Saved to Hazard ${getCurrentHazardNumber()}.</p>
+      <p class="glasses-muted">Recorded on this device for Hazard ${getCurrentHazardNumber()}.</p>
     `;
     actions = [
       { action: 'next', label: 'Continue', primary: true },
@@ -1933,19 +2021,30 @@ function renderGlasses() {
       { action: 'memo', label: 'Memo' }
     ];
   } else if (state.glassesStep === 'summary') {
+    const blockers = getFinalizationBlockers(buildSessionLog());
+    const glassesTitle = blockers.length
+      ? 'TBM Draft'
+      : getPotentialRecordStatus() === 'actions_open'
+        ? state.session.finalizedAt
+          ? 'TBM recorded — actions open'
+          : 'Ready to record — actions open'
+        : 'Ready to finalize';
     body = `
-      <p class="glasses-kicker">TBM Complete</p>
-      <h1>Summary</h1>
+      <p class="glasses-kicker">TBM Record</p>
+      <h1>${escapeHtml(glassesTitle)}</h1>
       ${state.glassesReviewFeedback ? `<p class="glasses-toast">${escapeHtml(state.glassesReviewFeedback)}</p>` : ''}
       <section class="glasses-stats" aria-label="Glasses summary counts">
-        <div><strong>${confirmed}</strong><span>Confirmed</span></div>
-        <div><strong>${fixOrdered}</strong><span>Fix Ordered</span></div>
+        <div><strong>${controlled}</strong><span>Controlled</span></div>
+        <div><strong>${actionRequired}</strong><span>Action Required</span></div>
         <div><strong>${unchecked}</strong><span>Not Checked</span></div>
       </section>
-      <p class="glasses-muted">${escapeHtml(state.saveFeedback || 'Save the completed session when ready.')}</p>
+      <p class="glasses-muted">${escapeHtml(
+        blockers.length ? blockers.join(' ') : state.saveFeedback || 'Ready to record without fabricating closure.'
+      )}</p>
     `;
     actions = [
-      { action: 'save-session', label: state.isSavingSession ? 'Saving...' : 'Save', primary: true },
+      { action: 'save-session', label: state.isSavingSession ? 'Queuing...' : 'Record Draft', primary: true },
+      ...(blockers.length ? [] : [{ action: 'finalize', label: 'Finalize' }]),
       { action: 'exit', label: 'Exit' }
     ];
   } else {
@@ -1960,11 +2059,11 @@ function renderGlasses() {
         <div><dt>Status</dt><dd>${escapeHtml(status)}</dd></div>
       </dl>
       <p class="glasses-muted">${escapeHtml(hazard?.action ?? '')}</p>
-      <div class="glasses-hint">1 Confirm · 2 Fix · M Memo · P Photo</div>
+      <div class="glasses-hint">1 Controlled · 2 Action Required · M Memo · P Photo</div>
     `;
     actions = [
-      { action: 'confirmed', label: 'Confirmed', primary: true },
-      { action: 'fix', label: 'Fix Ordered' },
+      { action: 'controlled', label: 'Controlled', primary: true },
+      { action: 'action-required', label: 'Action Required' },
       { action: 'memo', label: 'Memo' }
     ];
   }
@@ -1981,17 +2080,58 @@ function renderGlasses() {
       ${renderGlassesActions(actions)}
       <footer class="glasses-shortcuts">
         ${draftStatusHtml()}
+        ${
+          state.glassesStep === 'summary'
+            ? ''
+            : '<button class="focusable glasses-exit" data-glasses-action="save-session">Save Draft</button>'
+        }
         <span>←/→ Navigate · Enter Continue · Esc Exit</span>
       </footer>
     </section>
   `;
 
   app.querySelectorAll('button[data-action]').forEach((button) => {
-    button.addEventListener('click', () => {
+    button.addEventListener('click', async () => {
       if (button.dataset.action === 'save-session') saveCurrentSession();
     });
   });
   bindGlassesButtons();
+}
+
+function renderCorrectiveActionEditor(response) {
+  if (normalizeHazardStatus(response.status) !== HAZARD_STATUS.ACTION_REQUIRED) return '';
+  const action = normalizeCorrectiveAction(response.correctiveAction, response.status);
+  const closureEvidence = action.closureEvidence.join(', ');
+
+  return `
+    <section class="v2-card v2-corrective-card" aria-label="Corrective action details">
+      <div class="v2-section-heading">
+        <h2>Corrective Action Required</h2>
+        <p>This action remains open until verification, verifiedBy, and verifiedAt are explicitly recorded.</p>
+      </div>
+      <div class="v2-two-col">
+        <label class="v2-field-block"><span>Immediate control taken *</span><input data-corrective-field="immediateControl" value="${escapeHtml(action.immediateControl)}" /></label>
+        <label class="v2-field-block"><span>Assigned person *</span><input data-corrective-field="assignedTo" value="${escapeHtml(action.assignedTo)}" /></label>
+        <label class="v2-field-block"><span>Due date/time *</span><input type="datetime-local" data-corrective-field="dueAt" value="${escapeHtml(action.dueAt)}" /></label>
+        <label class="v2-field-block"><span>Work status *</span><select data-corrective-field="workStatus">
+          <option value="">Select status</option>
+          <option value="${WORK_STATUS.STOPPED}" ${action.workStatus === WORK_STATUS.STOPPED ? 'selected' : ''}>Work stopped</option>
+          <option value="${WORK_STATUS.PERMITTED_WITH_CONTROLS}" ${action.workStatus === WORK_STATUS.PERMITTED_WITH_CONTROLS ? 'selected' : ''}>Permitted with controls</option>
+        </select></label>
+        <label class="v2-field-block"><span>Verification status *</span><select data-corrective-field="verificationStatus">
+          <option value="${VERIFICATION_STATUS.OPEN}" ${action.verificationStatus === VERIFICATION_STATUS.OPEN ? 'selected' : ''}>Open — not verified</option>
+          <option value="${VERIFICATION_STATUS.VERIFIED}" ${action.verificationStatus === VERIFICATION_STATUS.VERIFIED ? 'selected' : ''}>Verified</option>
+        </select></label>
+        <label class="v2-field-block"><span>Optional closure evidence reference</span><input data-corrective-field="closureEvidence" value="${escapeHtml(closureEvidence)}" placeholder="Photo ID, note, or evidence reference" /></label>
+        ${
+          action.verificationStatus === VERIFICATION_STATUS.VERIFIED
+            ? `<label class="v2-field-block"><span>Verified by *</span><input data-corrective-field="verifiedBy" value="${escapeHtml(action.verifiedBy ?? '')}" /></label>
+               <label class="v2-field-block"><span>Verified at *</span><input type="datetime-local" data-corrective-field="verifiedAt" value="${escapeHtml(action.verifiedAt ?? '')}" /></label>`
+            : ''
+        }
+      </div>
+    </section>
+  `;
 }
 
 function renderChecklist() {
@@ -2000,7 +2140,7 @@ function renderChecklist() {
   const statusTone = getChecklistStatusTone(response.status);
 
   app.innerHTML = `
-    <section class="v2-screen">
+    <section class="v2-screen ${normalizeHazardStatus(response.status) === HAZARD_STATUS.ACTION_REQUIRED ? 'is-corrective' : ''}">
       ${v2Header('TBM Checklist', v2ChecklistProgress())}
       <section class="v2-card v2-hazard-card" aria-label="Current hazard">
         <div class="v2-hazard-hero">
@@ -2029,54 +2169,120 @@ function renderChecklist() {
         ${draftStatusHtml()}
       </section>
 
+      ${renderCorrectiveActionEditor(response)}
+
       <section class="v2-action-row" aria-label="Checklist actions">
-        <button class="focusable v2-key-button v2-key-primary" data-action="confirmed">✓ Confirmed</button>
-        <button class="focusable v2-key-button" data-action="fix">Fix Ordered</button>
+        <button class="focusable v2-key-button v2-key-primary" data-action="controlled">✓ Controlled — safe to proceed</button>
+        <button class="focusable v2-key-button" data-action="action-required">Action Required</button>
       </section>
 
       <section class="v2-action-row v2-action-row-nav" aria-label="Navigation">
         <button class="focusable v2-key-button" data-action="prev">← Previous</button>
         <button class="focusable v2-key-button" data-action="log-new">＋ Log New Hazard</button>
+        <button class="focusable v2-key-button" data-action="save-draft">Save Draft</button>
         <button class="focusable v2-key-button" data-action="next">Next →</button>
       </section>
     </section>
   `;
 
   app.querySelector('#memo').addEventListener('input', (event) => saveMemo(event.target.value));
+  app.querySelectorAll('[data-corrective-field]').forEach((field) => {
+    const eventName = field.tagName === 'SELECT' ? 'change' : 'input';
+    field.addEventListener(eventName, () => {
+      updateCorrectiveAction(field.dataset.correctiveField, field.value);
+      if (field.dataset.correctiveField === 'verificationStatus') render();
+    });
+  });
   bindButtons();
 }
 
+function renderSharingEditor() {
+  const sharing = normalizeSharing(state.session.sharing);
+  return `
+    <section class="v2-card v2-sharing-card" aria-label="Worker sharing evidence">
+      <div class="v2-section-heading">
+        <h2>Worker Sharing Evidence</h2>
+        <p>Reaching this screen does not mean results were shared. Record the actual outcome.</p>
+      </div>
+      <div class="v2-two-col">
+        <label class="v2-field-block"><span>Were results shared? *</span><select data-sharing-field="status">
+          <option value="${SHARING_STATUS.NOT_RECORDED}" ${sharing.status === SHARING_STATUS.NOT_RECORDED ? 'selected' : ''}>Not recorded yet</option>
+          <option value="${SHARING_STATUS.NOT_SHARED}" ${sharing.status === SHARING_STATUS.NOT_SHARED ? 'selected' : ''}>No — not shared</option>
+          <option value="${SHARING_STATUS.SHARED}" ${sharing.status === SHARING_STATUS.SHARED ? 'selected' : ''}>Supervisor reports shared</option>
+        </select></label>
+        ${
+          sharing.status === SHARING_STATUS.SHARED
+            ? `<label class="v2-field-block"><span>Sharing method *</span><input data-sharing-field="method" value="${escapeHtml(sharing.method)}" placeholder="Briefing, message, posted notice..." /></label>
+               <label class="v2-field-block"><span>Recipients or group *</span><input data-sharing-field="recipients" value="${escapeHtml(sharing.recipients)}" placeholder="Electrical crew, all attendees..." /></label>`
+            : ''
+        }
+        <label class="v2-field-block"><span>Optional acknowledgment results</span><textarea class="v2-textarea" data-sharing-field="acknowledgmentResults" placeholder="Record actual responses only">${escapeHtml(sharing.acknowledgmentResults)}</textarea></label>
+      </div>
+      <p class="draft-status">Offline selection records only the supervisor's device-observed claim. Server shared-at proves recording time, not delivery; acknowledgment results must reflect real responses.</p>
+    </section>
+  `;
+}
+
 function renderSummary() {
-  const { confirmed, fixOrdered } = getHazardReviewCounts();
-  const saveButtonText = state.isSavingSession ? 'Saving...' : 'Save Session';
+  const { controlled, actionRequired, unchecked } = getHazardReviewCounts();
+  const blockers = getFinalizationBlockers(buildSessionLog());
+  const proposedStatus = blockers.length ? 'draft' : getPotentialRecordStatus();
+  const isRecorded = Boolean(state.session.finalizedAt);
+  const title =
+    state.session.completedAt
+      ? 'TBM Complete — all actions verified'
+      : isRecorded && proposedStatus === 'actions_open'
+        ? 'TBM recorded — actions open'
+        : blockers.length
+          ? 'TBM Draft — finalization blocked'
+          : proposedStatus === 'actions_open'
+            ? 'Ready to record — actions open'
+            : 'Ready to finalize';
+  const explanation = blockers.length
+    ? 'This draft can be recorded without claiming completion. Resolve every blocking reason before finalizing.'
+    : proposedStatus === 'actions_open'
+      ? 'All hazards are reviewed and required action fields are recorded, but one or more actions still await verification.'
+      : 'All hazards are reviewed, required fields are recorded, and corrective actions are verified.';
 
   app.innerHTML = `
     <section class="v2-screen">
-      ${v2Header('TBM Complete', v2WorkflowProgress(4))}
+      ${v2Header('TBM Record', v2WorkflowProgress(4))}
       <section class="v2-card v2-summary-card">
         <div class="v2-summary-hero">
-          <div class="v2-success-tile">✓</div>
+          <div class="${blockers.length ? 'v2-warning-tile' : 'v2-success-tile'}">${blockers.length ? '!' : '✓'}</div>
           <div>
-            <h2>TBM Complete</h2>
-            <p>Great work. Your TBM has been completed.</p>
+            <h2>${escapeHtml(title)}</h2>
+            <p>${escapeHtml(explanation)}</p>
           </div>
-          ${v2StatusChip('Status', getSessionStatus(), 'success')}
+          ${v2StatusChip('Status', proposedStatus, blockers.length ? 'warning' : 'success')}
         </div>
 
         <div class="v2-summary-stats">
           <div class="v2-stat-card">
             <div class="v2-warning-tile">✓</div>
-            <p>Confirmed</p>
-            <strong>${confirmed}</strong>
-            <span>Hazards confirmed</span>
+            <p>Controlled</p>
+            <strong>${controlled}</strong>
+            <span>Safe to proceed</span>
           </div>
           <div class="v2-stat-card">
             <div class="v2-warning-tile">□</div>
-            <p>Fix Ordered</p>
-            <strong>${fixOrdered}</strong>
-            <span>Hazards to be fixed</span>
+            <p>Action Required</p>
+            <strong>${actionRequired}</strong>
+            <span>Corrective actions</span>
           </div>
+          <div class="v2-stat-card"><p>Not Checked</p><strong>${unchecked}</strong><span>Finalization blockers</span></div>
         </div>
+
+        ${renderSharingEditor()}
+
+        <section class="v2-report-preview">
+          <h3>Finalization blockers</h3>
+          ${
+            blockers.length
+              ? `<ul>${blockers.map((blocker) => `<li>${escapeHtml(blocker)}</li>`).join('')}</ul>`
+              : '<p>No finalization blockers.</p>'
+          }
+        </section>
 
         <section class="v2-report-preview">
           <h3>Report Preview</h3>
@@ -2088,15 +2294,25 @@ function renderSummary() {
       <div class="v2-action-grid">
         <button class="focusable v2-key-button v2-key-primary" data-action="review">Review</button>
         <button class="focusable v2-key-button" data-action="log-new">＋ Log New Hazard</button>
-        <button class="focusable v2-key-button" data-action="save-session" ${
+        <button class="focusable v2-key-button" data-action="save-draft" ${
           state.isSavingSession ? 'disabled' : ''
-        }>${saveButtonText}</button>
+        }>${state.isSavingSession ? 'Queuing...' : 'Record Draft'}</button>
+        <button class="focusable v2-key-button" data-action="finalize" ${
+          state.isSavingSession || blockers.length ? 'disabled' : ''
+        }>Finalize</button>
         <button class="focusable v2-key-button" data-action="saved-sessions">Saved Sessions</button>
         <button class="focusable v2-key-button" data-action="copy">Copy JSON</button>
       </div>
     </section>
   `;
 
+  app.querySelectorAll('[data-sharing-field]').forEach((field) => {
+    const eventName = field.tagName === 'SELECT' ? 'change' : 'input';
+    field.addEventListener(eventName, () => {
+      updateSharing(field.dataset.sharingField, field.value);
+      if (field.dataset.sharingField === 'status') render();
+    });
+  });
   bindButtons();
 }
 
@@ -2174,7 +2390,7 @@ function renderSavedSessions() {
 
 function bindButtons() {
   app.querySelectorAll('button[data-action]').forEach((button) => {
-    button.addEventListener('click', () => {
+    button.addEventListener('click', async () => {
       const action = button.dataset.action;
 
       if (action === 'auth-login') {
@@ -2188,7 +2404,7 @@ function bindButtons() {
         render();
       }
       if (action === 'restore-draft') {
-        restoreLocalDraft(state.pendingDraft || loadLocalDraft());
+        restoreLocalDraft(state.pendingDraft || await loadLocalDraft());
         render();
       }
       if (action === 'discard-draft') {
@@ -2199,6 +2415,19 @@ function bindButtons() {
       }
       if (action === 'logout') logout();
       if (action === 'retry') loadHazards();
+      if (action === 'retry-sync') synchronizeNow();
+      if (action === 'resolve-conflict-local' && state.syncConflict?.serverRevision != null) {
+        await state.offlineStore.resolveConflictKeepingLocal(
+          state.currentUser.id,
+          state.session.sessionId,
+          { ...buildSessionLog(), saveMode: 'draft' },
+          state.syncConflict.serverRevision
+        );
+        state.serverRevision = state.syncConflict.serverRevision;
+        state.syncConflict = null;
+        state.draftStatus = DRAFT_STATUS_TEXT.QUEUED;
+        await synchronizeNow();
+      }
       if (action === 'start') startTbm();
       if (action === 'remove-worker') removeWorker(button.dataset.worker);
       if (action === 'mark-all') markAllPresent();
@@ -2207,11 +2436,12 @@ function bindButtons() {
       if (action === 'cancel-manual') cancelManualEntry();
       if (action === 'prev') goTo(state.index - 1);
       if (action === 'next') goTo(state.index + 1);
-      if (action === 'confirmed') setStatus(HAZARD_REVIEW_STATUS.CONFIRMED);
-      if (action === 'fix') setStatus(HAZARD_REVIEW_STATUS.FIX_ORDERED);
+      if (action === 'controlled') setStatus(HAZARD_STATUS.CONTROLLED);
+      if (action === 'action-required') setStatus(HAZARD_STATUS.ACTION_REQUIRED);
       if (action === 'review') continueToChecklist();
       if (action === 'copy') copySessionLog(button);
-      if (action === 'save-session') saveCurrentSession();
+      if (action === 'save-session' || action === 'save-draft') saveCurrentSession('draft');
+      if (action === 'finalize') saveCurrentSession('finalize');
       if (action === 'saved-sessions') openSavedSessions();
       if (action === 'back-from-saved') closeSavedSessions();
       if (action === 'refresh-saved') loadSavedSessions().then(render);
@@ -2259,15 +2489,15 @@ window.addEventListener('keydown', (event) => {
     // Browser keyboard mapping for future wearable gestures:
     // ArrowRight / Enter -> next, select, or pinch confirm
     // ArrowLeft -> previous or back gesture
-    // 1 -> confirm hazard
-    // 2 -> fix ordered
+    // 1 -> controlled after review
+    // 2 -> action required (closure is never implied)
     // M -> voice memo
     // P -> photo capture
     // Escape -> exit glasses mode
     if (event.key === 'ArrowRight') handleGlassesAction('next');
     if (event.key === 'ArrowLeft') handleGlassesAction('prev');
-    if (event.key === '1') handleGlassesAction('confirmed');
-    if (event.key === '2') handleGlassesAction('fix');
+    if (event.key === '1') handleGlassesAction('controlled');
+    if (event.key === '2') handleGlassesAction('action-required');
     if (event.key.toLowerCase() === 'm') handleGlassesAction('memo');
     if (event.key.toLowerCase() === 'p') handleGlassesAction('photo');
     if (event.key === 'Enter') handleGlassesAction('next');
@@ -2278,12 +2508,52 @@ window.addEventListener('keydown', (event) => {
 
   if (event.key === 'ArrowRight') goTo(state.index + 1);
   if (event.key === 'ArrowLeft') goTo(state.index - 1);
-  if (event.key === '1') setStatus(HAZARD_REVIEW_STATUS.CONFIRMED);
-  if (event.key === '2') setStatus(HAZARD_REVIEW_STATUS.FIX_ORDERED);
+  if (event.key === '1') setStatus(HAZARD_STATUS.CONTROLLED);
+  if (event.key === '2') setStatus(HAZARD_STATUS.ACTION_REQUIRED);
 });
 
 // ---------------------------------------------------------------------------
 // App startup
 // ---------------------------------------------------------------------------
 
-checkAuth();
+async function initializeOfflineFirstApp() {
+  try {
+    state.offlineStore = await openOfflineStore();
+    await state.offlineStore.migrateLegacyDraft();
+    state.syncEngine = createSyncEngine({
+      store: state.offlineStore,
+      getOwnerId: () => state.currentUser?.id,
+      onStatus: ({ status, conflict, lastError }) => {
+        const labelByStatus = {
+          [SYNC_STATUS.DEVICE_ONLY]: DRAFT_STATUS_TEXT.DEVICE_ONLY,
+          [SYNC_STATUS.QUEUED]: DRAFT_STATUS_TEXT.QUEUED,
+          [SYNC_STATUS.SYNCING]: DRAFT_STATUS_TEXT.SYNCING,
+          [SYNC_STATUS.SYNCED]: DRAFT_STATUS_TEXT.SYNCED,
+          [SYNC_STATUS.FAILED]: DRAFT_STATUS_TEXT.FAILED,
+          [SYNC_STATUS.CONFLICT]: DRAFT_STATUS_TEXT.CONFLICT
+        };
+        state.draftStatus = labelByStatus[status] ?? state.draftStatus;
+        state.syncConflict = conflict ?? (status === SYNC_STATUS.CONFLICT ? state.syncConflict : null);
+        if (lastError && status === SYNC_STATUS.FAILED) state.saveFeedback = `${lastError} Local data was retained.`;
+        render();
+      }
+    });
+  } catch {
+    state.draftStatus = DRAFT_STATUS_TEXT.UNAVAILABLE;
+  }
+
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/sw.js').catch(() => {});
+  }
+  window.addEventListener('online', () => void synchronizeNow());
+  window.addEventListener('offline', () => {
+    if (state.currentUser) {
+      state.saveFeedback = 'Offline — new work will be recorded on this device and queued.';
+      render();
+    }
+  });
+  await checkAuth();
+  if (navigator.onLine) void synchronizeNow();
+}
+
+void initializeOfflineFirstApp();

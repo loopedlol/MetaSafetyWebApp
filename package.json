@@ -3,13 +3,31 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
   "scripts": {
     "dev": "vite --host 0.0.0.0",
-    "server": "node server.js",
+    "server": "node server.ts",
     "dev:all": "node scripts/dev-all.mjs",
-    "build": "vite build"
+    "build": "vite build",
+    "typecheck": "tsc --noEmit",
+    "syntax-check": "node --check public/sw.js && node --check scripts/dev-all.mjs && node --check scripts/migrate.mjs && node --check scripts/import-json.mjs && node --check scripts/verify-audit.mjs && npm run typecheck",
+    "test": "node --test",
+    "test:watch": "node --test --watch",
+    "check": "npm run syntax-check && npm test && npm run build",
+    "db:migrate": "node scripts/migrate.mjs",
+    "db:import-json": "node scripts/import-json.mjs",
+    "audit:verify": "node scripts/verify-audit.mjs"
   },
   "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/multer": "^2.2.0",
+    "@types/node": "^26.1.1",
+    "@types/supertest": "^7.2.0",
+    "fake-indexeddb": "^6.2.5",
+    "supertest": "^7.1.4",
+    "typescript": "^7.0.2",
     "vite": "^7.0.0"
   },
   "dependencies": {
