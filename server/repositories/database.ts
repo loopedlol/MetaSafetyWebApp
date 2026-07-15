@@ -5,7 +5,7 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { getRecordStatus, normalizeSessionRecord } from '../../src/domain/workflow.ts';
 
-const AUDIT_REDACTED_KEYS = /password|secret|registrationkey|cookie|authorization|token/i;
+const AUDIT_REDACTED_KEYS = /password|passphrase|secret|registration.?key|api.?key|cookie|authorization|token|credential/i;
 
 function json(value, fallback = null) {
   if (value == null) return fallback;
@@ -72,7 +72,7 @@ function runMigrations(db, migrationsDir, now) {
 }
 
 export function openDatabase({ databasePath, migrationsDir, now = () => new Date().toISOString() }) {
-  if (databasePath !== ':memory:') mkdirSync(path.dirname(databasePath), { recursive: true });
+  if (databasePath !== ':memory:') mkdirSync(path.dirname(databasePath), { recursive: true, mode: 0o700 });
   const db = new DatabaseSync(databasePath);
   db.exec('PRAGMA foreign_keys = ON');
   db.exec('PRAGMA busy_timeout = 5000');
@@ -154,12 +154,12 @@ export function openDatabase({ databasePath, migrationsDir, now = () => new Date
   }
 
   function findUserByEmail(email) {
-    const row = db.prepare('SELECT * FROM users WHERE email = ? COLLATE NOCASE').get(email);
+    const row = db.prepare('SELECT * FROM users WHERE email = ? COLLATE NOCASE AND deleted_at IS NULL').get(email);
     return row ? mapUser(row) : null;
   }
 
   function findUserById(id) {
-    const row = db.prepare('SELECT * FROM users WHERE id = ?').get(id);
+    const row = db.prepare('SELECT * FROM users WHERE id = ? AND deleted_at IS NULL').get(id);
     return row ? mapUser(row) : null;
   }
 
@@ -254,6 +254,54 @@ export function openDatabase({ databasePath, migrationsDir, now = () => new Date
 
   function getUploadsForOwner(ownerId) {
     return db.prepare('SELECT * FROM evidence_uploads WHERE owner_id = ?').all(ownerId).map(mapUpload);
+  }
+
+  function listAbandonedUploadsBefore(cutoff) {
+    return db.prepare(`
+      SELECT e.* FROM evidence_uploads e
+      WHERE e.uploaded_at < ?
+        AND NOT EXISTS (SELECT 1 FROM hazard_evidence h WHERE h.upload_id = e.id)
+        AND NOT EXISTS (SELECT 1 FROM near_miss_evidence n WHERE n.upload_id = e.id)
+        AND NOT EXISTS (SELECT 1 FROM ai_analyses a WHERE a.upload_id = e.id)
+      ORDER BY e.uploaded_at, e.id
+    `).all(cutoff).map(mapUpload);
+  }
+
+  function deleteAbandonedUpload(uploadId) {
+    return transaction(() => {
+      const upload = mapUpload(db.prepare('SELECT * FROM evidence_uploads WHERE id = ?').get(uploadId));
+      if (!upload) return false;
+      const deleted = db.prepare(`DELETE FROM evidence_uploads WHERE id = ?
+        AND NOT EXISTS (SELECT 1 FROM hazard_evidence WHERE upload_id = ?)
+        AND NOT EXISTS (SELECT 1 FROM near_miss_evidence WHERE upload_id = ?)
+        AND NOT EXISTS (SELECT 1 FROM ai_analyses WHERE upload_id = ?)`)
+        .run(uploadId, uploadId, uploadId, uploadId).changes === 1;
+      if (deleted) {
+        appendAuditEvent({
+          entityType: 'evidence_upload', entityId: uploadId, action: 'evidence.abandoned_deleted',
+          metadata: { sha256Hash: upload.hash, uploadedAt: upload.uploadedAt }
+        });
+      }
+      return deleted;
+    });
+  }
+
+  function deactivateUser(userId) {
+    return transaction(() => {
+      const user = findUserById(userId);
+      if (!user) return false;
+      const deletedAt = now();
+      appendAuditEvent({ entityType: 'user', entityId: userId, action: 'user.deactivated', actorUserId: userId,
+        metadata: { safetyRecordsRetained: true, policy: 'pending_pilot_owner_approval' } });
+      return db.prepare(`UPDATE users SET name = 'Deleted pilot user',
+        email = ?, password_hash = ?, role = 'deleted', deleted_at = ?, deletion_reason = 'user_requested'
+        WHERE id = ? AND deleted_at IS NULL`)
+        .run(`deleted-${userId}@invalid.local`, 'ACCOUNT_DEACTIVATED', deletedAt, userId).changes === 1;
+    });
+  }
+
+  function readinessCheck() {
+    return db.prepare('SELECT 1 AS ready').get()?.ready === 1;
   }
 
   function mapAiAnalysis(row) {
@@ -987,6 +1035,10 @@ export function openDatabase({ databasePath, migrationsDir, now = () => new Date
     createEvidenceUploads,
     getUploadForOwner,
     getUploadsForOwner,
+    listAbandonedUploadsBefore,
+    deleteAbandonedUpload,
+    deactivateUser,
+    readinessCheck,
     createAiAnalysis,
     getAiAnalysisForOwner,
     reviewAiAnalysis,

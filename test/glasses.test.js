@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 import { GLASSES_STEP, attendanceValue, createMockGlassesEvidence, evidenceSourceLabel,
-  isAttendanceSummaryValid, normalizeGlassesStep, splitAttendanceValue, transitionGlassesStep } from '../src/views/glasses/model.ts';
+  duePeriodToDueAt, getSharingScreenErrors, isAttendanceSummaryValid, isSharingScreenComplete,
+  normalizeGlassesStep, splitAttendanceValue, transitionGlassesStep } from '../src/views/glasses/model.ts';
 import { HAZARD_STATUS, getFinalizationBlockers, normalizeAttendanceSummary, normalizeWorker } from '../src/domain/workflow.ts';
 
 describe('structured glasses workflow', () => {
@@ -15,6 +16,24 @@ describe('structured glasses workflow', () => {
     assert.equal(transitionGlassesStep(GLASSES_STEP.CORRECTIVE_ACTION, 'continue'), GLASSES_STEP.PHOTO_EVIDENCE);
     assert.equal(transitionGlassesStep(GLASSES_STEP.PHOTO_EVIDENCE, 'continue'), GLASSES_STEP.HAZARD_CONFIRMATION);
     assert.equal(transitionGlassesStep(GLASSES_STEP.HAZARD_CONFIRMATION, 'summary'), GLASSES_STEP.HAZARD_SUMMARY);
+    assert.equal(transitionGlassesStep(GLASSES_STEP.SHARING_RECORD, 'continue'), GLASSES_STEP.REPORT_REVIEW);
+    assert.equal(transitionGlassesStep(GLASSES_STEP.REPORT_REVIEW, 'submit'), GLASSES_STEP.SUBMITTING_REPORT);
+    assert.equal(transitionGlassesStep(GLASSES_STEP.REPORT_REVIEW, 'back'), GLASSES_STEP.SHARING_RECORD);
+  });
+
+  test('sharing completeness is independent from report-finalization blockers', () => {
+    const empty = { status: 'not_recorded', method: '', proofType: '' };
+    assert.deepEqual(getSharingScreenErrors(empty), ['results_shared', 'sharing_method', 'proof_type']);
+    assert.equal(isSharingScreenComplete(empty), false);
+    const complete = { status: 'shared', method: 'team_meeting', proofType: 'no_independent_proof' };
+    assert.equal(isSharingScreenComplete(complete), true);
+    assert.equal(isSharingScreenComplete({ ...complete, method: 'Team meeting' }), false);
+  });
+
+  test('structured urgency maps to a valid legacy due timestamp', () => {
+    const dueAt = duePeriodToDueAt('within_one_hour', '2026-07-13T00:00:00.000Z');
+    assert.equal(dueAt, '2026-07-13T01:00:00.000Z');
+    assert.equal(Number.isNaN(new Date(dueAt).getTime()), false);
   });
 
   test('supports 00–99 attendance and rejects present greater than expected', () => {
@@ -48,5 +67,6 @@ describe('structured glasses workflow', () => {
     assert.equal(normalizeGlassesStep('intro'), GLASSES_STEP.START);
     assert.equal(normalizeGlassesStep('action_details'), GLASSES_STEP.CORRECTIVE_ACTION);
     assert.equal(normalizeGlassesStep('summary', { phase: 'summary' }), GLASSES_STEP.HAZARD_SUMMARY);
+    assert.equal(normalizeGlassesStep('report_review', { phase: 'summary' }), GLASSES_STEP.REPORT_REVIEW);
   });
 });

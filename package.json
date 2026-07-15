@@ -21,7 +21,9 @@
     "check": "npm run syntax-check && npm test && npm run build",
     "db:migrate": "node scripts/migrate.mjs",
     "db:import-json": "node scripts/import-json.mjs",
-    "audit:verify": "node scripts/verify-audit.mjs"
+    "audit:verify": "node scripts/verify-audit.mjs",
+    "security:secrets": "node scripts/scan-secrets.mjs",
+    "security:audit": "npm audit --audit-level=high"
   },
   "devDependencies": {
     "@playwright/test": "^1.61.1",

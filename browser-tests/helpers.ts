@@ -2,6 +2,11 @@ import { expect, type Page } from '@playwright/test';
 
 export const screenshotPath = (name: string) => `test-artifacts/browser/screenshots/${name}.png`;
 
+export async function captureGlassesScreenshot(page: Page, name: string) {
+  await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+  await page.screenshot({ path: screenshotPath(name), animations: 'disabled' });
+}
+
 export async function openGlasses(page: Page) {
   await page.setViewportSize({ width: 600, height: 600 });
   await page.goto('/?mode=glasses&stress');

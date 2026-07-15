@@ -36,16 +36,30 @@ import {
   createMockGlassesEvidence,
   attendanceValue,
   evidenceSourceLabel,
+  duePeriodToDueAt,
+  getSharingScreenErrors,
   glassesSyncState,
   isAttendanceSummaryValid,
+  isSharingScreenComplete,
   isGlassesPreview,
   normalizeGlassesStep,
   normalBrowserUrl,
-  reducePreviewHelp
 } from '../views/glasses/model.ts';
 import { createTranslator } from '../i18n/index.ts';
 import { persistLanguage, restoreLanguage, updateDocumentLanguage } from '../i18n/preference.ts';
 import { localizeFinalizationBlocker } from '../i18n/workflow.ts';
+import { DEVICE_ACTION, DEVICE_RUNTIME, createDeviceAdapter, resolveDeviceRuntime } from '../device/device-adapter.ts';
+import {
+  createDiagnosticsSnapshot,
+  exitDiagnosticsUrl,
+  isDeviceDiagnosticsEnabled,
+  probeAuthentication,
+  probeIndexedDb,
+  probeServiceWorker,
+  recordDiagnosticKey,
+  sanitizeRuntimeError,
+  summarizeFocus
+} from '../device/diagnostics.ts';
 
 // ---------------------------------------------------------------------------
 // Constants / config
@@ -58,10 +72,17 @@ const stressMemo =
   'Long memo stress test: crew reported this needs barricades, signage, owner assignment, and follow-up before restart. This text should wrap and scroll inside the memo field without pushing buttons over other content.';
 
 const isStressTest = new URLSearchParams(window.location.search).has('stress');
-// Glasses HUD Mode is a browser preview for a future Meta Display / wearable app.
 const isGlassesMode = isGlassesPreview(window.location.search);
+const deviceRuntime = resolveDeviceRuntime(window.location.search);
+const isMetaDisplayRuntime = isGlassesMode && deviceRuntime === DEVICE_RUNTIME.META_DISPLAY_WEB;
+const isInvalidGlassesRuntime = isGlassesMode && deviceRuntime === DEVICE_RUNTIME.INVALID;
+const isDeviceDiagnosticsMode = isDeviceDiagnosticsEnabled(window.location.search);
 document.documentElement.classList.toggle('is-glasses-mode', isGlassesMode);
 document.documentElement.classList.toggle('is-normal-mode', !isGlassesMode);
+document.documentElement.classList.toggle('is-meta-display-runtime', isMetaDisplayRuntime);
+if (isMetaDisplayRuntime) {
+  document.querySelector('meta[name="viewport"]')?.setAttribute('content', 'width=600,height=600,initial-scale=1');
+}
 const LOCAL_DRAFT_VERSION = 2;
 let locale = restoreLanguage();
 let t = createTranslator(locale);
@@ -76,8 +97,19 @@ let pendingFocusSelector = '';
 // ---------------------------------------------------------------------------
 
 const state = createApplicationState({ stressMemo: isStressTest ? stressMemo : '', appVersion: APP_VERSION });
+state.session.device = isMetaDisplayRuntime
+  ? { platform: 'meta_ray_ban_display_web_app', appVersion: APP_VERSION, inputMode: 'documented_dpad_key_events' }
+  : state.session.device;
+
+const deviceAdapter = createDeviceAdapter(deviceRuntime, {
+  createPreviewMemo: () => t('glasses.mockMemoText'),
+  createPreviewEvidence: (hazardNumber) => createMockGlassesEvidence(hazardNumber)
+});
 
 const app = document.querySelector('#app');
+const diagnosticsState = isDeviceDiagnosticsMode
+  ? createDiagnosticsSnapshot({ runtime: deviceRuntime, capabilities: deviceAdapter.capabilities })
+  : null;
 
 // ---------------------------------------------------------------------------
 // Utility helpers
@@ -107,6 +139,64 @@ function selectLanguage(value) {
   updateDocumentLanguage(locale);
   pendingFocusSelector = '[data-language-selector]';
   render();
+}
+
+function diagnosticsStatus(key) {
+  return t(`diagnostics.status.${key}`);
+}
+
+function renderDeviceDiagnostics() {
+  if (!diagnosticsState) return;
+  diagnosticsState.viewport = { width: window.innerWidth, height: window.innerHeight, devicePixelRatio: window.devicePixelRatio };
+  diagnosticsState.focus = summarizeFocus(document.activeElement);
+  diagnosticsState.visibility = document.visibilityState;
+  diagnosticsState.network = navigator.onLine ? 'online' : 'offline';
+  const capabilityRows = Object.entries(diagnosticsState.capabilities)
+    .map(([capability, support]) => `<tr><th>${t(`diagnostics.capability.${capability}`)}</th><td>${diagnosticsStatus(support)}</td></tr>`)
+    .join('');
+  const latestKey = diagnosticsState.latestKey
+    ? `${diagnosticsState.latestKey.key} · ${diagnosticsState.latestKey.eventType}`
+    : t('diagnostics.noKey');
+
+  app.innerHTML = `<section class="diagnostics-screen" data-device-diagnostics>
+    <header><div><p class="glasses-kicker">${t('diagnostics.nonProduction')}</p><h1>${t('diagnostics.title')}</h1></div>
+      <button class="focusable diagnostics-language" data-diagnostics-action="language">${locale === 'ko' ? 'English' : '한국어'}</button></header>
+    <main class="diagnostics-grid">
+      <section><h2>${t('diagnostics.runtime')}</h2><dl>
+        <div><dt>${t('diagnostics.viewport')}</dt><dd data-diagnostic="viewport">${diagnosticsState.viewport.width}×${diagnosticsState.viewport.height}</dd></div>
+        <div><dt>DPR</dt><dd data-diagnostic="dpr">${diagnosticsState.viewport.devicePixelRatio}</dd></div>
+        <div><dt>${t('diagnostics.userAgent')}</dt><dd data-diagnostic="user-agent">${escapeHtml(diagnosticsState.userAgent)}</dd></div>
+        <div><dt>${t('diagnostics.adapter')}</dt><dd data-diagnostic="adapter">${escapeHtml(diagnosticsState.runtime)} / ${escapeHtml(diagnosticsState.adapter)}</dd></div>
+        <div><dt>${t('diagnostics.latestKey')}</dt><dd data-diagnostic="latest-key">${escapeHtml(latestKey)}</dd></div>
+        <div><dt>${t('diagnostics.document')}</dt><dd data-diagnostic="document">${escapeHtml(diagnosticsState.focus)} · ${escapeHtml(diagnosticsState.visibility)}</dd></div>
+      </dl></section>
+      <section><h2>${t('diagnostics.capabilities')}</h2><table><tbody>${capabilityRows}</tbody></table></section>
+      <section><h2>${t('diagnostics.localProbes')}</h2><dl>
+        <div><dt>${t('diagnostics.network')}</dt><dd data-diagnostic="network">${diagnosticsState.network === 'online' ? t('diagnostics.browserOnline') : t('diagnostics.browserOffline')}</dd></div>
+        <div><dt>${t('diagnostics.serviceWorker')}</dt><dd data-diagnostic="service-worker">${diagnosticsStatus(diagnosticsState.serviceWorker.support)} · ${t('diagnostics.registered')}: ${diagnosticsStatus(diagnosticsState.serviceWorker.registered ? 'yes' : 'no')} · ${t('diagnostics.controlling')}: ${diagnosticsStatus(diagnosticsState.serviceWorker.controlling ? 'yes' : 'no')}</dd></div>
+        <div><dt>IndexedDB</dt><dd data-diagnostic="indexed-db">${diagnosticsStatus(diagnosticsState.indexedDb.status)} · ${t('diagnostics.cleanup')}: ${diagnosticsStatus(diagnosticsState.indexedDb.cleanup)}</dd></div>
+        <div><dt>${t('diagnostics.authentication')}</dt><dd data-diagnostic="authentication" class="is-${diagnosticsState.authentication}">${diagnosticsStatus(diagnosticsState.authentication)}</dd></div>
+        <div><dt>${t('diagnostics.latestError')}</dt><dd data-diagnostic="runtime-error">${escapeHtml(diagnosticsState.runtimeError === 'none' ? t('diagnostics.none') : diagnosticsState.runtimeError)}</dd></div>
+      </dl></section>
+    </main>
+    <p class="diagnostics-warning">${t('diagnostics.honestyWarning')}</p>
+    <button class="focusable v2-key-button v2-key-primary diagnostics-exit" data-diagnostics-action="exit" data-primary-action>${t('diagnostics.exit')}</button>
+  </section>`;
+  app.querySelector('[data-diagnostics-action="exit"]')?.addEventListener('click', () => {
+    window.location.href = exitDiagnosticsUrl(window.location.href);
+  });
+  app.querySelector('[data-diagnostics-action="language"]')?.addEventListener('click', () => selectLanguage(locale === 'ko' ? 'en' : 'ko'));
+  requestAnimationFrame(() => app.querySelector('[data-primary-action]')?.focus());
+}
+
+function renderInvalidDeviceRuntime() {
+  app.innerHTML = `<section class="diagnostics-screen diagnostics-invalid-runtime">
+    <p class="glasses-kicker">${t('diagnostics.invalidRuntime')}</p><h1>${t('diagnostics.invalidRuntimeTitle')}</h1>
+    <p>${t('diagnostics.invalidRuntimeBody')}</p>
+    <button class="focusable v2-key-button v2-key-primary" data-invalid-runtime-exit>${t('glasses.reviewInBrowser')}</button>
+  </section>`;
+  app.querySelector('[data-invalid-runtime-exit]')?.addEventListener('click', exitGlassesMode);
+  requestAnimationFrame(() => app.querySelector('[data-invalid-runtime-exit]')?.focus());
 }
 
 function getApiErrorMessage(error, fallback) {
@@ -347,6 +437,8 @@ function buildLocalDraft() {
     glassesAttendanceDigits: state.glassesAttendanceDigits,
     glassesProvisionalDecision: state.glassesProvisionalDecision,
     glassesContext: state.glassesContext,
+    glassesSharingFeedback: state.glassesSharingFeedback,
+    glassesSubmissionStatus: state.glassesSubmissionStatus,
     saveFeedback: state.saveFeedback
   };
 }
@@ -390,7 +482,19 @@ function saveLocalDraft(status = DRAFT_STATUS_TEXT.DEVICE_ONLY) {
   });
 }
 
-async function queueCurrentMutation(type = 'session_upsert', entityId = state.session.sessionId, saveMode = 'draft') {
+async function persistLocalDraft(status = DRAFT_STATUS_TEXT.DEVICE_ONLY) {
+  if (!state.currentUser || !state.offlineStore) return false;
+  state.draftStatus = status;
+  try {
+    await state.offlineStore.putDraft(buildLocalDraft());
+    return true;
+  } catch {
+    state.draftStatus = DRAFT_STATUS_TEXT.UNAVAILABLE;
+    return false;
+  }
+}
+
+async function queueCurrentMutation(type = 'session_upsert', entityId = state.session.sessionId, saveMode = 'draft', synchronize = true) {
   if (!state.offlineStore) return;
   saveLocalDraft(DRAFT_STATUS_TEXT.QUEUED);
   await state.offlineStore.queueSessionMutation({
@@ -402,7 +506,7 @@ async function queueCurrentMutation(type = 'session_upsert', entityId = state.se
     baseRevision: state.serverRevision
   });
   state.draftStatus = DRAFT_STATUS_TEXT.QUEUED;
-  if (navigator.onLine) void synchronizeNow();
+  if (navigator.onLine && synchronize) void synchronizeNow();
 }
 
 async function synchronizeNow() {
@@ -413,7 +517,17 @@ async function synchronizeNow() {
     state.serverRevision = Number(draft.serverRevision) || state.serverRevision;
     state.syncConflict = draft.conflict ?? state.syncConflict;
     if (draft.serverSession) {
-      state.session.sharing = normalizeSharing(draft.serverSession.sharing);
+      const localSharing = normalizeSharing(state.session.sharing);
+      const serverSharing = normalizeSharing(draft.serverSession.sharing);
+      state.session.sharing = normalizeSharing({
+        ...serverSharing,
+        status: localSharing.status,
+        method: localSharing.method,
+        recipients: localSharing.recipients,
+        proofType: localSharing.proofType,
+        acknowledgmentResults: localSharing.acknowledgmentResults,
+        sharedAt: serverSharing.sharedAt ?? localSharing.sharedAt
+      });
       state.session.finalizedAt = draft.serverSession.finalizedAt ?? null;
       state.session.completedAt = draft.serverSession.completedAt ?? null;
     }
@@ -446,6 +560,12 @@ function restoreLocalDraft(draft) {
   state.workers = draft.workers.map(normalizeWorker);
   state.hazards = Array.isArray(draft.hazards) && draft.hazards.length ? draft.hazards : state.hazards;
   state.responses = draft.responses.map(normalizeHazard);
+  state.responses.forEach((response) => {
+    const action = response.correctiveAction;
+    if (action?.duePeriod && Number.isNaN(new Date(action.dueAt).getTime())) {
+      action.dueAt = duePeriodToDueAt(action.duePeriod, response.updatedAt ?? draft.deviceObservedAt);
+    }
+  });
   state.nearMisses = draft.nearMisses;
   state.index = Math.max(0, Math.min(state.responses.length - 1, Number(draft.index) || 0));
   state.phase = safePhase;
@@ -463,6 +583,8 @@ function restoreLocalDraft(draft) {
   state.glassesAttendanceDigits = draft.glassesAttendanceDigits ?? state.glassesAttendanceDigits;
   state.glassesProvisionalDecision = draft.glassesProvisionalDecision ?? null;
   state.glassesContext = draft.glassesContext ?? null;
+  state.glassesSharingFeedback = draft.glassesSharingFeedback ?? '';
+  state.glassesSubmissionStatus = draft.glassesSubmissionStatus ?? '';
   state.saveFeedback = draft.saveFeedback ?? '';
   state.serverRevision = Number(draft.serverRevision) || 0;
   state.syncConflict = draft.conflict ?? null;
@@ -861,22 +983,44 @@ function setStatus(status) {
 // ---------------------------------------------------------------------------
 // Glasses mode shares the same session, response, draft, save, and report model
 // as the normal dashboard; only the interaction layer is different.
-// Memo and photo actions below are explicitly labeled prototype mocks.
+// Capture behavior is supplied by the adapter; only the preview adapter returns mocks.
 
-function getMockEvidencePhoto() {
-  return createMockGlassesEvidence(getCurrentHazardNumber());
-}
-
-function captureGlassesPhoto() {
+async function captureGlassesPhoto() {
   const response = currentResponse();
   if (!response) return;
 
+  const result = await deviceAdapter.captureEvidence({ hazardNumber: getCurrentHazardNumber() });
+  if (result.status !== 'captured') {
+    state.glassesPhotoFeedback = result.status === 'unsupported' ? t('glasses.metaCameraUnsupported') : t('glasses.captureFailed');
+    state.glassesAnnouncement = state.glassesPhotoFeedback;
+    render();
+    return;
+  }
+
   markRecordDirty();
-  response.evidencePhotos = [...(response.evidencePhotos ?? []), getMockEvidencePhoto()];
+  response.evidencePhotos = [...(response.evidencePhotos ?? []), result.value];
   response.updatedAt = new Date().toISOString();
   state.glassesPhotoFeedback = t('glasses.mockPhotoRecorded');
   state.glassesStep = GLASSES_STEP.PHOTO_EVIDENCE;
   state.glassesAnnouncement = t('glasses.photoCaptured');
+  saveLocalDraft();
+  render();
+}
+
+async function captureGlassesMemo() {
+  const result = await deviceAdapter.captureMemo();
+  if (result.status !== 'captured') {
+    state.glassesMemoFeedback = result.status === 'unsupported' ? t('glasses.metaVoiceUnsupported') : t('glasses.captureFailed');
+    state.glassesAnnouncement = state.glassesMemoFeedback;
+    render();
+    return;
+  }
+  markRecordDirty();
+  state.memo = result.value;
+  const response = currentResponse();
+  if (response) response.memo = result.value;
+  state.glassesMemoFeedback = t('glasses.memoCaptured');
+  state.glassesAnnouncement = state.glassesMemoFeedback;
   saveLocalDraft();
   render();
 }
@@ -916,7 +1060,7 @@ function exitGlassesMode() {
   window.location.href = normalBrowserUrl(window.location.href);
 }
 
-function handleGlassesAction(action) {
+async function handleGlassesAction(action) {
   if (action === 'toggle-help') {
     state.glassesHelpOpen = !state.glassesHelpOpen;
     render();
@@ -943,7 +1087,7 @@ function handleGlassesAction(action) {
   }
   if (action === 'mock-photo') {
     if (state.phase !== 'checklist') return;
-    captureGlassesPhoto();
+    await captureGlassesPhoto();
     return;
   }
   if (action === 'evidence-continue') {
@@ -984,10 +1128,27 @@ function handleGlassesAction(action) {
   }
   if (action === 'summary-continue') { state.glassesStep = GLASSES_STEP.SHARING_RECORD; saveLocalDraft(); render(); return; }
   if (action === 'record-continue') {
-    if (getFinalizationBlockers(buildSessionLog()).length) return;
-    state.glassesStep = GLASSES_STEP.RECORDING; saveLocalDraft();
-    void saveCurrentSession('finalize').then(() => { if (state.glassesStep !== GLASSES_STEP.CONFLICT) state.glassesStep = GLASSES_STEP.COMPLETE; saveLocalDraft(); render(); });
+    const sharing = normalizeSharing(state.session.sharing);
+    const errors = getSharingScreenErrors(sharing);
+    if (errors.length) { state.glassesSharingFeedback = t('glasses.sharingMissing'); render(); return; }
+    state.glassesSharingFeedback = '';
+    if (!(await persistLocalDraft())) { state.glassesSharingFeedback = t('glasses.localDraftFailed'); render(); return; }
+    await queueCurrentMutation('sharing_event', state.session.sessionId);
+    state.glassesStep = GLASSES_STEP.REPORT_REVIEW;
+    if (!(await persistLocalDraft(state.draftStatus))) { state.glassesStep = GLASSES_STEP.SHARING_RECORD; state.glassesSharingFeedback = t('glasses.localDraftFailed'); }
     render(); return;
+  }
+  if (action === 'submit-report') {
+    const blockers = getFinalizationBlockers(buildSessionLog());
+    if (blockers.length || state.isSavingSession) return;
+    state.glassesStep = GLASSES_STEP.SUBMITTING_REPORT; state.glassesSubmissionStatus = 'submitting';
+    await persistLocalDraft(state.draftStatus); render();
+    const result = await saveCurrentSession('finalize');
+    if (result?.status === DRAFT_STATUS_TEXT.CONFLICT) { state.glassesStep = GLASSES_STEP.CONFLICT; state.glassesSubmissionStatus = 'conflict'; }
+    else if (result?.ok && result.status === DRAFT_STATUS_TEXT.SYNCED) { state.glassesStep = GLASSES_STEP.COMPLETE; state.glassesSubmissionStatus = 'submitted'; }
+    else if (result?.ok && result.status === DRAFT_STATUS_TEXT.QUEUED) { state.glassesStep = GLASSES_STEP.COMPLETE; state.glassesSubmissionStatus = 'queued'; }
+    else { state.glassesStep = GLASSES_STEP.REPORT_REVIEW; state.glassesSubmissionStatus = 'failed'; }
+    await persistLocalDraft(state.draftStatus); render(); return;
   }
   if (action === 'done') { state.glassesStep = GLASSES_STEP.START; state.phase = 'start'; saveLocalDraft(); render(); return; }
 
@@ -1003,6 +1164,7 @@ function handleGlassesAction(action) {
     else if (state.glassesStep === GLASSES_STEP.HAZARD_CONFIRMATION) state.glassesStep = GLASSES_STEP.PHOTO_EVIDENCE;
     else if (state.glassesStep === GLASSES_STEP.HAZARD_SUMMARY) { state.phase = 'checklist'; state.index = Math.max(0, state.responses.length - 1); state.glassesStep = GLASSES_STEP.HAZARD_CONFIRMATION; state.glassesProvisionalDecision = currentResponse().status; }
     else if (state.glassesStep === GLASSES_STEP.SHARING_RECORD) state.glassesStep = GLASSES_STEP.HAZARD_SUMMARY;
+    else if (state.glassesStep === GLASSES_STEP.REPORT_REVIEW) state.glassesStep = GLASSES_STEP.SHARING_RECORD;
     saveLocalDraft();
     render();
   }
@@ -1641,14 +1803,14 @@ function formatSavedSessionDate(session) {
 }
 
 async function saveCurrentSession(saveMode = 'draft') {
-  if (state.isSavingSession) return;
+  if (state.isSavingSession) return { ok: false, status: state.draftStatus, reason: 'already_saving' };
 
   const sessionLog = buildSessionLog();
   const blockers = saveMode === 'finalize' ? getFinalizationBlockers(sessionLog) : [];
   if (blockers.length) {
     state.saveFeedback = t('feedback.cannotFinalize', { reasons: blockers.map((blocker) => localizeFinalizationBlocker(blocker, t)).join(' ') });
     render();
-    return;
+    return { ok: false, status: state.draftStatus, blockers };
   }
 
   state.isSavingSession = true;
@@ -1656,13 +1818,15 @@ async function saveCurrentSession(saveMode = 'draft') {
   render();
 
   try {
-    await queueCurrentMutation('session_upsert', state.session.sessionId, saveMode);
+    await queueCurrentMutation('session_upsert', state.session.sessionId, saveMode, false);
     if (navigator.onLine) await synchronizeNow();
     state.saveFeedback = state.draftStatus === DRAFT_STATUS_TEXT.SYNCED
       ? t('feedback.synced')
       : t('feedback.queued');
+    return { ok: ![DRAFT_STATUS_TEXT.CONFLICT, DRAFT_STATUS_TEXT.UNAVAILABLE, DRAFT_STATUS_TEXT.FAILED].includes(state.draftStatus), status: state.draftStatus };
   } catch (error) {
     state.saveFeedback = `${getApiErrorMessage(error, t('feedback.syncFailed'))} ${t('feedback.localRetained')}`;
+    return { ok: false, status: state.draftStatus, error };
   } finally {
     state.isSavingSession = false;
     render();
@@ -2211,6 +2375,7 @@ function renderManualEntry() {
 // to port to Meta Web Apps or another wearable runtime later.
 
 function renderGlassesActions(actions) {
+  if (!actions.length) return '';
   return `
     <section class="glasses-actions">
       ${actions
@@ -2248,17 +2413,17 @@ function renderGlasses() {
   let actions = [];
 
   if (state.glassesStep === GLASSES_STEP.START) {
-    body = `<p class="glasses-kicker">${t('glasses.mode')}</p><h1>${t('tbm.start')}</h1>
+    body = `<p class="glasses-kicker">${t(isMetaDisplayRuntime ? 'glasses.metaMode' : 'glasses.previewMode')}</p><h1>${t('tbm.start')}</h1>
       <p class="glasses-large">${escapeHtml(state.session.siteName)}</p>`;
     actions = [{ action: 'start', label: t('glasses.start'), primary: true }];
   } else if (state.glassesStep === GLASSES_STEP.CONTEXT_CONFIRMATION) {
     const observed = state.glassesContext?.observedAt ?? new Date().toISOString();
     const locationSource = state.session.gps?.latitude != null ? t('glasses.deviceLocation') : t('glasses.sessionSite');
     body = `<p class="glasses-kicker">${t('glasses.contextTitle')}</p><h1>${escapeHtml(state.currentUser?.name)}</h1>
-      <dl class="glasses-detail-list"><div><dt>${t('auth.role')}</dt><dd>${escapeHtml(state.currentUser?.role)}</dd></div>
-      <div><dt>${t('tbm.siteName')}</dt><dd>${escapeHtml(state.session.siteName)}</dd></div><div><dt>${t('tbm.taskName')}</dt><dd>${escapeHtml(state.session.taskName)}</dd></div>
-      <div><dt>${t('hazard.location')}</dt><dd>${escapeHtml(state.session.siteArea)} · ${locationSource}</dd></div>
-      <div><dt>${t('tbm.dateTime')}</dt><dd>${escapeHtml(formatDateTime(new Date(observed)))} · ${t('glasses.deviceTime')}</dd></div></dl>`;
+      <dl class="glasses-detail-list glasses-context-grid"><div><dt>${t('auth.role')}</dt><dd>${escapeHtml(state.currentUser?.role)}</dd></div>
+      <div><dt>${t('tbm.siteName')}</dt><dd>${escapeHtml(state.session.siteName)}</dd><small>${t('glasses.sessionSite')}</small></div><div><dt>${t('tbm.taskName')}</dt><dd>${escapeHtml(state.session.taskName)}</dd></div>
+      <div><dt>${t('hazard.location')}</dt><dd>${escapeHtml(state.session.siteArea)}</dd><small>${locationSource}</small></div>
+      <div><dt>${t('tbm.dateTime')}</dt><dd>${escapeHtml(formatDateTime(new Date(observed)))}</dd><small>${t('glasses.deviceTime')}</small></div></dl>`;
     actions = [{ action: 'context-confirm', label: t('glasses.confirm'), primary: true }, { action: 'context-reject', label: t('glasses.reject') }];
   } else if (state.glassesStep === GLASSES_STEP.ATTENDANCE) {
     const d = state.glassesAttendanceDigits; const expected = attendanceValue(d.expectedTens, d.expectedOnes); const present = attendanceValue(d.presentTens, d.presentOnes);
@@ -2291,9 +2456,12 @@ function renderGlasses() {
     actions = [{ action: 'corrective-continue', label: t('common.continue'), primary: true, disabled: !valid }];
   } else if (state.glassesStep === GLASSES_STEP.PHOTO_EVIDENCE) {
     const photos = response?.evidencePhotos ?? [];
-    body = `<p class="glasses-kicker">${t('glasses.photoEvidence')}</p><h1>${t('report.photoCount',{count:photos.length})}</h1>
-      <ul>${photos.map(p=>`<li>${escapeHtml(evidenceSourceLabel(p.source))}</li>`).join('') || `<li>${t('report.noPhoto')}</li>`}</ul><p class="glasses-muted">${t('glasses.previewEvidenceDisclaimer')}</p>`;
-    actions = [{ action: 'mock-photo', label: t('glasses.photoMock'), primary: true }, { action: 'evidence-continue', label: t('common.continue') }];
+    body = `<p class="glasses-kicker">${t('glasses.photoEvidence')}</p><h1>${t('glasses.evidenceCount',{count:photos.length})}</h1>
+      <ul class="glasses-evidence-list">${photos.map(p=>`<li>${escapeHtml(evidenceSourceLabel(p.source))}</li>`).join('') || `<li>${t('report.noPhoto')}</li>`}</ul><p class="glasses-muted">${t(isMetaDisplayRuntime ? 'glasses.metaEvidenceUnavailable' : 'glasses.previewEvidenceDisclaimer')}</p>
+      ${state.glassesPhotoFeedback ? `<p class="glasses-validation" role="status">${escapeHtml(state.glassesPhotoFeedback)}</p>` : ''}`;
+    actions = isMetaDisplayRuntime
+      ? [{ action: 'evidence-continue', label: t('common.continue'), primary: true }]
+      : [{ action: 'mock-photo', label: t('glasses.photoMock'), primary: true }, { action: 'evidence-continue', label: t('common.continue') }];
   } else if (state.glassesStep === GLASSES_STEP.HAZARD_CONFIRMATION) {
     const corrective = normalizeCorrectiveAction(response?.correctiveAction, state.glassesProvisionalDecision);
     const complete = state.glassesProvisionalDecision === HAZARD_STATUS.CONTROLLED || Boolean(corrective.immediateResponseCategory && corrective.responsibleParty && corrective.workStatus && corrective.duePeriod);
@@ -2303,21 +2471,36 @@ function renderGlasses() {
     body = `<p class="glasses-kicker">${t('glasses.hazardSummary')}</p><h1>${t('summary.review')}</h1><ol class="glasses-summary-list">${state.responses.map((r,i)=>`<li><strong>${i+1}. ${escapeHtml(r.title)}</strong><span>${normalizeHazardStatus(r.status)===HAZARD_STATUS.CONTROLLED?t('hazard.controlled'):t('glasses.notControlled')} · ${r.evidencePhotos?.length??0} ${t('report.photoEvidence')}</span></li>`).join('')}</ol>`;
     actions = [{ action: 'summary-continue', label: t('common.continue'), primary: true }];
   } else if (state.glassesStep === GLASSES_STEP.SHARING_RECORD) {
-    const sharing = normalizeSharing(state.session.sharing); const ready = sharing.status===SHARING_STATUS.SHARED && sharing.method && sharing.proofType;
+    const sharing = normalizeSharing(state.session.sharing); const sharingErrors = getSharingScreenErrors(sharing); const ready = isSharingScreenComplete(sharing);
     const options = (values,selected,prefix)=>`<option value=""></option>${values.map(v=>`<option value="${v}" ${selected===v?'selected':''}>${t(`${prefix}.${v}`)}</option>`).join('')}`;
     body = `<p class="glasses-kicker">${t('sharing.title')}</p><h1>${t('glasses.sharingRecord')}</h1><div class="glasses-compact-form">
       <label><input type="checkbox" data-sharing-field="shared" ${sharing.status===SHARING_STATUS.SHARED?'checked':''}/> ${t('glasses.resultsShared')}</label>
       <label>${t('sharing.method')}<select data-sharing-field="method">${options(Object.values(SHARING_METHOD),sharing.method,'glasses.share')}</select></label>
-      <label>${t('glasses.proofType')}<select data-sharing-field="proofType">${options(Object.values(SHARING_PROOF_TYPE),sharing.proofType,'glasses.proof')}</select></label></div>`;
-    actions = [{ action: 'record-continue', label: t('common.continue'), primary: true, disabled: !ready || getFinalizationBlockers(buildSessionLog()).length>0 }];
-  } else if (state.glassesStep === GLASSES_STEP.RECORDING) {
-    body = `<p class="glasses-kicker">${t('glasses.recording')}</p><h1>${t('feedback.queueing')}</h1><p>${t('feedback.localRetained')}</p>`; actions = [];
+      <label>${t('glasses.proofType')}<select data-sharing-field="proofType">${options(Object.values(SHARING_PROOF_TYPE),sharing.proofType,'glasses.proof')}</select></label></div>
+      ${sharingErrors.length ? `<p class="glasses-validation" role="status">${t('glasses.sharingMissing')}: ${sharingErrors.map(key=>t(`glasses.sharingError.${key}`)).join(', ')}</p>` : ''}
+      ${state.glassesSharingFeedback ? `<p class="glasses-validation" role="alert">${escapeHtml(state.glassesSharingFeedback)}</p>` : ''}`;
+    actions = [{ action: 'record-continue', label: t('common.continue'), primary: true, disabled: !ready }];
+  } else if (state.glassesStep === GLASSES_STEP.REPORT_REVIEW) {
+    const sharing = normalizeSharing(state.session.sharing); const blockers = getFinalizationBlockers(buildSessionLog());
+    const attendance = normalizeAttendanceSummary(state.session.attendanceSummary);
+    const openActions = state.responses.filter(r=>normalizeHazardStatus(r.status)===HAZARD_STATUS.ACTION_REQUIRED && !isCorrectiveActionClosed(r.correctiveAction));
+    body = `<header class="glasses-report-heading"><p class="glasses-kicker">${t('glasses.reportReview')}</p><h1>${t('glasses.reviewBeforeSubmit')}</h1></header>
+      <section class="glasses-report-section"><h2>${t('summary.record')}</h2><dl class="glasses-report-grid"><div><dt>${t('tbm.supervisor')}</dt><dd>${escapeHtml(state.currentUser?.name)} / ${escapeHtml(state.currentUser?.role)}</dd></div><div><dt>${t('tbm.siteName')}</dt><dd>${escapeHtml(state.session.siteName)} / ${escapeHtml(state.session.taskName)}</dd></div></dl></section>
+      <section class="glasses-report-section"><h2>${t('report.attendance')}</h2><div class="glasses-report-stats"><p><strong>${attendance ? `${attendance.presentCount} / ${attendance.expectedCount}` : '—'}</strong><span>${t('report.attendance')}</span></p><p><strong>${openActions.length}</strong><span>${t('report.openActions')}</span></p></div></section>
+      <section class="glasses-report-section"><h2>${t('report.allHazards')}</h2><ol class="glasses-summary-list">${state.responses.map((r,i)=>`<li><strong>${i+1}. ${escapeHtml(r.title)}</strong><span>${normalizeHazardStatus(r.status)===HAZARD_STATUS.CONTROLLED?t('hazard.controlled'):t('glasses.notControlled')} · ${r.evidencePhotos?.length??0} ${t('report.photoEvidence')} · ${(r.evidencePhotos??[]).map(p=>escapeHtml(evidenceSourceLabel(p.source))).join(', ')||t('report.noPhoto')}</span></li>`).join('')}</ol></section>
+      <section class="glasses-report-section"><h2>${t('sharing.title')}</h2><dl class="glasses-report-grid"><div><dt>${t('sharing.method')}</dt><dd>${t(`glasses.share.${sharing.method}`)}</dd></div><div><dt>${t('glasses.proofType')}</dt><dd>${t(`glasses.proof.${sharing.proofType}`)}</dd></div></dl></section>
+      ${blockers.length ? `<section class="glasses-report-section glasses-validation"><h2>${t('summary.blockers')}</h2><ul>${blockers.map(b=>`<li>${escapeHtml(localizeFinalizationBlocker(b,t))}</li>`).join('')}</ul></section>` : `<p class="glasses-report-ready">✓ ${t('summary.noBlockers')}</p>`}
+      ${state.glassesSubmissionStatus==='failed'?`<p class="glasses-validation" role="alert">${t('glasses.submitFailed')}</p>`:''}`;
+    actions = [{ action: 'submit-report', label: t('glasses.submitReport'), primary: true, disabled: blockers.length>0 || state.isSavingSession }];
+  } else if (state.glassesStep === GLASSES_STEP.SUBMITTING_REPORT) {
+    body = `<p class="glasses-kicker">${t('glasses.submittingReport')}</p><h1>${t('feedback.queueing')}</h1><p>${t('glasses.noDuplicateSubmit')}</p>`; actions = [];
   } else if (state.glassesStep === GLASSES_STEP.CONFLICT) {
     body = `<p class="glasses-kicker">${t('sync.conflict')}</p><h1>${t('glasses.conflictTitle')}</h1><p class="glasses-large">${t('glasses.conflictBody')}</p>`;
     actions = [{ action: 'exit', label: t('glasses.reviewInBrowser'), primary: true }];
   } else if (state.glassesStep === GLASSES_STEP.COMPLETE) {
     const counts=getHazardReviewCounts(); const evidence=state.responses.reduce((n,r)=>n+(r.evidencePhotos?.length??0),0);
-    body = `<p class="glasses-kicker">${t(syncPresentation.key)}</p><h1>${t('glasses.localRecordSafe')}</h1><dl class="glasses-detail-list"><div><dt>${t('hazard.controlled')}</dt><dd>${counts.controlled}</dd></div><div><dt>${t('glasses.notControlled')}</dt><dd>${counts.actionRequired}</dd></div><div><dt>${t('report.openActions')}</dt><dd>${counts.actionRequired}</dd></div><div><dt>${t('report.photoEvidence')}</dt><dd>${evidence}</dd></div></dl>`;
+    const completionTitle = state.glassesSubmissionStatus === 'submitted' ? t('glasses.reportSubmitted') : t('glasses.reportQueued');
+    body = `<p class="glasses-kicker">${t(syncPresentation.key)}</p><h1>${completionTitle}</h1><div class="glasses-completion-grid"><p><strong>${counts.controlled}</strong><span>✓ ${t('hazard.controlled')}</span></p><p><strong>${counts.actionRequired}</strong><span>! ${t('glasses.notControlled')}</span></p><p><strong>${counts.actionRequired}</strong><span>↻ ${t('report.openActions')}</span></p><p><strong>${evidence}</strong><span>▣ ${t('report.photoEvidence')}</span></p></div>`;
     actions = [{ action: 'done', label: t('glasses.done'), primary: true }];
   }
 
@@ -2326,7 +2509,7 @@ function renderGlasses() {
       <header class="glasses-topline">
         ${v2Logo()}
         <nav aria-label="${t('glasses.secondaryNavigation')}">
-          ${![GLASSES_STEP.START, GLASSES_STEP.RECORDING, GLASSES_STEP.COMPLETE].includes(state.glassesStep) ? `<button class="focusable glasses-exit" data-glasses-action="prev">${t('common.back')}</button>` : ''}
+          ${![GLASSES_STEP.START, GLASSES_STEP.SUBMITTING_REPORT, GLASSES_STEP.COMPLETE].includes(state.glassesStep) ? `<button class="focusable glasses-exit" data-glasses-action="prev">${t('common.back')}</button>` : ''}
           <button class="focusable glasses-exit" data-glasses-action="exit">${t('glasses.quit')}</button>
         </nav>
       </header>
@@ -2334,21 +2517,24 @@ function renderGlasses() {
         ${body}
       </main>
       ${renderGlassesActions(actions)}
-      <footer class="glasses-shortcuts"><span class="glasses-sync is-${syncPresentation.tone}">${t(syncPresentation.key)}</span>
-        <button class="focusable glasses-help-button" data-glasses-action="toggle-help" aria-expanded="${state.glassesHelpOpen}">${t('glasses.previewHelp')}</button></footer>
+      <footer class="glasses-shortcuts"><span class="glasses-sync is-${syncPresentation.tone}">${t(syncPresentation.key)} · ${t(state.deviceConnectionState === 'offline' ? 'glasses.networkOffline' : 'glasses.networkOnline')}</span>
+        <button class="focusable glasses-help-button" data-glasses-action="toggle-help" aria-expanded="${state.glassesHelpOpen}">${t(isMetaDisplayRuntime ? 'glasses.deviceHelp' : 'glasses.previewHelp')}</button></footer>
       <p class="sr-only" role="status" aria-live="polite" aria-atomic="true">${escapeHtml(state.glassesAnnouncement)}</p>
       ${state.glassesHelpOpen ? `<aside class="glasses-help-overlay" role="dialog" aria-modal="true" aria-labelledby="glasses-help-title">
-        <h2 id="glasses-help-title">${t('glasses.previewTooling')}</h2><p>${t('glasses.previewDisclaimer')}</p>
-        <ul><li>Enter — ${t('common.continue')}</li><li>← — ${t('common.back')}</li><li>1 — ${t('hazard.controlled')}</li><li>2 — ${t('glasses.notControlled')}</li><li>H / ? — ${t('glasses.previewHelp')}</li></ul>
+        <h2 id="glasses-help-title">${t(isMetaDisplayRuntime ? 'glasses.deviceTooling' : 'glasses.previewTooling')}</h2><p>${t(isMetaDisplayRuntime ? 'glasses.metaCapabilityNotice' : 'glasses.previewDisclaimer')}</p>
+        ${isMetaDisplayRuntime
+          ? `<ul><li>↑/↓/←/→ — ${t('glasses.moveFocus')}</li><li>Enter — ${t('glasses.activateFocused')}</li><li>Escape — ${t('common.back')}</li></ul>`
+          : `<ul><li>Enter — ${t('common.continue')}</li><li>← — ${t('common.back')}</li><li>1 — ${t('hazard.controlled')}</li><li>2 — ${t('glasses.notControlled')}</li><li>H / ? — ${t('glasses.previewHelp')}</li></ul>`}
         <button class="focusable v2-key-button v2-key-primary" data-glasses-action="toggle-help" data-primary-action>${t('common.close')}</button></aside>` : ''}
     </section>
   `;
 
   app.querySelectorAll('[data-corrective-field]').forEach((field) => {
     field.addEventListener('change', () => {
-      const labels = { immediateResponseCategory: 'immediateControl', responsibleParty: 'assignedTo', duePeriod: 'dueAt' };
+      const labels = { immediateResponseCategory: 'immediateControl', responsibleParty: 'assignedTo' };
       updateCorrectiveAction(field.dataset.correctiveField, field.value);
       if (labels[field.dataset.correctiveField]) updateCorrectiveAction(labels[field.dataset.correctiveField], field.value);
+      if (field.dataset.correctiveField === 'duePeriod') updateCorrectiveAction('dueAt', duePeriodToDueAt(field.value));
       render();
     });
   });
@@ -2729,6 +2915,8 @@ function bindButtons() {
 // ---------------------------------------------------------------------------
 
 function render() {
+  if (isDeviceDiagnosticsMode) { renderDeviceDiagnostics(); return; }
+  if (isInvalidGlassesRuntime) { renderInvalidDeviceRuntime(); return; }
   if (state.phase === 'auth-check') renderAuthChecking();
   if (state.phase === 'auth') renderAuth();
   if (state.phase === 'loading') renderLoading();
@@ -2764,30 +2952,78 @@ function enhanceNormalAccessibility() {
 }
 
 // ---------------------------------------------------------------------------
-// Keyboard shortcuts
+// Device adapter and normal-browser keyboard controls
 // ---------------------------------------------------------------------------
 
-window.addEventListener('keydown', (event) => {
-  if (isGlassesMode && state.currentUser && state.hazards.length) {
-    const nextHelpState = reducePreviewHelp(state.glassesHelpOpen, event.key);
-    if (nextHelpState !== state.glassesHelpOpen) {
-      state.glassesHelpOpen = nextHelpState;
-      event.preventDefault();
-      render();
-      return;
-    }
-    if (state.glassesHelpOpen) return;
-    if (event.target.matches('input, textarea, select, button')) return;
-    if (event.key === 'ArrowRight' && state.glassesStep !== GLASSES_STEP.HAZARD_DECISION) handleGlassesAction('next');
-    if (event.key === 'ArrowLeft') handleGlassesAction('prev');
-    if (event.key === '1') handleGlassesAction('controlled');
-    if (event.key === '2') handleGlassesAction('action-required');
-    if (event.key.toLowerCase() === 'm') handleGlassesAction('memo');
-    if (event.key.toLowerCase() === 'p') handleGlassesAction('photo');
-    if (event.key === 'Enter' && state.glassesStep !== GLASSES_STEP.HAZARD_DECISION) handleGlassesAction('next');
-    if (event.key === 'Escape') handleGlassesAction('prev');
-    return;
+function deviceFocusableElements() {
+  return [...app.querySelectorAll('.focusable:not([disabled]), select:not([disabled]), input:not([disabled])')]
+    .filter((element) => element.getClientRects().length > 0);
+}
+
+function moveDeviceFocus(direction = 1) {
+  const elements = deviceFocusableElements();
+  if (!elements.length) return false;
+  const currentIndex = elements.indexOf(document.activeElement);
+  const nextIndex = currentIndex < 0 ? 0 : (currentIndex + direction + elements.length) % elements.length;
+  elements[nextIndex].focus();
+  return true;
+}
+
+function activateDeviceFocus() {
+  const focused = document.activeElement;
+  if (focused?.matches('select')) return moveDeviceFocus(1);
+  if (focused?.matches('button, input[type="checkbox"]')) {
+    focused.click();
+    return true;
   }
+  return moveDeviceFocus(1);
+}
+
+function handleDeviceAction(action, event) {
+  if (!isGlassesMode || !state.currentUser || !state.hazards.length) return false;
+  if (state.glassesHelpOpen && action !== DEVICE_ACTION.BACK && action !== DEVICE_ACTION.ACTIVATE && action !== DEVICE_ACTION.TOGGLE_HELP) return false;
+
+  if (action === DEVICE_ACTION.TOGGLE_HELP) {
+    state.glassesHelpOpen = !state.glassesHelpOpen;
+    render();
+    return true;
+  }
+  if (action === DEVICE_ACTION.BACK && state.glassesHelpOpen) {
+    state.glassesHelpOpen = false;
+    render();
+    return true;
+  }
+  if (action === DEVICE_ACTION.FOCUS_NEXT || action === DEVICE_ACTION.FOCUS_PREVIOUS) {
+    if (event.target?.matches?.('select')) return false;
+    return moveDeviceFocus(action === DEVICE_ACTION.FOCUS_NEXT ? 1 : -1);
+  }
+  if (action === DEVICE_ACTION.ACTIVATE) return activateDeviceFocus();
+  if (event.target?.matches?.('input, textarea, select, button')) return false;
+  if (action === DEVICE_ACTION.ADVANCE) {
+    if (state.glassesStep === GLASSES_STEP.HAZARD_DECISION) return false;
+    app.querySelector('[data-primary-action]:not([disabled])')?.click();
+    return true;
+  }
+  if (action === DEVICE_ACTION.BACK) { void handleGlassesAction('prev'); return true; }
+  if (action === DEVICE_ACTION.MARK_CONTROLLED) { void handleGlassesAction('controlled'); return true; }
+  if (action === DEVICE_ACTION.MARK_ACTION_REQUIRED) { void handleGlassesAction('action-required'); return true; }
+  if (action === DEVICE_ACTION.CAPTURE_MEMO) { void captureGlassesMemo(); return true; }
+  if (action === DEVICE_ACTION.CAPTURE_EVIDENCE) { void captureGlassesPhoto(); return true; }
+  return false;
+}
+
+if (!isDeviceDiagnosticsMode && !isInvalidGlassesRuntime) {
+  deviceAdapter.connect({
+    onAction: handleDeviceAction,
+    onConnectionChange: (connectionState) => {
+      state.deviceConnectionState = connectionState;
+      if (isGlassesMode && state.currentUser && state.hazards.length) render();
+    }
+  });
+}
+
+window.addEventListener('keydown', (event) => {
+  if (isGlassesMode) return;
   if (event.target.matches('input, textarea, select, button')) return;
   if (state.phase !== 'checklist') return;
 
@@ -2846,4 +3082,45 @@ async function initializeOfflineFirstApp() {
   if (navigator.onLine) void synchronizeNow();
 }
 
-void initializeOfflineFirstApp();
+async function initializeDeviceDiagnostics() {
+  if (!diagnosticsState) return;
+  const refresh = () => renderDeviceDiagnostics();
+  const recordKey = (event) => {
+    const recorded = recordDiagnosticKey(event);
+    if (!recorded) return;
+    diagnosticsState.latestKey = recorded;
+    renderDeviceDiagnostics();
+    if (event.type === 'keydown' && event.key === 'Escape') window.location.href = exitDiagnosticsUrl(window.location.href);
+  };
+  window.addEventListener('keydown', recordKey);
+  window.addEventListener('keyup', recordKey);
+  window.addEventListener('resize', refresh);
+  window.addEventListener('online', refresh);
+  window.addEventListener('offline', refresh);
+  document.addEventListener('visibilitychange', refresh);
+  window.addEventListener('error', (event) => {
+    event.preventDefault();
+    diagnosticsState.runtimeError = sanitizeRuntimeError(event.error ?? event.message);
+    renderDeviceDiagnostics();
+  });
+  window.addEventListener('unhandledrejection', (event) => {
+    event.preventDefault();
+    diagnosticsState.runtimeError = sanitizeRuntimeError(event.reason);
+    renderDeviceDiagnostics();
+  });
+
+  renderDeviceDiagnostics();
+  const [authentication, serviceWorker, indexedDb] = await Promise.all([
+    probeAuthentication(),
+    probeServiceWorker('serviceWorker' in navigator ? navigator.serviceWorker : undefined),
+    probeIndexedDb('indexedDB' in window ? window.indexedDB : undefined)
+  ]);
+  diagnosticsState.authentication = authentication;
+  diagnosticsState.serviceWorker = serviceWorker;
+  diagnosticsState.indexedDb = indexedDb;
+  renderDeviceDiagnostics();
+}
+
+if (isDeviceDiagnosticsMode) void initializeDeviceDiagnostics();
+else if (isInvalidGlassesRuntime) renderInvalidDeviceRuntime();
+else void initializeOfflineFirstApp();

@@ -4,6 +4,7 @@ declare global {
   namespace Express {
     interface Request {
       user: PublicUser & { passwordHash?: string };
+      requestId: string;
     }
   }
 }

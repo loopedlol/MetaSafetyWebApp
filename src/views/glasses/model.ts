@@ -12,7 +12,8 @@ export const GLASSES_STEP = Object.freeze({
   HAZARD_CONFIRMATION: 'hazard_confirmation',
   HAZARD_SUMMARY: 'hazard_summary',
   SHARING_RECORD: 'sharing_record',
-  RECORDING: 'recording',
+  REPORT_REVIEW: 'report_review',
+  SUBMITTING_REPORT: 'submitting_report',
   CONFLICT: 'conflict',
   COMPLETE: 'complete'
 });
@@ -29,7 +30,7 @@ const LEGACY_STEPS: Record<string, string> = {
   summary: GLASSES_STEP.HAZARD_SUMMARY,
   summary_incomplete: GLASSES_STEP.SHARING_RECORD,
   summary_ready: GLASSES_STEP.SHARING_RECORD,
-  save_queued: GLASSES_STEP.COMPLETE,
+  save_queued: GLASSES_STEP.REPORT_REVIEW,
   completion: GLASSES_STEP.COMPLETE
 };
 
@@ -63,6 +64,32 @@ export function evidenceSourceLabel(source: unknown): string {
     browser_file_picker: 'Unverified external source', browser_preview_mock: 'Browser preview mock',
     unknown_legacy_source: 'Unknown legacy source'
   } as Record<string, string>)[String(source)] ?? 'Unknown legacy source';
+}
+
+const SHARING_METHODS = new Set(['verbal_briefing', 'team_meeting', 'displayed_notice', 'mobile_message', 'printed_handout', 'other_approved_method']);
+const SHARING_PROOF_TYPES = new Set(['photo_evidence', 'uploaded_document', 'attendance_record', 'supervisor_confirmation', 'worker_acknowledgment_record', 'no_independent_proof']);
+
+export function getSharingScreenErrors(sharing: any): string[] {
+  const errors: string[] = [];
+  if (sharing?.status !== 'shared') errors.push('results_shared');
+  if (!SHARING_METHODS.has(sharing?.method)) errors.push('sharing_method');
+  if (!SHARING_PROOF_TYPES.has(sharing?.proofType)) errors.push('proof_type');
+  return errors;
+}
+
+export function isSharingScreenComplete(sharing: any): boolean {
+  return getSharingScreenErrors(sharing).length === 0;
+}
+
+export function duePeriodToDueAt(period: string, observedAt = new Date().toISOString()): string {
+  const base = new Date(observedAt);
+  if (Number.isNaN(base.getTime())) return '';
+  if (period === 'within_one_hour') base.setHours(base.getHours() + 1);
+  else if (period === 'same_shift') base.setHours(base.getHours() + 8);
+  else if (period === 'end_of_day') base.setHours(23, 59, 59, 999);
+  else if (period === 'scheduled_follow_up') base.setDate(base.getDate() + 1);
+  else if (!['immediate', 'before_work_resumes'].includes(period)) return '';
+  return base.toISOString();
 }
 
 export function compactHudText(value: unknown, maximumCharacters = 54) {
@@ -103,8 +130,9 @@ export function transitionGlassesStep(step: string, event: string) {
     [GLASSES_STEP.PHOTO_EVIDENCE]: { continue: GLASSES_STEP.HAZARD_CONFIRMATION },
     [GLASSES_STEP.HAZARD_CONFIRMATION]: { summary: GLASSES_STEP.HAZARD_SUMMARY, next: GLASSES_STEP.HAZARD_DECISION },
     [GLASSES_STEP.HAZARD_SUMMARY]: { continue: GLASSES_STEP.SHARING_RECORD },
-    [GLASSES_STEP.SHARING_RECORD]: { continue: GLASSES_STEP.RECORDING },
-    [GLASSES_STEP.RECORDING]: { complete: GLASSES_STEP.COMPLETE }
+    [GLASSES_STEP.SHARING_RECORD]: { continue: GLASSES_STEP.REPORT_REVIEW },
+    [GLASSES_STEP.REPORT_REVIEW]: { submit: GLASSES_STEP.SUBMITTING_REPORT },
+    [GLASSES_STEP.SUBMITTING_REPORT]: { complete: GLASSES_STEP.COMPLETE }
   };
   if (event === 'back') {
     const back: Record<string, string> = {
@@ -115,6 +143,7 @@ export function transitionGlassesStep(step: string, event: string) {
       [GLASSES_STEP.HAZARD_CONFIRMATION]: GLASSES_STEP.PHOTO_EVIDENCE,
       [GLASSES_STEP.HAZARD_SUMMARY]: GLASSES_STEP.HAZARD_CONFIRMATION,
       [GLASSES_STEP.SHARING_RECORD]: GLASSES_STEP.HAZARD_SUMMARY
+      , [GLASSES_STEP.REPORT_REVIEW]: GLASSES_STEP.SHARING_RECORD
     };
     return back[step] ?? step;
   }
@@ -122,7 +151,7 @@ export function transitionGlassesStep(step: string, event: string) {
 }
 
 export function normalBrowserUrl(currentUrl: string): string {
-  const url = new URL(currentUrl); url.searchParams.delete('mode'); return url.toString();
+  const url = new URL(currentUrl); url.searchParams.delete('mode'); url.searchParams.delete('adapter'); return url.toString();
 }
 
 export function createMockGlassesEvidence(hazardNumber: number) {

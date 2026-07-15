@@ -59,7 +59,7 @@ describe('SQLite schema and ownership', () => {
     assert.equal(database.raw.prepare('PRAGMA foreign_keys').get().foreign_keys, 1);
     assert.deepEqual(
       database.raw.prepare('SELECT version FROM schema_migrations ORDER BY version').all().map((row) => row.version),
-      ['001_initial.sql', '002_offline_sync.sql', '003_ai_analyses.sql', '004_glasses_structured_records.sql']
+      ['001_initial.sql', '002_offline_sync.sql', '003_ai_analyses.sql', '004_glasses_structured_records.sql', '005_pilot_retention.sql']
     );
     assert.equal(database.raw.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'ai_analyses'").get().count, 1);
     assert.ok(database.raw.prepare("PRAGMA table_info(tbm_sessions)").all().some((column) => column.name === 'attendance_expected_count'));

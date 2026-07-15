@@ -225,8 +225,7 @@ test.describe('normal browser verification', () => {
     await start.focus();
     await page.keyboard.press('Enter');
     await expect(page.getByRole('heading', { level: 1, name: '근로자 참여' })).toBeVisible();
-    await page.getByRole('button', { name: /계속/ }).focus();
-    await page.keyboard.press('Enter');
+    await page.getByRole('button', { name: /계속/ }).press('Enter');
     await expect(page.getByRole('heading', { level: 1, name: 'TBM 점검표' })).toBeVisible();
     const controlled = page.getByRole('button', { name: /통제됨/ });
     await focusByKeyboard(page, '[data-action="controlled"]');

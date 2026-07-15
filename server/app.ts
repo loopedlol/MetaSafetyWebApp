@@ -6,15 +6,17 @@
 import express from 'express';
 import bcrypt from 'bcryptjs';
 import multer from 'multer';
-import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
+import { existsSync, mkdirSync, readFileSync, unlinkSync } from 'node:fs';
 import { readFile, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openDatabase } from './repositories/database.ts';
+import { validateEnvironment } from './config.ts';
+import { rejectCrossSiteMutation, requestContext, sanitizeRequestPath, securityHeaders } from './middleware/http-security.ts';
 import { ALLOWED_IMAGE_TYPES, detectImageMimeType as detectUploadedImageMimeType } from './services/image-validation.ts';
 import { createAnalysisProvider, normalizeProviderResult } from './services/ai-provider.ts';
-import { validateSessionPayload } from './validation/session.ts';
+import { validatePayloadBounds, validateSessionPayload } from './validation/session.ts';
 import { createTranslator, normalizeLocale } from '../src/i18n/index.ts';
 import {
   clearAuthCookie,
@@ -89,6 +91,12 @@ function escapeHtml(value) {
     .replaceAll('>', '&gt;')
     .replaceAll('"', '&quot;')
     .replaceAll("'", '&#039;');
+}
+
+function secretsEqual(left, right) {
+  const leftHash = createHash('sha256').update(String(left)).digest();
+  const rightHash = createHash('sha256').update(String(right)).digest();
+  return timingSafeEqual(leftHash, rightHash);
 }
 
 // ---------------------------------------------------------------------------
@@ -635,9 +643,10 @@ export function renderSessionReport(session, localeValue = 'ko') {
       </section>
 
       <div class="print-actions">
-        <button type="button" onclick="window.print()">${t('report.print')}</button>
+        <button type="button" id="print-report">${t('report.print')}</button>
       </div>
     </main>
+    <script src="/report-print.js"></script>
   </body>
 </html>`;
 }
@@ -678,7 +687,9 @@ export function createApp({
   now = () => Date.now(),
   aiMode = process.env.AI_MODE ?? 'mock',
   analysisProvider: configuredAnalysisProvider = null,
-  staticDir = path.join(PROJECT_ROOT, 'dist')
+  staticDir = path.join(PROJECT_ROOT, 'dist'),
+  trustProxy = false,
+  logger = console
 } = {}) {
   const sessionSecret = requireSecureSessionSecret(configuredSessionSecret, nodeEnv);
   const useSecureCookies = nodeEnv === 'production' || secureCookies === true;
@@ -690,14 +701,20 @@ export function createApp({
     now: () => new Date(now()).toISOString()
   });
   app.locals.database = database;
-  app.locals.closeDatabase = () => database.close();
+  app.locals.isShuttingDown = false;
+  let databaseClosed = false;
+  app.locals.closeDatabase = () => {
+    if (databaseClosed) return;
+    databaseClosed = true;
+    database.close();
+  };
   const authAttempts = new Map();
 
-  mkdirSync(uploadsDir, { recursive: true });
+  mkdirSync(uploadsDir, { recursive: true, mode: 0o700 });
 
   const upload = multer({
     storage: multer.memoryStorage(),
-    limits: { fileSize: 5 * 1024 * 1024 },
+    limits: { fileSize: 5 * 1024 * 1024, files: 10, fields: 10, parts: 20, fieldNameSize: 100, fieldSize: 10_000 },
     fileFilter: (_request, file, callback) => {
       if (!ALLOWED_IMAGE_TYPES.has(file.mimetype)) {
         callback(new multer.MulterError('LIMIT_UNEXPECTED_FILE', file.fieldname));
@@ -773,6 +790,7 @@ export function createApp({
     try {
       const user = await getAuthenticatedUser(request);
       if (!user) {
+        if (request.headers.cookie?.includes('safety_lens_session=')) clearAuthCookie(response, useSecureCookies || request.secure);
         response.status(401).json({ error: 'Please log in to continue.' });
         return;
       }
@@ -799,8 +817,61 @@ export function createApp({
     return true;
   }
 
-  app.use(express.json({ limit: '1mb' }));
-  if (nodeEnv === 'production') app.set('trust proxy', 1);
+  app.locals.runRetentionCleanup = async ({ cutoff = new Date(now() - 24 * 60 * 60 * 1000).toISOString() } = {}) => {
+    const abandoned = database.listAbandonedUploadsBefore(cutoff);
+    let deleted = 0;
+    for (const record of abandoned) {
+      try {
+        // Keep the file removal and conditional metadata deletion in one event-loop turn.
+        // That prevents a session save from linking the upload between those operations.
+        unlinkSync(path.join(uploadsDir, record.filename));
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+      }
+      if (database.deleteAbandonedUpload(record.id)) deleted += 1;
+    }
+    return { examined: abandoned.length, deleted };
+  };
+
+  app.disable('x-powered-by');
+  if (trustProxy) app.set('trust proxy', trustProxy);
+  app.use(requestContext(logger, now));
+  app.use(securityHeaders(nodeEnv));
+  app.use(rejectCrossSiteMutation);
+  app.use(express.json({ limit: '1mb', strict: true }));
+  app.use('/api', (request, response, next) => {
+    const idempotencyKey = request.get('Idempotency-Key');
+    if (idempotencyKey && idempotencyKey.trim().length > 128) {
+      response.status(400).json({ error: 'Idempotency-Key exceeds 128 characters.' });
+      return;
+    }
+    const boundsError = validatePayloadBounds(request.body);
+    if (boundsError) {
+      response.status(400).json({ error: boundsError });
+      return;
+    }
+    next();
+  });
+  for (const parameter of ['sessionId', 'uploadId', 'analysisId']) {
+    app.param(parameter, (request, response, next, value) => {
+      if (String(value).length > 200) {
+        response.status(400).json({ error: `${parameter} exceeds 200 characters.` });
+        return;
+      }
+      next();
+    });
+  }
+
+  app.get('/healthz', (_request, response) => response.json({ status: 'ok' }));
+  app.get('/readyz', (_request, response) => {
+    let ready = false;
+    try {
+      ready = !app.locals.isShuttingDown && database.readinessCheck();
+    } catch {
+      ready = false;
+    }
+    response.status(ready ? 200 : 503).json({ status: ready ? 'ready' : 'not_ready' });
+  });
 
   app.post('/api/auth/register', authRateLimiter('register'), async (request, response, next) => {
     try {
@@ -809,6 +880,11 @@ export function createApp({
       const password = String(request.body?.password ?? '');
       const role = String(request.body?.role ?? 'supervisor').trim() || 'supervisor';
       const registrationKey = String(request.body?.registrationKey ?? '');
+
+      if (name.length > 200 || email.length > 320 || password.length > 128 || role.length > 100 || registrationKey.length > 256) {
+        response.status(400).json({ error: 'Registration fields exceed allowed lengths.' });
+        return;
+      }
 
       if (!configuredRegistrationKey) {
         response.status(500).json({ error: 'Registration is not configured on this server.' });
@@ -830,7 +906,7 @@ export function createApp({
         response.status(400).json({ error: 'Registration key is required.' });
         return;
       }
-      if (registrationKey !== configuredRegistrationKey) {
+      if (!secretsEqual(registrationKey, configuredRegistrationKey)) {
         response.status(403).json({ error: 'Registration key is not authorized.' });
         return;
       }
@@ -874,6 +950,11 @@ export function createApp({
       const email = normalizeEmail(request.body?.email);
       const password = String(request.body?.password ?? '');
 
+      if (email.length > 320 || password.length > 128) {
+        response.status(400).json({ error: 'Email or password exceeds the allowed length.' });
+        return;
+      }
+
       if (!email || !password) {
         response.status(400).json({ error: 'Email and password are required.' });
         return;
@@ -907,6 +988,7 @@ export function createApp({
     try {
       const user = await getAuthenticatedUser(request);
       if (!user) {
+        if (request.headers.cookie?.includes('safety_lens_session=')) clearAuthCookie(response, useSecureCookies || request.secure);
         response.status(401).json({ error: 'Not logged in.' });
         return;
       }
@@ -923,6 +1005,24 @@ export function createApp({
   // All current and future routes under these namespaces are authenticated by
   // default. Route authors cannot accidentally omit authorization per handler.
   app.use(['/api/sessions', '/api/uploads', '/api/ai'], requireAuth);
+
+  app.delete('/api/account', requireAuth, async (request, response, next) => {
+    try {
+      const password = String(request.body?.password ?? '');
+      if (!password || password.length > 128 || !(await bcrypt.compare(password, request.user.passwordHash ?? DUMMY_PASSWORD_HASH))) {
+        response.status(401).json({ error: 'Password confirmation failed.' });
+        return;
+      }
+      if (!database.deactivateUser(request.user.id)) {
+        response.status(404).json({ error: 'Resource not found.' });
+        return;
+      }
+      clearAuthCookie(response, useSecureCookies || request.secure);
+      response.status(204).end();
+    } catch (error) {
+      next(error);
+    }
+  });
 
   app.post('/api/sessions', async (request, response, next) => {
     try {
@@ -1051,6 +1151,10 @@ export function createApp({
       const prepared = [];
 
       for (const file of files) {
+        if (file.originalname.length > 255) {
+          response.status(400).json({ error: 'Image filenames must be 255 characters or fewer.' });
+          return;
+        }
         const detectedMimeType = detectUploadedImageMimeType(file.buffer);
         if (!detectedMimeType || detectedMimeType !== file.mimetype) {
           response.status(400).json({ error: 'Uploaded content is not a valid JPEG, PNG, or WebP image.' });
@@ -1141,6 +1245,11 @@ export function createApp({
 
   app.post('/api/ai/analyze-hazard', async (request, response, next) => {
     const { entryType, uploadId, sessionId } = request.body ?? {};
+
+    if (String(uploadId ?? '').length > 200 || String(sessionId ?? '').length > 200) {
+      response.status(400).json({ error: 'Analysis identifiers exceed allowed lengths.' });
+      return;
+    }
 
     if (!['new_hazard', 'near_miss'].includes(entryType)) {
       response.status(400).json({ error: 'entryType must be new_hazard or near_miss.' });
@@ -1303,30 +1412,88 @@ export function createApp({
   // Error handling / startup
   // ---------------------------------------------------------------------------
 
-  app.use((error, _request, response, _next) => {
-    console.error(error);
-    response.status(500).json({ error: 'Internal server error.' });
+  app.use((error, request, response, _next) => {
+    if (error?.type === 'entity.parse.failed') {
+      response.status(400).json({ error: 'Malformed JSON request.', requestId: request.requestId });
+      return;
+    }
+    if (error?.type === 'entity.too.large') {
+      response.status(413).json({ error: 'Request body is too large.', requestId: request.requestId });
+      return;
+    }
+    logger.error(JSON.stringify({
+      level: 'error', event: 'request_failed', requestId: request.requestId,
+      method: request.method, path: sanitizeRequestPath(request.originalUrl), errorType: error?.name ?? 'Error'
+    }));
+    response.status(500).json({ error: 'Internal server error.', requestId: request.requestId });
   });
 
   return app;
 }
 
-export function startServer({
-  port = process.env.PORT ?? 3001,
-  host = process.env.HOST ?? '127.0.0.1',
-  ...appOptions
-} = {}) {
-  const app = createApp(appOptions);
+export function startServer(options = {}) {
+  const { environment = process.env, logger = console } = options;
+  const config = validateEnvironment(environment, PROJECT_ROOT);
+  const { port = config.port, host = config.host, shutdownTimeoutMs = config.shutdownTimeoutMs,
+    abandonedUploadTtlHours = config.abandonedUploadTtlHours,
+    retentionCleanupIntervalMinutes = config.retentionCleanupIntervalMinutes,
+    environment: _environment, logger: _logger, ...appOverrides } = options;
+  const app = createApp({
+    databasePath: config.databasePath, uploadsDir: config.uploadsDir, registrationKey: config.registrationKey,
+    sessionSecret: config.sessionSecret, nodeEnv: config.nodeEnv, sessionTtlMs: config.sessionTtlMs,
+    aiMode: config.aiMode, trustProxy: config.trustProxy, logger, ...appOverrides
+  });
   const httpServer = app.listen(port, host, () => {
-    console.log(`Safety Lens backend listening on http://${host}:${port}`);
+    logger.info(JSON.stringify({ level: 'info', event: 'server_listening', host, port }));
   });
 
+  const cleanup = () => app.locals.runRetentionCleanup({
+    cutoff: new Date(Date.now() - abandonedUploadTtlHours * 60 * 60 * 1000).toISOString()
+  }).then((result) => {
+    if (result.deleted) logger.info(JSON.stringify({ level: 'info', event: 'retention_cleanup', ...result }));
+  }).catch((error) => logger.error(JSON.stringify({ level: 'error', event: 'retention_cleanup_failed', errorType: error.name })));
+  void cleanup();
+  const cleanupTimer = setInterval(cleanup, retentionCleanupIntervalMinutes * 60 * 1000);
+  cleanupTimer.unref();
+
+  let shuttingDown = false;
+  const shutdown = (signal) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    app.locals.isShuttingDown = true;
+    clearInterval(cleanupTimer);
+    logger.info(JSON.stringify({ level: 'info', event: 'server_shutdown_started', signal }));
+    const forcedExit = setTimeout(() => {
+      logger.error(JSON.stringify({ level: 'error', event: 'server_shutdown_timeout' }));
+      process.exitCode = 1;
+      httpServer.closeAllConnections?.();
+    }, shutdownTimeoutMs);
+    forcedExit.unref();
+    httpServer.close((error) => {
+      clearTimeout(forcedExit);
+      app.locals.closeDatabase();
+      if (error) process.exitCode = 1;
+    });
+    httpServer.closeIdleConnections?.();
+  };
+  httpServer.shutdown = shutdown;
+  process.once('SIGTERM', shutdown);
+  process.once('SIGINT', shutdown);
+
   httpServer.on('error', (error) => {
-    console.error(`Safety Lens backend failed to start on ${host}:${port}.`);
-    console.error(error);
+    clearInterval(cleanupTimer);
+    app.locals.closeDatabase();
+    process.removeListener('SIGTERM', shutdown);
+    process.removeListener('SIGINT', shutdown);
+    logger.error(JSON.stringify({ level: 'error', event: 'server_start_failed', host, port, errorType: error.name }));
     process.exitCode = 1;
   });
-  httpServer.on('close', () => app.locals.closeDatabase());
+  httpServer.on('close', () => {
+    clearInterval(cleanupTimer);
+    app.locals.closeDatabase();
+    process.removeListener('SIGTERM', shutdown);
+    process.removeListener('SIGINT', shutdown);
+  });
 
   return httpServer;
 }

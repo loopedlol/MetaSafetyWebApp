@@ -89,6 +89,8 @@ test('report rendering is independently callable without an HTTP request', () =>
   assert.match(html, /<!doctype html>/i);
   assert.match(html, /Test Site/);
   assert.match(html, /direct-report/);
+  assert.match(html, /src="\/report-print\.js"/);
+  assert.doesNotMatch(html, /onclick=/);
 });
 
 describe('authentication', () => {
@@ -227,6 +229,8 @@ describe('authentication', () => {
     assert.match(cookie, /HttpOnly/);
     assert.match(cookie, /SameSite=Lax/);
     assert.match(cookie, /Secure/);
+    assert.equal(response.headers['strict-transport-security'], 'max-age=31536000; includeSubDomains');
+    assert.equal(response.headers['access-control-allow-origin'], undefined);
   });
 });
 

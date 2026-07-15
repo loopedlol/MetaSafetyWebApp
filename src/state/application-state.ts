@@ -29,7 +29,9 @@ export function createApplicationState({ stressMemo = '', appVersion }: { stress
     serverRevision: 0, syncConflict: null, glassesStep: 'start', glassesReturnStep: 'hazard_decision',
     glassesAttendanceDigits: { expectedTens: 0, expectedOnes: 4, presentTens: 0, presentOnes: 0 },
     glassesProvisionalDecision: null, glassesContext: null,
-    glassesHelpOpen: false, glassesAnnouncement: '', glassesMemoFeedback: '', glassesPhotoFeedback: '', glassesReviewFeedback: ''
+    glassesSharingFeedback: '', glassesSubmissionStatus: '',
+    glassesHelpOpen: false, glassesAnnouncement: '', glassesMemoFeedback: '', glassesPhotoFeedback: '', glassesReviewFeedback: '',
+    deviceConnectionState: 'online'
   };
 }
 
