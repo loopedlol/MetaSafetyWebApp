@@ -1805,6 +1805,93 @@ html.is-normal-mode .v2-worker-check em {
   gap: var(--glasses-space-2);
 }
 
+.is-meta-display-runtime [data-focus-id].is-logically-focused {
+  color: #fff;
+  background: #d92d27;
+  border: 4px solid #5d0b08;
+  outline: 4px solid #fff;
+  outline-offset: 2px;
+  box-shadow: 0 0 0 7px #111;
+  font-weight: 950;
+}
+
+.is-meta-display-runtime [data-focus-id]:hover:not(.is-logically-focused) {
+  outline: none;
+  transform: none;
+}
+
+.pairing-code-preview,
+.pairing-code-value,
+.supervisor-pairing-code {
+  font-variant-numeric: tabular-nums;
+  letter-spacing: .14em;
+  font-weight: 900;
+}
+
+.pairing-code-value {
+  margin: .2em 0;
+  font-size: clamp(4rem, 18vw, 7rem);
+  text-align: center;
+}
+
+.pairing-code-preview {
+  margin: 0;
+  font-size: 36px;
+  text-align: center;
+}
+
+.pairing-digit-groups {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr)) 18px repeat(3, minmax(0, 1fr));
+  align-items: stretch;
+  gap: 6px;
+  width: 100%;
+}
+
+.pairing-group-gap {
+  grid-column: 4;
+}
+
+.pairing-digit {
+  min-width: 0;
+  min-height: 118px;
+  display: grid;
+  place-items: center;
+  padding: 6px 2px;
+  border: 2px solid #7a828b;
+  border-radius: 14px;
+  background: #fff;
+  color: #08131d;
+  font: inherit;
+  cursor: pointer;
+}
+
+.pairing-digit strong {
+  font-size: 44px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+
+.pairing-digit span {
+  color: #4b535c;
+  font-size: 16px;
+  line-height: 1;
+}
+
+.supervisor-pairing-code {
+  padding: .5em;
+  border: 3px solid currentColor;
+  font-size: clamp(2.5rem, 8vw, 5rem);
+  text-align: center;
+}
+
+.is-meta-display-runtime .glasses-actions {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  overflow-y: auto;
+}
+
 .glasses-actions .v2-key-button {
   width: 100%;
   min-width: 0;
@@ -1872,6 +1959,181 @@ html.is-normal-mode .v2-worker-check em {
 .glasses-sync.is-conflict::before,
 .glasses-sync.is-failed::before {
   content: '!';
+}
+
+/* Meta Display uses the full 600×600 surface for the current task. */
+html.is-meta-display-runtime body {
+  background: #fff;
+}
+
+html.is-meta-display-runtime .hud-shell {
+  width: min(100vw, var(--hud-size));
+  height: min(100vh, var(--hud-size));
+  padding: 6px;
+  border: 0;
+  border-radius: 0;
+  background: #fff;
+  box-shadow: none;
+}
+
+.is-meta-display-runtime .glasses-screen {
+  --glasses-space-2: 6px;
+  --glasses-space-3: 8px;
+  --glasses-space-5: 12px;
+  --glasses-action-height: 68px;
+  grid-template-rows: minmax(0, 1fr) auto auto;
+  gap: 6px;
+  background: #fff;
+}
+
+.is-meta-display-runtime .glasses-card {
+  gap: 8px;
+  padding: 12px 14px;
+  border: 0;
+  border-radius: 0;
+  background: #fff;
+  box-shadow: none;
+}
+
+.is-meta-display-runtime .glasses-card h1 {
+  font-size: 39px;
+  line-height: 1.04;
+}
+
+.is-meta-display-runtime .glasses-kicker {
+  font-size: 12px;
+}
+
+.is-meta-display-runtime .glasses-muted,
+.is-meta-display-runtime .glasses-large,
+.is-meta-display-runtime .glasses-card > p:not([class]) {
+  font-size: 16px;
+  line-height: 1.2;
+}
+
+.is-meta-display-runtime .glasses-actions {
+  gap: 7px;
+  overflow-y: auto;
+  padding: 4px 7px;
+}
+
+.is-meta-display-runtime .glasses-actions .v2-key-button {
+  width: 100%;
+  min-height: 68px;
+  border: 2px solid #9aa1a9;
+  border-radius: 12px;
+  background: #fff;
+  color: #171b20;
+  box-shadow: none;
+  font-size: 18px;
+}
+
+.is-meta-display-runtime .glasses-actions .v2-key-button:only-child {
+  width: 100%;
+  max-width: none;
+}
+
+.is-meta-display-runtime .glasses-actions .v2-key-button.is-logically-focused {
+  color: #fff;
+  background: #d92d27;
+  border: 4px solid #5d0b08;
+  outline: 4px solid #fff;
+  box-shadow: 0 0 0 7px #111;
+}
+
+.is-meta-display-runtime .glasses-actions .v2-key-button:disabled {
+  border-color: #c7ccd3;
+  background: #f1f2f3;
+  color: #686f78;
+}
+
+.is-meta-display-runtime .glasses-meta-status {
+  min-width: 0;
+  overflow: hidden;
+  padding: 1px 8px 0;
+  color: #59616a;
+  font-size: 10px;
+  font-weight: 850;
+  line-height: 1.1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.is-meta-display-runtime .glasses-screen.is-start .glasses-card {
+  align-content: center;
+  text-align: center;
+}
+
+.is-meta-display-runtime .glasses-screen.is-start .glasses-card h1 {
+  font-size: 44px;
+}
+
+.is-meta-display-runtime .glasses-screen.is-start .glasses-actions .v2-key-button {
+  min-height: 82px;
+  font-size: 23px;
+}
+
+.meta-attendance-editors {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+}
+
+.meta-attendance-editors section {
+  min-width: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.meta-attendance-editors h2 {
+  margin: 0;
+  font-size: 17px;
+  line-height: 1.1;
+  text-align: center;
+}
+
+.meta-attendance-editors section > div {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px;
+}
+
+.attendance-digit {
+  min-width: 0;
+  min-height: 104px;
+  display: grid;
+  place-items: center;
+  padding: 5px 2px;
+  border: 2px solid #9299a1;
+  border-radius: 12px;
+  background: #fff;
+  color: #171b20;
+  font: inherit;
+}
+
+.attendance-digit strong {
+  font-size: 42px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+
+.attendance-digit span {
+  color: currentColor;
+  font-size: 14px;
+  line-height: 1;
+}
+
+.is-meta-display-runtime .attendance-total {
+  display: none;
+}
+
+.is-meta-display-runtime .is-photo_evidence .glasses-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.is-meta-display-runtime .is-photo_evidence .glasses-actions .v2-key-button:last-child {
+  grid-column: 1 / -1;
 }
 
 .glasses-help-overlay {
@@ -2102,3 +2364,7 @@ html.is-normal-mode .v2-worker-check em {
     font-size: 15px;
   }
 }
+.evidence-requests-panel { margin-top: 1rem; }
+.evidence-request-row { display: grid; gap: .75rem; margin-top: .75rem; padding: 1rem; }
+.evidence-request-row p { margin: .25rem 0; }
+.evidence-request-preview img { display: block; width: min(240px, 100%); max-height: 180px; object-fit: contain; margin-bottom: .5rem; border-radius: .5rem; }

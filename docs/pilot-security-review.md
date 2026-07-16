@@ -1,5 +1,11 @@
 # Pilot Security Review
 
+## Glasses pairing boundary
+
+The Meta Display runtime uses a distinct HttpOnly, SameSite=Lax cookie with configurable short expiry. Its opaque ID resolves to a revocable database record scoped to one owned site or TBM. Session routes enforce that scope on reads, lists, reports, and writes. Account, upload, AI, pairing-creation, and administrative routes continue to require the normal supervisor cookie. Exchange failures are generic and rate-limited; code digests and audit metadata never contain the plaintext code.
+
+Remaining physical-device risks: cookie persistence and IndexedDB durability depend on the Meta Web App runtime; focus contrast and D-pad ergonomics require real-glasses testing; process-local client rate limiting resets on restart; there is no remote wipe. These are pilot limitations, not certification or production guarantees.
+
 Scope: HTTP/browser boundary, local auth/cookies, proxy/HTTPS/CORS/CSRF, validation, private uploads, SQLite lifecycle, retention/deletion, logs/errors, configuration, scanning, backup/restore, and product claims.
 
 Implemented controls are documented in `configuration.md`, `pilot-operations.md`, and `../SECURITY.md`. This supports only a controlled internal prototype pilot after the manual environment checklist is completed; it does not establish production readiness, certification, or regulatory compliance.
@@ -21,14 +27,18 @@ Implemented controls are documented in `configuration.md`, `pilot-operations.md`
 | Check | Result |
 | --- | --- |
 | Syntax and strict TypeScript | Passed (`npm run syntax-check`) |
-| Node/Supertest regressions | Passed, 95/95 (`npm test`) |
-| Normal and 600×600 glasses browser workflows | Passed, 13/13 (`npm run test:browser`) |
+| Node/Supertest regressions | Passed, 124/124 (`npm test`) |
+| Normal and 600×600 glasses browser workflows | Passed, 18/18 (`npm run test:browser`) |
 | Production frontend build | Passed (`npm run build`) |
 | Registry dependency advisory scan | Passed, 0 vulnerabilities (`npm audit --audit-level=high`) |
-| High-confidence non-ignored-file secret scan | Passed, 72 files (`npm run security:secrets`) |
-| Header/CSP, request-ID, safe-log, CSRF, cookie/HSTS/CORS, bounded-input, sanitized-error, graceful-shutdown, retention, and account-deactivation checks | Passed in focused automated regressions |
+| High-confidence non-ignored-file secret scan | Passed, 82 files (`npm run security:secrets`) |
+| Header/CSP, request-ID, safe-log, CSRF, cookie/HSTS/CORS, bounded-input, sanitized-error, graceful-shutdown, retention, account-deactivation, and evidence-request authorization/lifecycle checks | Passed in focused automated regressions |
 | TLS redirect/certificate, trusted-proxy network isolation, backup destination controls, restore drill, and real pilot-device disposal | Not executable in the repository; must be completed in the target pilot environment using `pilot-operations.md` |
 
 Repository-executable manual-checklist items were reviewed against the tests and built assets: the report uses an external self-hosted print script under the CSP, API responses omit permissive CORS headers, logs contain only bounded route metadata, and browser workflows complete with isolated test storage. Target TLS/proxy routing, backup controls/restore, and device disposal remain unchecked until an actual pilot environment exists.
 
 No deployment was performed. Generated browser evidence remains under ignored `test-artifacts/`.
+## Photo-handoff findings
+
+- **Medium:** stored originals may retain EXIF metadata; metadata is not logged, but stripping is not implemented.
+- **Low:** glasses status uses explicit refresh, intentionally avoiding idle polling.

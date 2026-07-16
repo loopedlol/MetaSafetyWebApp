@@ -23,14 +23,20 @@ export function createApplicationState({ stressMemo = '', appVersion }: { stress
       { id: crypto.randomUUID(), name: '정도윤', role: '작업반장', present: false, acknowledgment: createEmptyAcknowledgment() }
     ],
     responses: [], nearMisses: [], savedSessions: [], savedSessionsStatus: 'idle', saveFeedback: '',
+    pairingScopes: { sites: [], sessions: [] }, supervisorPairing: null, pairingFeedback: '',
+    nativeDevices: [], nativeDevicesStatus: 'idle', nativeDeviceRegistration: null, nativeDeviceFeedback: '',
+    evidenceRequests: [], evidenceRequestsStatus: 'idle', evidenceRequestFeedback: '', evidenceFulfillment: null,
     isSavingSession: false, manualEntryFeedback: '', manualAiSuggestion: null, manualAiDecision: null,
     manualUploadedEvidence: [],
     returnPhase: 'checklist', draftStatus: '', pendingDraft: null, offlineStore: null, syncEngine: null,
     serverRevision: 0, syncConflict: null, glassesStep: 'start', glassesReturnStep: 'hazard_decision',
     glassesAttendanceDigits: { expectedTens: 0, expectedOnes: 4, presentTens: 0, presentOnes: 0 },
     glassesProvisionalDecision: null, glassesContext: null,
+    glassesEvidenceRequest: null, nativeDeviceAvailable: null,
     glassesSharingFeedback: '', glassesSubmissionStatus: '',
     glassesHelpOpen: false, glassesAnnouncement: '', glassesMemoFeedback: '', glassesPhotoFeedback: '', glassesReviewFeedback: '',
+    glassesFocusId: '', glassesFocusView: '',
+    glassesPairing: { stage: 'intro', digits: [0, 0, 0, 0, 0, 0], digitIndex: 0, focusId: 'pairing-enter', feedback: '', submitting: false, scope: null },
     deviceConnectionState: 'online'
   };
 }

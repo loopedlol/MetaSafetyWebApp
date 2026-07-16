@@ -49,6 +49,7 @@ import { createTranslator } from '../i18n/index.ts';
 import { persistLanguage, restoreLanguage, updateDocumentLanguage } from '../i18n/preference.ts';
 import { localizeFinalizationBlocker } from '../i18n/workflow.ts';
 import { DEVICE_ACTION, DEVICE_RUNTIME, createDeviceAdapter, resolveDeviceRuntime } from '../device/device-adapter.ts';
+import { EVIDENCE_PROVIDER } from '../domain/evidence-acquisition.ts';
 import {
   createDiagnosticsSnapshot,
   exitDiagnosticsUrl,
@@ -91,6 +92,7 @@ let lastNormalViewKey = '';
 let lastNormalAnnouncement = '';
 let lastNormalDraftStatus = '';
 let pendingFocusSelector = '';
+let pairingCountdownTimer = 0;
 
 // ---------------------------------------------------------------------------
 // App state
@@ -119,9 +121,14 @@ async function apiFetch(url, options = {}) {
   const response = await apiRequest(url, options);
   if (response.status === 401) {
     state.currentUser = null;
-    state.authMode = 'login';
-    state.authFeedback = t('auth.loginRequired');
-    state.phase = 'auth';
+    if (isMetaDisplayRuntime) {
+      state.phase = 'glasses-pairing';
+      state.glassesPairing = { ...state.glassesPairing, stage: 'intro', focusId: 'pairing-enter', feedback: '안경 연결이 만료되었거나 해제되었습니다.' };
+    } else {
+      state.authMode = 'login';
+      state.authFeedback = t('auth.loginRequired');
+      state.phase = 'auth';
+    }
     render();
   }
 
@@ -321,12 +328,23 @@ async function checkAuth() {
   render();
 
   try {
-    const response = await apiRequest('/api/auth/me', { cache: 'no-store' });
+    const response = await apiRequest(isMetaDisplayRuntime ? '/api/glasses/session' : '/api/auth/me', { cache: 'no-store' });
     const payload = await response.json().catch(() => ({}));
+
+    if (isMetaDisplayRuntime) {
+      if (!response.ok || !payload.scope) {
+        state.currentUser = null;
+        state.phase = 'glasses-pairing';
+        render();
+        return;
+      }
+      await establishGlassesScope(payload.scope);
+      return;
+    }
 
     if (!response.ok || !validatePublicUserBoundary(payload.user)) {
       state.currentUser = null;
-      state.phase = 'auth';
+      state.phase = isMetaDisplayRuntime ? 'glasses-pairing' : 'auth';
       render();
       return;
     }
@@ -348,6 +366,49 @@ async function checkAuth() {
       render();
     }
   }
+}
+
+async function establishGlassesScope(scope) {
+  state.glassesPairing.scope = scope;
+  state.currentUser = { id: `glasses:${scope.siteId}`, name: '연결된 감독자', email: '', role: 'restricted_glasses' };
+  state.session.siteName = scope.siteName;
+  state.session.siteArea = scope.siteArea;
+  if (scope.taskName) state.session.taskName = scope.taskName;
+  await loadHazards();
+  if (scope.type === 'tbm_session' && scope.sessionId) {
+    const response = await apiRequest(`/api/sessions/${encodeURIComponent(scope.sessionId)}`, { cache: 'no-store' });
+    const session = await response.json().catch(() => null);
+    if (response.ok && session?.sessionId) {
+      state.session = {
+        ...state.session, sessionId: session.sessionId, createdAt: session.createdAt,
+        siteName: session.site?.siteName ?? state.session.siteName, siteArea: session.site?.siteArea ?? state.session.siteArea,
+        gps: session.site?.gps ?? state.session.gps, taskName: session.work?.taskName ?? state.session.taskName,
+        workType: session.work?.workType ?? state.session.workType,
+        plannedWorkDescription: session.work?.plannedWorkDescription ?? state.session.plannedWorkDescription,
+        supervisorName: session.supervisor?.name ?? state.session.supervisorName,
+        supervisorRole: session.supervisor?.role ?? state.session.supervisorRole,
+        attendanceSummary: normalizeAttendanceSummary(session.attendanceSummary),
+        sharing: normalizeSharing(session.sharing)
+      };
+      state.workers = (session.workers ?? []).map(normalizeWorker);
+      state.responses = (session.hazards ?? []).map(normalizeHazard);
+      state.hazards = state.responses.map((item) => ({
+        id: item.id, name: item.title, category: item.category, location: item.location,
+        riskLevel: item.riskLevel, risk: item.riskDescription, action: item.recommendedAction,
+        evidencePhotos: item.evidencePhotos
+      }));
+      state.nearMisses = session.nearMisses ?? [];
+      state.serverRevision = Number(session.revision) || 0;
+      state.phase = 'start';
+      state.glassesStep = GLASSES_STEP.START;
+    }
+  }
+  if (isMetaDisplayRuntime) {
+    const availability = await apiRequest('/api/glasses/native-device-availability', { cache: 'no-store' }).catch(() => null);
+    const payload = availability ? await availability.json().catch(() => ({})) : {};
+    state.nativeDeviceAvailable = Boolean(availability?.ok && payload.available);
+  }
+  render();
 }
 
 async function submitAuth(form) {
@@ -789,6 +850,10 @@ async function loadHazards() {
   }
 
   render();
+  if (!isGlassesMode && state.currentUser && navigator.onLine) {
+    void loadEvidenceRequests();
+    void loadNativeDevices();
+  }
 }
 
 function makeStressHazards(hazards) {
@@ -812,6 +877,112 @@ function makeStressHazards(hazards) {
 // ---------------------------------------------------------------------------
 // Normal dashboard actions
 // ---------------------------------------------------------------------------
+
+async function loadEvidenceRequests() {
+  state.evidenceRequestsStatus = 'loading';
+  try {
+    const response = await apiFetch('/api/evidence-requests?status=pending', { cache: 'no-store' });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || 'Could not load evidence requests.');
+    state.evidenceRequests = payload.requests ?? [];
+    state.evidenceRequestsStatus = 'ready';
+  } catch (error) {
+    state.evidenceRequestsStatus = 'error';
+    state.evidenceRequestFeedback = navigator.onLine ? getApiErrorMessage(error, 'Could not load evidence requests.') : 'Offline: requests cannot be refreshed.';
+  }
+  if (state.phase === 'start') render();
+}
+
+async function loadNativeDevices() {
+  state.nativeDevicesStatus = 'loading';
+  try {
+    const response = await apiFetch('/api/native-devices', { cache: 'no-store' });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || 'Could not load native devices.');
+    state.nativeDevices = payload.devices ?? [];
+    state.nativeDevicesStatus = 'ready';
+    state.nativeDeviceFeedback = '';
+  } catch (error) {
+    state.nativeDevicesStatus = 'error';
+    state.nativeDeviceFeedback = navigator.onLine ? getApiErrorMessage(error, 'Could not load native devices.') : 'Offline: native devices cannot be managed.';
+  }
+  if (state.phase === 'start') render();
+}
+
+async function createNativeDeviceRegistration(form) {
+  const name = String(new FormData(form).get('nativeDeviceName') ?? '').trim();
+  const response = await apiFetch('/api/native-devices/registrations', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name })
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) state.nativeDeviceFeedback = payload.error ?? 'Device registration failed.';
+  else {
+    state.nativeDeviceRegistration = payload;
+    state.nativeDeviceFeedback = 'Enter this one-time code in the Android companion app.';
+  }
+  render();
+}
+
+async function revokeNativeDevice(deviceId) {
+  const response = await apiFetch(`/api/native-devices/${encodeURIComponent(deviceId)}`, { method: 'DELETE' });
+  if (!response.ok) state.nativeDeviceFeedback = (await response.json().catch(() => ({}))).error ?? 'Device revocation failed.';
+  else {
+    state.nativeDeviceRegistration = null;
+    state.nativeDeviceFeedback = 'Native device revoked.';
+    await loadNativeDevices();
+  }
+  render();
+}
+
+function clearEvidenceSelection() {
+  if (state.evidenceFulfillment?.previewUrl) URL.revokeObjectURL(state.evidenceFulfillment.previewUrl);
+  state.evidenceFulfillment = null;
+}
+
+function selectEvidenceFile(requestId, file, provider) {
+  clearEvidenceSelection();
+  const allowed = ['image/jpeg', 'image/png', 'image/webp'];
+  if (!file || !allowed.includes(file.type) || file.size > 5 * 1024 * 1024) {
+    state.evidenceRequestFeedback = 'Choose a JPEG, PNG, or WebP image no larger than 5 MB.';
+  } else {
+    state.evidenceFulfillment = { requestId, file, provider, previewUrl: URL.createObjectURL(file), uploaded: null, submitting: false };
+    state.evidenceRequestFeedback = '';
+  }
+  render();
+}
+
+async function fulfillEvidenceRequest() {
+  const selected = state.evidenceFulfillment;
+  if (!selected || selected.submitting) return;
+  selected.submitting = true; state.evidenceRequestFeedback = 'Uploading privately…'; render();
+  try {
+    if (!selected.uploaded) {
+      const form = new FormData(); form.append('photos', selected.file);
+      const uploadResponse = await apiFetch('/api/uploads', { method: 'POST', headers: { 'Idempotency-Key': crypto.randomUUID() }, body: form });
+      const uploads = await uploadResponse.json();
+      if (!uploadResponse.ok) throw new Error(uploads.error || 'Private upload failed.');
+      selected.uploaded = uploads[0];
+    }
+    const completeResponse = await apiFetch(`/api/evidence-requests/${encodeURIComponent(selected.requestId)}/complete`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ uploadId: selected.uploaded.uploadId ?? selected.uploaded.id, provider: selected.provider })
+    });
+    const payload = await completeResponse.json();
+    if (!completeResponse.ok) throw new Error(payload.error || 'Request completion failed.');
+    clearEvidenceSelection(); state.evidenceRequestFeedback = 'Photo uploaded. The glasses must check and explicitly attach it.';
+    await loadEvidenceRequests();
+  } catch (error) {
+    selected.submitting = false;
+    state.evidenceRequestFeedback = navigator.onLine ? getApiErrorMessage(error, 'Upload failed. Try again.') : 'Offline: no upload or completion was reported.';
+    render();
+  }
+}
+
+async function cancelSupervisorEvidenceRequest(requestId) {
+  const response = await apiFetch(`/api/evidence-requests/${encodeURIComponent(requestId)}`, { method: 'DELETE' });
+  if (!response.ok && response.status !== 204) state.evidenceRequestFeedback = (await response.json()).error || 'Cancellation failed.';
+  clearEvidenceSelection(); await loadEvidenceRequests();
+}
 
 function markRecordDirty() {
   state.session.finalizedAt = null;
@@ -1007,6 +1178,112 @@ async function captureGlassesPhoto() {
   render();
 }
 
+async function createPhoneEvidenceRequest() {
+  const response = currentResponse();
+  if (!response) return;
+  state.glassesPhotoFeedback = '';
+  try {
+    const result = await apiFetch('/api/glasses/evidence-requests', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionId: state.session.sessionId, hazardId: response.id })
+    });
+    const payload = await result.json();
+    if (!result.ok) throw new Error(payload.error || 'Evidence request failed.');
+    state.glassesEvidenceRequest = payload;
+    state.glassesStep = GLASSES_STEP.EVIDENCE_HANDOFF;
+  } catch (error) {
+    state.glassesPhotoFeedback = navigator.onLine ? getApiErrorMessage(error, 'Phone request failed.') : 'Offline: the phone request was not created.';
+  }
+  render();
+}
+
+async function createNativeEvidenceRequest() {
+  const response = currentResponse();
+  if (!response || !state.nativeDeviceAvailable) return;
+  try {
+    const result = await apiFetch('/api/glasses/evidence-requests', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionId: state.session.sessionId, hazardId: response.id, provider: EVIDENCE_PROVIDER.NATIVE_DAT_CAMERA }) });
+    const payload = await result.json();
+    if (!result.ok) throw new Error(payload.error || 'Native capture request failed.');
+    state.glassesEvidenceRequest = payload;
+    state.glassesStep = GLASSES_STEP.NATIVE_CAPTURE_PREPARE;
+    state.glassesPhotoFeedback = '';
+  } catch (error) { state.glassesPhotoFeedback = navigator.onLine ? getApiErrorMessage(error, 'Native capture request failed.') : 'Offline: no camera request was created.'; }
+  render();
+}
+
+async function confirmNativeCapture() {
+  const item = state.glassesEvidenceRequest;
+  if (!item?.id) return;
+  try {
+    const result = await apiFetch(`/api/glasses/evidence-requests/${encodeURIComponent(item.id)}/ready`, { method: 'POST' });
+    const payload = await result.json();
+    if (!result.ok) throw new Error(payload.error || 'Capture confirmation failed.');
+    state.glassesEvidenceRequest = payload;
+    state.glassesStep = GLASSES_STEP.EVIDENCE_HANDOFF;
+    state.glassesPhotoFeedback = '';
+  } catch (error) { state.glassesPhotoFeedback = navigator.onLine ? getApiErrorMessage(error, 'Capture confirmation failed.') : 'Offline: capture was not confirmed.'; }
+  render();
+}
+
+async function retakeNativeEvidence() {
+  const item = state.glassesEvidenceRequest;
+  if (!item?.id || item.attachedAt) return;
+  try {
+    const result = await apiFetch(`/api/glasses/evidence-requests/${encodeURIComponent(item.id)}/retake`, { method: 'POST' });
+    const payload = await result.json();
+    if (!result.ok) throw new Error(payload.error || 'Retake failed.');
+    state.glassesEvidenceRequest = payload;
+    state.glassesStep = GLASSES_STEP.NATIVE_CAPTURE_PREPARE;
+    state.glassesPhotoFeedback = '';
+  } catch (error) { state.glassesPhotoFeedback = getApiErrorMessage(error, 'Retake failed.'); }
+  render();
+}
+
+async function refreshPhoneEvidenceRequest() {
+  if (!state.glassesEvidenceRequest?.id) return;
+  try {
+    const result = await apiFetch(`/api/glasses/evidence-requests/${encodeURIComponent(state.glassesEvidenceRequest.id)}`);
+    const payload = await result.json();
+    if (!result.ok) throw new Error(payload.error || 'Status check failed.');
+    state.glassesEvidenceRequest = payload;
+    state.glassesPhotoFeedback = '';
+  } catch (error) {
+    state.glassesPhotoFeedback = navigator.onLine ? getApiErrorMessage(error, 'Status check failed.') : 'Offline: completion could not be checked.';
+  }
+  render();
+}
+
+async function cancelPhoneEvidenceRequest() {
+  if (!state.glassesEvidenceRequest?.id) return;
+  try {
+    const result = await apiFetch(`/api/glasses/evidence-requests/${encodeURIComponent(state.glassesEvidenceRequest.id)}`, { method: 'DELETE' });
+    if (!result.ok && result.status !== 204) throw new Error((await result.json()).error || 'Cancellation failed.');
+    state.glassesEvidenceRequest = null;
+    state.glassesStep = GLASSES_STEP.PHOTO_EVIDENCE;
+  } catch (error) { state.glassesPhotoFeedback = getApiErrorMessage(error, 'Cancellation failed.'); }
+  render();
+}
+
+async function attachPhoneEvidenceRequest() {
+  const requestItem = state.glassesEvidenceRequest;
+  const response = currentResponse();
+  if (!requestItem?.id || !response) return;
+  try {
+    const result = await apiFetch(`/api/glasses/evidence-requests/${encodeURIComponent(requestItem.id)}/attach`, { method: 'POST' });
+    const payload = await result.json();
+    if (!result.ok) throw new Error(payload.error || 'Attachment failed.');
+    const evidence = payload.evidence;
+    if (evidence && !(response.evidencePhotos ?? []).some((item) => item.uploadId === evidence.uploadId)) {
+      response.evidencePhotos = [...(response.evidencePhotos ?? []), evidence];
+    }
+    state.glassesEvidenceRequest = payload;
+    state.glassesStep = GLASSES_STEP.HAZARD_CONFIRMATION;
+    saveLocalDraft();
+  } catch (error) { state.glassesPhotoFeedback = getApiErrorMessage(error, 'Attachment failed.'); }
+  render();
+}
+
 async function captureGlassesMemo() {
   const result = await deviceAdapter.captureMemo();
   if (result.status !== 'captured') {
@@ -1081,6 +1358,39 @@ async function handleGlassesAction(action) {
   if (action === 'context-reject') {
     state.glassesStep = GLASSES_STEP.START; saveLocalDraft(); render(); return;
   }
+  if (action.startsWith('attendance-cycle-')) {
+    const key = action.slice('attendance-cycle-'.length);
+    if (key in state.glassesAttendanceDigits) state.glassesAttendanceDigits[key] = (state.glassesAttendanceDigits[key] + 1) % 10;
+    saveLocalDraft(); render(); return;
+  }
+  if (action.startsWith('corrective-cycle-')) {
+    const field = action.slice('corrective-cycle-'.length);
+    const values = {
+      immediateResponseCategory: Object.values(IMMEDIATE_RESPONSE_CATEGORY),
+      responsibleParty: Object.values(RESPONSIBLE_PARTY),
+      workStatus: [WORK_STATUS.STOPPED, WORK_STATUS.PERMITTED_WITH_CONTROLS],
+      duePeriod: Object.values(DUE_PERIOD)
+    }[field] ?? [];
+    const current = normalizeCorrectiveAction(currentResponse()?.correctiveAction, HAZARD_STATUS.ACTION_REQUIRED)[field];
+    const value = values[(values.indexOf(current) + 1) % values.length];
+    updateCorrectiveAction(field, value);
+    if (field === 'immediateResponseCategory') updateCorrectiveAction('immediateControl', value);
+    if (field === 'responsibleParty') updateCorrectiveAction('assignedTo', value);
+    if (field === 'duePeriod') updateCorrectiveAction('dueAt', duePeriodToDueAt(value));
+    saveLocalDraft(); render(); return;
+  }
+  if (action === 'sharing-toggle') {
+    const sharing = normalizeSharing(state.session.sharing);
+    state.session.sharing = { ...sharing, status: sharing.status === SHARING_STATUS.SHARED ? SHARING_STATUS.NOT_RECORDED : SHARING_STATUS.SHARED, recipients: sharing.status === SHARING_STATUS.SHARED ? '' : 'All expected workers' };
+    saveLocalDraft(); render(); return;
+  }
+  if (action === 'sharing-cycle-method' || action === 'sharing-cycle-proof') {
+    const key = action === 'sharing-cycle-method' ? 'method' : 'proofType';
+    const values = action === 'sharing-cycle-method' ? Object.values(SHARING_METHOD) : Object.values(SHARING_PROOF_TYPE);
+    const sharing = normalizeSharing(state.session.sharing);
+    updateSharing(key, values[(values.indexOf(sharing[key]) + 1) % values.length]);
+    saveLocalDraft(); render(); return;
+  }
   if (action === 'attendance-continue') {
     continueGlassesFromWorkers();
     return;
@@ -1093,6 +1403,13 @@ async function handleGlassesAction(action) {
   if (action === 'evidence-continue') {
     state.glassesStep = GLASSES_STEP.HAZARD_CONFIRMATION; saveLocalDraft(); render(); return;
   }
+  if (action === 'phone-evidence-start') { await createPhoneEvidenceRequest(); return; }
+  if (action === 'native-evidence-start') { await createNativeEvidenceRequest(); return; }
+  if (action === 'native-capture-confirm') { await confirmNativeCapture(); return; }
+  if (action === 'native-evidence-retake') { await retakeNativeEvidence(); return; }
+  if (action === 'phone-evidence-check') { await refreshPhoneEvidenceRequest(); return; }
+  if (action === 'phone-evidence-cancel') { await cancelPhoneEvidenceRequest(); return; }
+  if (action === 'phone-evidence-attach') { await attachPhoneEvidenceRequest(); return; }
 
   if (action === 'controlled') {
     if (state.glassesStep !== GLASSES_STEP.HAZARD_DECISION) return;
@@ -1161,6 +1478,8 @@ async function handleGlassesAction(action) {
       state.glassesStep = GLASSES_STEP.ATTENDANCE;
     } else if (state.glassesStep === GLASSES_STEP.CORRECTIVE_ACTION) state.glassesStep = GLASSES_STEP.HAZARD_DECISION;
     else if (state.glassesStep === GLASSES_STEP.PHOTO_EVIDENCE) state.glassesStep = state.glassesProvisionalDecision === HAZARD_STATUS.ACTION_REQUIRED ? GLASSES_STEP.CORRECTIVE_ACTION : GLASSES_STEP.HAZARD_DECISION;
+    else if (state.glassesStep === GLASSES_STEP.NATIVE_CAPTURE_PREPARE) state.glassesStep = GLASSES_STEP.PHOTO_EVIDENCE;
+    else if (state.glassesStep === GLASSES_STEP.EVIDENCE_HANDOFF) state.glassesStep = GLASSES_STEP.PHOTO_EVIDENCE;
     else if (state.glassesStep === GLASSES_STEP.HAZARD_CONFIRMATION) state.glassesStep = GLASSES_STEP.PHOTO_EVIDENCE;
     else if (state.glassesStep === GLASSES_STEP.HAZARD_SUMMARY) { state.phase = 'checklist'; state.index = Math.max(0, state.responses.length - 1); state.glassesStep = GLASSES_STEP.HAZARD_CONFIRMATION; state.glassesProvisionalDecision = currentResponse().status; }
     else if (state.glassesStep === GLASSES_STEP.SHARING_RECORD) state.glassesStep = GLASSES_STEP.HAZARD_SUMMARY;
@@ -1866,6 +2185,55 @@ function closeSavedSessions() {
   render();
 }
 
+async function openPairGlasses() {
+  state.phase = 'pair-glasses';
+  state.pairingFeedback = '';
+  render();
+  try {
+    const response = await apiFetch('/api/glasses-pairings/scopes', { cache: 'no-store' });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.error ?? 'Pairing scopes could not be loaded.');
+    state.pairingScopes = payload;
+  } catch (error) {
+    state.pairingFeedback = getApiErrorMessage(error, 'Pairing scopes could not be loaded.');
+  }
+  render();
+}
+
+async function createSupervisorPairing(form) {
+  const [scopeType, scopeId] = String(new FormData(form).get('scope') ?? '').split(':');
+  const response = await apiFetch('/api/glasses-pairings', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ scopeType, scopeId })
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) state.pairingFeedback = payload.error ?? 'Pairing code creation failed.';
+  else { state.supervisorPairing = { ...payload.pairing, code: payload.code, groupedCode: payload.groupedCode }; state.pairingFeedback = ''; }
+  render();
+}
+
+async function refreshSupervisorPairing() {
+  if (!state.supervisorPairing?.id) return;
+  const response = await apiFetch(`/api/glasses-pairings/${encodeURIComponent(state.supervisorPairing.id)}`, { cache: 'no-store' });
+  const payload = await response.json().catch(() => ({}));
+  if (response.ok) {
+    state.supervisorPairing = { ...state.supervisorPairing, ...payload.pairing };
+    if (payload.pairing.status !== 'pending') {
+      delete state.supervisorPairing.code;
+      delete state.supervisorPairing.groupedCode;
+    }
+  }
+  render();
+}
+
+async function endSupervisorPairing(revoke = false) {
+  if (!state.supervisorPairing?.id) return;
+  const suffix = revoke ? '/revoke' : '';
+  const response = await apiFetch(`/api/glasses-pairings/${encodeURIComponent(state.supervisorPairing.id)}${suffix}`, { method: revoke ? 'POST' : 'DELETE' });
+  if (response.ok) await refreshSupervisorPairing();
+  else state.pairingFeedback = (await response.json().catch(() => ({}))).error ?? 'Pairing update failed.';
+  render();
+}
+
 function openSessionReport(sessionId) {
   if (!sessionId) return;
   window.open(`/api/sessions/${encodeURIComponent(sessionId)}/report?lang=${locale}`, '_blank', 'noopener');
@@ -2113,6 +2481,39 @@ function renderDraftRestore() {
   bindButtons();
 }
 
+function renderEvidenceRequestPanel() {
+  const selected = state.evidenceFulfillment;
+  const rows = state.evidenceRequests.map((item) => `<article class="v2-card evidence-request-row" data-evidence-request="${escapeHtml(item.id)}">
+    <div><strong>${escapeHtml(item.hazard?.title ?? '')}</strong><p>${escapeHtml(item.hazard?.location ?? '')} · ${escapeHtml(item.tbm?.siteName ?? '')} / ${escapeHtml(item.tbm?.taskName ?? '')}</p><small>Expires ${escapeHtml(formatDateTime(new Date(item.expiresAt)))}</small></div>
+    ${selected?.requestId === item.id ? `<div class="evidence-request-preview"><img src="${escapeHtml(selected.previewUrl)}" alt="Local evidence preview" /><p>${escapeHtml(selected.file.type)} · ${Math.ceil(selected.file.size / 1024)} KB</p>
+      <button class="focusable v2-key-button v2-key-primary" data-action="confirm-evidence-upload" ${selected.submitting ? 'disabled' : ''}>Confirm private upload</button>
+      <button class="focusable v2-key-button" data-action="replace-evidence-camera" data-request="${escapeHtml(item.id)}">Replace</button>
+      <button class="focusable v2-key-button" data-action="clear-evidence-selection">Cancel selection</button></div>` : `<div class="v2-action-row">
+      <button class="focusable v2-key-button" data-action="select-evidence-camera" data-request="${escapeHtml(item.id)}">Take photo</button>
+      <button class="focusable v2-key-button" data-action="select-evidence-gallery" data-request="${escapeHtml(item.id)}">Choose from gallery</button>
+      <button class="focusable v2-key-button" data-action="cancel-evidence-request" data-request="${escapeHtml(item.id)}">Cancel request</button></div>`}
+    <input class="sr-only" type="file" accept="image/jpeg,image/png,image/webp" capture="environment" data-evidence-camera="${escapeHtml(item.id)}" />
+    <input class="sr-only" type="file" accept="image/jpeg,image/png,image/webp" data-evidence-gallery="${escapeHtml(item.id)}" />
+  </article>`).join('');
+  return `<section class="v2-card evidence-requests-panel" aria-label="Glasses evidence requests"><div class="v2-section-heading v2-section-heading-row"><div><h2>Glasses evidence requests</h2><p>Phone selection stays local until you confirm the private upload.</p></div><button class="focusable v2-key-button v2-key-small" data-action="refresh-evidence-requests">${t('common.refresh')}</button></div>
+    ${state.evidenceRequestsStatus === 'loading' ? '<p>Checking…</p>' : rows || '<p>No pending requests.</p>'}
+    ${state.evidenceRequestFeedback ? `<p role="status">${escapeHtml(state.evidenceRequestFeedback)}</p>` : ''}</section>`;
+}
+
+function renderNativeDevicePanel() {
+  const registration = state.nativeDeviceRegistration;
+  const devices = state.nativeDevices.map((device) => `<article class="v2-card evidence-request-row">
+    <div><strong>${escapeHtml(device.name)}</strong><p>Last seen ${escapeHtml(formatDateTime(new Date(device.lastSeenAt)))}</p><small>${device.revokedAt ? 'Revoked' : 'Authorized for private native capture'}</small></div>
+    ${device.revokedAt ? '' : `<button class="focusable v2-key-button" data-action="revoke-native-device" data-device="${escapeHtml(device.id)}">Revoke</button>`}
+  </article>`).join('');
+  return `<section class="v2-card evidence-requests-panel" aria-label="Native camera devices">
+    <div class="v2-section-heading v2-section-heading-row"><div><h2>Native camera devices</h2><p>Registration authorizes the Android DAT companion for this account. Codes expire and work once.</p></div><button class="focusable v2-key-button v2-key-small" data-action="refresh-native-devices">${t('common.refresh')}</button></div>
+    ${registration ? `<p class="supervisor-pairing-code" aria-label="native device registration code">${escapeHtml(registration.groupedCode ?? registration.code)}</p><p>Expires ${escapeHtml(formatDateTime(new Date(registration.registration.expiresAt)))}</p>` : `<form id="native-device-form"><label class="v2-field-block"><span>Device name</span><input name="nativeDeviceName" maxlength="80" required value="Pilot Android companion" /></label><button class="focusable v2-key-button" type="submit">Create one-time device code</button></form>`}
+    ${state.nativeDevicesStatus === 'loading' ? '<p>Checking…</p>' : devices || '<p>No registered native camera devices.</p>'}
+    ${state.nativeDeviceFeedback ? `<p role="status">${escapeHtml(state.nativeDeviceFeedback)}</p>` : ''}
+  </section>`;
+}
+
 function renderStart() {
   app.innerHTML = `
     <section class="v2-screen" role="main">
@@ -2152,15 +2553,47 @@ function renderStart() {
         <section class="v2-action-row" aria-label="${t('common.actions')}">
           <button class="focusable v2-key-button v2-key-primary" data-action="start">▶ ${t('tbm.start')}</button>
           <button class="focusable v2-key-button" data-action="save-draft">${t('draft.record')}</button>
+          <button class="focusable v2-key-button" data-action="pair-glasses">${locale === 'ko' ? '안경 페어링' : 'Pair glasses'}</button>
         </section>
       </section>
+      ${renderNativeDevicePanel()}
+      ${renderEvidenceRequestPanel()}
     </section>
   `;
 
   app.querySelectorAll('input[name]').forEach((input) => {
     bindCompositionSafeInput(input, (value) => saveStartField(input.name, value));
   });
+  app.querySelectorAll('[data-evidence-camera]').forEach((input) => input.addEventListener('change', () => selectEvidenceFile(input.dataset.evidenceCamera, input.files?.[0], EVIDENCE_PROVIDER.PHONE_BROWSER_CAMERA)));
+  app.querySelectorAll('[data-evidence-gallery]').forEach((input) => input.addEventListener('change', () => selectEvidenceFile(input.dataset.evidenceGallery, input.files?.[0], EVIDENCE_PROVIDER.PHONE_BROWSER_GALLERY)));
+  app.querySelector('#native-device-form')?.addEventListener('submit', (event) => { event.preventDefault(); void createNativeDeviceRegistration(event.currentTarget); });
   bindButtons();
+}
+
+function renderPairGlasses() {
+  window.clearTimeout(pairingCountdownTimer);
+  const scopes = [
+    ...(state.pairingScopes.sessions ?? []).map((item) => ({ value: `tbm_session:${item.id}`, label: `${item.siteName} — ${item.taskName}` })),
+    ...(state.pairingScopes.sites ?? []).map((item) => ({ value: `site:${item.id}`, label: `${item.siteName}${item.siteArea ? ` — ${item.siteArea}` : ''}` }))
+  ];
+  const pairing = state.supervisorPairing;
+  const remaining = pairing ? Math.max(0, Math.ceil((new Date(pairing.expiresAt).getTime() - Date.now()) / 1000)) : 0;
+  app.innerHTML = `${v2Header(locale === 'ko' ? '안경 페어링' : 'Pair glasses')}
+    <main class="v2-main"><section class="v2-card"><h2>${locale === 'ko' ? '제한된 사이트 또는 TBM 선택' : 'Choose a restricted site or TBM'}</h2>
+    ${pairing ? `${pairing.groupedCode ? `<p class="supervisor-pairing-code" aria-label="pairing code">${escapeHtml(pairing.groupedCode)}</p>` : ''}
+      <dl><dt>${locale === 'ko' ? '상태' : 'Status'}</dt><dd>${escapeHtml(pairing.status)}</dd><dt>${locale === 'ko' ? '남은 시간' : 'Expires in'}</dt><dd>${remaining}s</dd><dt>${locale === 'ko' ? '범위' : 'Scope'}</dt><dd>${escapeHtml(`${pairing.siteName}${pairing.taskName ? ` — ${pairing.taskName}` : ''}`)}</dd></dl>
+      <div class="v2-actions"><button class="focusable v2-key-button" data-action="refresh-pairing">${t('common.refresh')}</button>${pairing.status === 'pending' ? `<button class="focusable v2-key-button" data-action="cancel-pairing">${t('common.cancel')}</button>` : ''}${pairing.status === 'paired' ? `<button class="focusable v2-key-button" data-action="revoke-pairing">${locale === 'ko' ? '연결 해제' : 'Revoke'}</button>` : ''}</div>` : `<form id="pair-glasses-form"><label class="v2-field-block"><span>${locale === 'ko' ? '허용 범위' : 'Allowed scope'}</span><select name="scope" required>${scopes.map((scope) => `<option value="${escapeHtml(scope.value)}">${escapeHtml(scope.label)}</option>`).join('')}</select></label><button class="focusable v2-key-button v2-key-primary" type="submit" ${scopes.length ? '' : 'disabled'}>${locale === 'ko' ? '일회용 코드 만들기' : 'Create one-time code'}</button></form>`}
+    ${state.pairingFeedback ? `<p role="alert">${escapeHtml(state.pairingFeedback)}</p>` : ''}</section>
+    <button class="focusable v2-key-button" data-action="close-pairing">${t('common.back')}</button></main>`;
+  app.querySelector('#pair-glasses-form')?.addEventListener('submit', (event) => { event.preventDefault(); void createSupervisorPairing(event.currentTarget); });
+  bindButtons();
+  if (pairing?.status === 'pending') {
+    pairingCountdownTimer = window.setTimeout(() => {
+      if (state.phase !== 'pair-glasses') return;
+      if (Date.now() >= new Date(pairing.expiresAt).getTime()) void refreshSupervisorPairing();
+      else renderPairGlasses();
+    }, 1000);
+  }
 }
 
 function renderParticipation() {
@@ -2374,18 +2807,35 @@ function renderManualEntry() {
 // Keep this path plain HTML/CSS/JS and one-card-at-a-time so it remains easy
 // to port to Meta Web Apps or another wearable runtime later.
 
-function renderGlassesActions(actions) {
+function ensureGlassesFocus(actions, viewKey = state.glassesStep) {
+  const available = actions.flatMap((action, index) => action.disabled ? [] : [action.id ?? `${action.action}-${index}`]);
+  if (state.glassesFocusView !== viewKey || !available.includes(state.glassesFocusId)) {
+    const preferred = actions.find((action) => action.initial && !action.disabled) ??
+      actions.find((action) => action.primary && !action.disabled) ?? actions.find((action) => !action.disabled);
+    const preferredIndex = preferred ? actions.indexOf(preferred) : -1;
+    state.glassesFocusId = preferred ? (preferred.id ?? `${preferred.action}-${preferredIndex}`) : '';
+    state.glassesFocusView = viewKey;
+  }
+  return available;
+}
+
+function renderGlassesActions(actions, viewKey = state.glassesStep) {
   if (!actions.length) return '';
+  ensureGlassesFocus(actions, viewKey);
   return `
     <section class="glasses-actions">
       ${actions
-        .map(
-          (action) => `
-            <button class="focusable v2-key-button ${action.primary ? 'v2-key-primary' : ''}" ${action.primary ? 'data-primary-action' : ''} ${action.disabled ? 'disabled' : ''} data-glasses-action="${escapeHtml(
+        .filter((action) => !action.inline)
+        .map((action, index) => {
+          const sourceIndex = actions.indexOf(action);
+          const id = action.id ?? `${action.action}-${sourceIndex}`;
+          const focused = isMetaDisplayRuntime && !action.disabled && id === state.glassesFocusId;
+          return `
+            <button class="focusable v2-key-button ${action.primary ? 'v2-key-primary' : ''} ${focused ? 'is-logically-focused' : ''}" ${action.primary ? 'data-primary-action' : ''} ${action.disabled ? 'disabled' : ''} ${action.pressed == null ? '' : `aria-pressed="${action.pressed}"`} data-focus-id="${escapeHtml(id)}" tabindex="${focused ? '0' : '-1'}" aria-current="${focused ? 'true' : 'false'}" data-glasses-action="${escapeHtml(
               action.action
             )}">${escapeHtml(action.label)}</button>
-          `
-        )
+          `;
+        })
         .join('')}
     </section>
   `;
@@ -2393,8 +2843,104 @@ function renderGlassesActions(actions) {
 
 function bindGlassesButtons() {
   app.querySelectorAll('button[data-glasses-action]').forEach((button) => {
-    button.addEventListener('click', () => handleGlassesAction(button.dataset.glassesAction));
+    button.addEventListener('click', () => state.phase === 'glasses-pairing'
+      ? handlePairingAction(button.dataset.glassesAction)
+      : handleGlassesAction(button.dataset.glassesAction));
   });
+  requestAnimationFrame(() => {
+    const focused = app.querySelector(`[data-focus-id="${CSS.escape(state.glassesFocusId)}"]`);
+    focused?.focus({ preventScroll: true });
+    focused?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  });
+}
+
+async function exchangeGlassesPairingCode() {
+  if (state.glassesPairing.submitting) return;
+  state.glassesPairing.submitting = true;
+  state.glassesPairing.feedback = '연결 중…';
+  renderGlassesPairing();
+  const code = state.glassesPairing.digits.join('');
+  try {
+    const response = await apiRequest('/api/glasses/pair', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code })
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || !payload.scope) throw new Error(payload.error ?? '코드를 확인할 수 없습니다.');
+    state.glassesPairing.submitting = false;
+    state.glassesPairing.feedback = '';
+    await establishGlassesScope(payload.scope);
+  } catch (error) {
+    state.glassesPairing.submitting = false;
+    state.glassesPairing.feedback = getApiErrorMessage(error, '코드를 확인할 수 없습니다. 새 코드를 받아 다시 시도하세요.');
+    state.glassesPairing.stage = 'confirm';
+    state.glassesPairing.focusId = 'pairing-pair';
+    renderGlassesPairing();
+  }
+}
+
+function pairingActions() {
+  const stage = state.glassesPairing.stage;
+  if (stage === 'intro') return [
+    { id: 'pairing-enter', action: 'pairing-enter', label: locale === 'ko' ? '페어링 코드 입력' : 'Enter pairing code', primary: true },
+    { id: 'pairing-language', action: 'pairing-language', label: locale === 'ko' ? '언어 선택' : 'Choose language' }
+  ];
+  if (stage === 'language') return [
+    { id: 'language-ko', action: 'language-ko', label: '한국어', primary: locale === 'ko', pressed: locale === 'ko' },
+    { id: 'language-en', action: 'language-en', label: 'English', primary: locale === 'en', pressed: locale === 'en' }
+  ];
+  if (stage === 'confirm') return [
+    { id: 'pairing-pair', action: 'pairing-submit', label: locale === 'ko' ? '연결' : 'Pair', primary: true, disabled: state.glassesPairing.submitting },
+    { id: 'pairing-edit', action: 'pairing-edit', label: locale === 'ko' ? '코드 수정' : 'Edit code' },
+    { id: 'pairing-cancel', action: 'pairing-cancel', label: locale === 'ko' ? '취소' : 'Cancel' }
+  ];
+  return [];
+}
+
+function renderGlassesPairing() {
+  const pairing = state.glassesPairing;
+  const stage = pairing.stage;
+  const actions = pairingActions();
+  state.glassesFocusId = pairing.focusId;
+  if (stage === 'digits') {
+    pairing.digitIndex = Math.max(0, Math.min(5, Number(pairing.digitIndex) || 0));
+    state.glassesFocusId = `pairing-digit-${pairing.digitIndex}`;
+    state.glassesFocusView = 'pairing:digits';
+  } else {
+    ensureGlassesFocus(actions, `pairing:${stage}`);
+  }
+  pairing.focusId = state.glassesFocusId;
+  const grouped = `${pairing.digits.slice(0, 3).join('')} ${pairing.digits.slice(3).join('')}`;
+  let body = '';
+  if (stage === 'intro') body = `<p class="glasses-kicker">${locale === 'ko' ? '보안 연결' : 'Secure connection'}</p><h1>${locale === 'ko' ? '감독자에게 페어링 코드를 요청하세요' : 'Ask the supervisor for a pairing code'}</h1><p>${locale === 'ko' ? '코드는 5분 동안 한 번만 사용할 수 있습니다.' : 'The code is single-use and expires in five minutes.'}</p>`;
+  if (stage === 'language') body = `<p class="glasses-kicker">Language</p><h1>${locale === 'ko' ? '언어 선택' : 'Choose language'}</h1><p>${locale === 'ko' ? '위/아래로 이동하고 Enter로 확인하세요.' : 'Move with Up/Down and confirm with Enter.'}</p>`;
+  if (stage === 'digits') body = `<p class="glasses-kicker">${locale === 'ko' ? '6자리 코드' : 'Six-digit code'}</p><h1 class="pairing-code-preview">${grouped}</h1>
+    <div class="pairing-digit-groups" role="group" aria-label="${locale === 'ko' ? '페어링 코드' : 'Pairing code'}">
+      ${pairing.digits.map((digit, index) => `${index === 3 ? '<span class="pairing-group-gap" aria-hidden="true"></span>' : ''}<button type="button" class="pairing-digit ${index === pairing.digitIndex ? 'is-logically-focused' : ''}" data-pairing-digit="${index}" data-focus-id="pairing-digit-${index}" tabindex="${index === pairing.digitIndex ? '0' : '-1'}" aria-current="${index === pairing.digitIndex ? 'true' : 'false'}" aria-label="${locale === 'ko' ? `${index + 1}번째 숫자: ${digit}` : `Digit ${index + 1}: ${digit}`}"><span aria-hidden="true">▲</span><strong>${digit}</strong><span aria-hidden="true">▼</span></button>`).join('')}
+    </div><p>${locale === 'ko' ? '↑/↓ 숫자 변경 · ←/→ 자리 이동 · Enter 다음 · Escape 뒤로' : '↑/↓ change digit · ←/→ move · Enter next · Escape back'}</p>`;
+  if (stage === 'confirm') body = `<p class="glasses-kicker">${locale === 'ko' ? '최종 확인' : 'Final confirmation'}</p><h1 class="pairing-code-value">${grouped}</h1><p>${locale === 'ko' ? '실수로 전송되지 않습니다. 연결을 선택하고 Enter를 누르세요.' : 'Select Pair and press Enter. The code is not submitted automatically.'}</p>${pairing.feedback ? `<p class="glasses-validation" role="alert">${escapeHtml(pairing.feedback)}</p>` : ''}`;
+  app.innerHTML = `<section class="glasses-screen pairing-screen"><main class="glasses-card">${body}</main>${renderGlassesActions(actions, `pairing:${stage}`)}</section>`;
+  pairing.focusId = state.glassesFocusId;
+  app.querySelectorAll('[data-pairing-digit]').forEach((button) => button.addEventListener('click', () => {
+    pairing.digitIndex = Number(button.dataset.pairingDigit);
+    pairing.focusId = `pairing-digit-${pairing.digitIndex}`;
+    renderGlassesPairing();
+  }));
+  bindGlassesButtons();
+  if (!isMetaDisplayRuntime) requestAnimationFrame(() => app.querySelector('[data-primary-action]')?.focus());
+}
+
+async function handlePairingAction(action) {
+  const pairing = state.glassesPairing;
+  if (action === 'pairing-enter') { pairing.stage = 'digits'; pairing.digitIndex = 0; }
+  else if (action === 'pairing-language') pairing.stage = 'language';
+  else if (action === 'language-ko' || action === 'language-en') {
+    selectLanguage(action === 'language-en' ? 'en' : 'ko');
+    pairing.stage = 'intro';
+  } else if (action === 'pairing-edit') { pairing.stage = 'digits'; pairing.digitIndex = 5; }
+  else if (action === 'pairing-cancel') { pairing.stage = 'intro'; pairing.digits = [0, 0, 0, 0, 0, 0]; pairing.digitIndex = 0; }
+  else if (action === 'pairing-submit') { await exchangeGlassesPairingCode(); return; }
+  pairing.focusId = '';
+  renderGlassesPairing();
 }
 
 function renderGlasses() {
@@ -2413,9 +2959,10 @@ function renderGlasses() {
   let actions = [];
 
   if (state.glassesStep === GLASSES_STEP.START) {
-    body = `<p class="glasses-kicker">${t(isMetaDisplayRuntime ? 'glasses.metaMode' : 'glasses.previewMode')}</p><h1>${t('tbm.start')}</h1>
-      <p class="glasses-large">${escapeHtml(state.session.siteName)}</p>`;
-    actions = [{ action: 'start', label: t('glasses.start'), primary: true }];
+    body = isMetaDisplayRuntime
+      ? `<p class="glasses-kicker">${t('glasses.metaMode')}</p><h1>${escapeHtml(state.session.siteName)}</h1><p class="glasses-muted">${escapeHtml(state.session.taskName)}</p>`
+      : `<p class="glasses-kicker">${t('glasses.previewMode')}</p><h1>${t('tbm.start')}</h1><p class="glasses-large">${escapeHtml(state.session.siteName)}</p>`;
+    actions = [{ action: 'start', label: isMetaDisplayRuntime ? t('tbm.start') : t('glasses.start'), primary: true }];
   } else if (state.glassesStep === GLASSES_STEP.CONTEXT_CONFIRMATION) {
     const observed = state.glassesContext?.observedAt ?? new Date().toISOString();
     const locationSource = state.session.gps?.latitude != null ? t('glasses.deviceLocation') : t('glasses.sessionSite');
@@ -2431,9 +2978,27 @@ function renderGlasses() {
     const editor = (kind, label) => `<fieldset class="glasses-digit-editor"><legend>${label}</legend>${['Tens','Ones'].map((part) => {
       const key = `${kind}${part}`; return `<label><span>${part === 'Tens' ? t('glasses.tens') : t('glasses.ones')}</span><select data-attendance-digit="${key}" aria-label="${label} ${part}">${Array.from({length:10},(_,i)=>`<option value="${i}" ${d[key]===i?'selected':''}>${i}</option>`).join('')}</select></label>`;
     }).join('')}</fieldset>`;
-    body = `<p class="glasses-kicker">${t('attendance.title')}</p><h1>${present} / ${expected}</h1><div class="glasses-attendance-editors">${editor('expected', t('glasses.expectedWorkers'))}${editor('present', t('glasses.workersPresent'))}</div>
-      <p class="glasses-muted">${t('glasses.countOnlyNotice')}</p>`;
-    actions = [{ action: 'attendance-continue', label: t('common.continue'), primary: true, disabled: !valid }];
+    if (isMetaDisplayRuntime) {
+      const digitKeys = ['expectedTens','expectedOnes','presentTens','presentOnes'];
+      actions = [
+        ...digitKeys.map((key, index) => ({ id: `attendance-digit-${key}`, action: `attendance-cycle-${key}`, label: key, inline: true, initial: index === 0 })),
+        { id: 'attendance-continue', action: 'attendance-continue', label: t('common.continue'), primary: true, disabled: !valid }
+      ];
+      ensureGlassesFocus(actions, state.glassesStep);
+      const digit = (key, label) => {
+        const focused = state.glassesFocusId === `attendance-digit-${key}`;
+        return `<button type="button" class="attendance-digit ${focused ? 'is-logically-focused' : ''}" data-focus-id="attendance-digit-${key}" data-glasses-action="attendance-cycle-${key}" tabindex="${focused ? '0' : '-1'}" aria-current="${focused ? 'true' : 'false'}" aria-label="${escapeHtml(label)}: ${d[key]}"><span aria-hidden="true">▲</span><strong>${d[key]}</strong><span aria-hidden="true">▼</span></button>`;
+      };
+      body = `<p class="glasses-kicker">${t('attendance.title')}</p><h1 class="attendance-total">${present} / ${expected}</h1>
+        <div class="meta-attendance-editors">
+          <section aria-label="${t('glasses.expectedWorkers')}"><h2>${t('glasses.expectedWorkers')}</h2><div>${digit('expectedTens', `${t('glasses.expectedWorkers')} ${t('glasses.tens')}`)}${digit('expectedOnes', `${t('glasses.expectedWorkers')} ${t('glasses.ones')}`)}</div></section>
+          <section aria-label="${t('glasses.workersPresent')}"><h2>${t('glasses.workersPresent')}</h2><div>${digit('presentTens', `${t('glasses.workersPresent')} ${t('glasses.tens')}`)}${digit('presentOnes', `${t('glasses.workersPresent')} ${t('glasses.ones')}`)}</div></section>
+        </div><p class="glasses-muted">${t('glasses.countOnlyNotice')}</p>`;
+    } else {
+      body = `<p class="glasses-kicker">${t('attendance.title')}</p><h1>${present} / ${expected}</h1><div class="glasses-attendance-editors">${editor('expected', t('glasses.expectedWorkers'))}${editor('present', t('glasses.workersPresent'))}</div>
+        <p class="glasses-muted">${t('glasses.countOnlyNotice')}</p>`;
+      actions = [{ action: 'attendance-continue', label: t('common.continue'), primary: true, disabled: !valid }];
+    }
   } else if (state.glassesStep === GLASSES_STEP.HAZARD_DECISION) {
     body = `<p class="glasses-kicker">${escapeHtml(getHazardProgressText())}</p>
       <h1 class="glasses-primary-title" aria-label="${escapeHtml(title.full)}">${escapeHtml(title.primary)}</h1>
@@ -2446,22 +3011,54 @@ function renderGlasses() {
   } else if (state.glassesStep === GLASSES_STEP.CORRECTIVE_ACTION) {
     const corrective = normalizeCorrectiveAction(response?.correctiveAction, HAZARD_STATUS.ACTION_REQUIRED);
     const select = (field, label, values) => `<label>${label}<select data-corrective-field="${field}"><option value="">${t('corrective.selectStatus')}</option>${values.map(([v,l])=>`<option value="${v}" ${corrective[field]===v?'selected':''}>${l}</option>`).join('')}</select></label>`;
-    body = `<p class="glasses-kicker">${t('glasses.notControlled')}</p><h1>${t('corrective.title')}</h1><div class="glasses-compact-form">
+    body = `<p class="glasses-kicker">${t('glasses.notControlled')}</p><h1>${t('corrective.title')}</h1>${isMetaDisplayRuntime ? '<p>Enter를 눌러 각 값을 변경하세요.</p>' : `<div class="glasses-compact-form">
       ${select('immediateResponseCategory',t('corrective.immediateControl'),Object.values(IMMEDIATE_RESPONSE_CATEGORY).map(v=>[v,t(`glasses.control.${v}`)]))}
       ${select('responsibleParty',t('corrective.assignedPerson'),Object.values(RESPONSIBLE_PARTY).map(v=>[v,t(`glasses.party.${v}`)]))}
       ${select('workStatus',t('corrective.workStatus'),[[WORK_STATUS.STOPPED,t('corrective.stopped')],[WORK_STATUS.PERMITTED_WITH_CONTROLS,t('corrective.permitted')]])}
       ${select('duePeriod',t('corrective.dueAt'),Object.values(DUE_PERIOD).map(v=>[v,t(`glasses.due.${v}`)]))}
-      <label>${t('corrective.verificationStatus')}<select data-corrective-field="verificationStatus"><option value="open">${t('corrective.open')}</option></select></label></div>`;
+      <label>${t('corrective.verificationStatus')}<select data-corrective-field="verificationStatus"><option value="open">${t('corrective.open')}</option></select></label></div>`}`;
     const valid = corrective.immediateResponseCategory && corrective.responsibleParty && corrective.workStatus && corrective.duePeriod;
-    actions = [{ action: 'corrective-continue', label: t('common.continue'), primary: true, disabled: !valid }];
+    actions = isMetaDisplayRuntime ? [
+      { action: 'corrective-cycle-immediateResponseCategory', label: `${t('corrective.immediateControl')}: ${corrective.immediateResponseCategory ? t(`glasses.control.${corrective.immediateResponseCategory}`) : '—'}` },
+      { action: 'corrective-cycle-responsibleParty', label: `${t('corrective.assignedPerson')}: ${corrective.responsibleParty ? t(`glasses.party.${corrective.responsibleParty}`) : '—'}` },
+      { action: 'corrective-cycle-workStatus', label: `${t('corrective.workStatus')}: ${corrective.workStatus ? t(corrective.workStatus === WORK_STATUS.STOPPED ? 'corrective.stopped' : 'corrective.permitted') : '—'}` },
+      { action: 'corrective-cycle-duePeriod', label: `${t('corrective.dueAt')}: ${corrective.duePeriod ? t(`glasses.due.${corrective.duePeriod}`) : '—'}` },
+      { action: 'corrective-continue', label: t('common.continue'), primary: true, disabled: !valid }
+    ] : [{ action: 'corrective-continue', label: t('common.continue'), primary: true, disabled: !valid }];
   } else if (state.glassesStep === GLASSES_STEP.PHOTO_EVIDENCE) {
     const photos = response?.evidencePhotos ?? [];
     body = `<p class="glasses-kicker">${t('glasses.photoEvidence')}</p><h1>${t('glasses.evidenceCount',{count:photos.length})}</h1>
       <ul class="glasses-evidence-list">${photos.map(p=>`<li>${escapeHtml(evidenceSourceLabel(p.source))}</li>`).join('') || `<li>${t('report.noPhoto')}</li>`}</ul><p class="glasses-muted">${t(isMetaDisplayRuntime ? 'glasses.metaEvidenceUnavailable' : 'glasses.previewEvidenceDisclaimer')}</p>
       ${state.glassesPhotoFeedback ? `<p class="glasses-validation" role="status">${escapeHtml(state.glassesPhotoFeedback)}</p>` : ''}`;
     actions = isMetaDisplayRuntime
-      ? [{ action: 'evidence-continue', label: t('common.continue'), primary: true }]
-      : [{ action: 'mock-photo', label: t('glasses.photoMock'), primary: true }, { action: 'evidence-continue', label: t('common.continue') }];
+      ? [{ action: 'native-evidence-start', label: locale === 'ko' ? '사진 촬영' : 'Take photo', primary: true, disabled: !state.nativeDeviceAvailable }, { action: 'evidence-continue', label: locale === 'ko' ? '사진 없이 계속' : 'Continue without photo' }]
+      : [{ action: 'mock-photo', label: t('glasses.takePhoto'), primary: true }, { action: 'upload-photo', label: t('glasses.uploadPhoto'), disabled: true }, { action: 'evidence-continue', label: t('common.continue') }];
+    if (isMetaDisplayRuntime && !state.nativeDeviceAvailable) {
+      body += `<p class="glasses-validation">${locale === 'ko' ? '등록된 Android DAT 카메라 기기가 없습니다.' : 'No registered Android DAT camera device is available.'}</p>`;
+    }
+  } else if (state.glassesStep === GLASSES_STEP.NATIVE_CAPTURE_PREPARE) {
+    body = `<p class="glasses-kicker">${locale === 'ko' ? '카메라 준비' : 'Camera preparation'}</p>
+      <h1>${locale === 'ko' ? '위험 요소를 바라보세요' : 'Look at the hazard'}</h1>
+      <p class="glasses-large">${escapeHtml(state.glassesEvidenceRequest?.hazard?.title ?? response?.title ?? '')}</p>
+      <p class="glasses-muted">${locale === 'ko' ? '확인을 누르기 전에는 촬영되지 않습니다.' : 'Nothing is captured until you confirm.'}</p>
+      ${state.glassesPhotoFeedback ? `<p class="glasses-validation" role="status">${escapeHtml(state.glassesPhotoFeedback)}</p>` : ''}`;
+    actions = [{ action: 'native-capture-confirm', label: locale === 'ko' ? '촬영 확인' : 'Confirm capture', primary: true }, { action: 'phone-evidence-cancel', label: t('common.cancel') }];
+  } else if (state.glassesStep === GLASSES_STEP.EVIDENCE_HANDOFF) {
+    const requestItem = state.glassesEvidenceRequest;
+    const nativeRequest = requestItem?.provider === EVIDENCE_PROVIDER.NATIVE_DAT_CAMERA;
+    const completed = requestItem?.status === 'completed';
+    const terminal = ['cancelled', 'expired', 'failed'].includes(requestItem?.status);
+    body = `<p class="glasses-kicker">${nativeRequest ? (locale === 'ko' ? '안경 카메라 요청' : 'Glasses camera request') : (locale === 'ko' ? '휴대전화 사진 요청' : 'Phone evidence request')}</p>
+      <h1>${completed ? (locale === 'ko' ? '사진 1장 수신됨' : 'One photo received') : terminal ? escapeHtml(requestItem.status) : nativeRequest ? (locale === 'ko' ? '카메라 대기 중' : 'Waiting for camera') : (locale === 'ko' ? '휴대전화 대기 중' : 'Waiting for phone')}</h1>
+      <p class="glasses-large">${escapeHtml(requestItem?.hazard?.title ?? response?.title ?? '')}</p>
+      <p class="glasses-muted">${requestItem?.expiresAt ? `${locale === 'ko' ? '만료' : 'Expires'}: ${escapeHtml(formatDateTime(new Date(requestItem.expiresAt)))}` : ''}</p>
+      ${state.glassesPhotoFeedback ? `<p class="glasses-validation" role="status">${escapeHtml(state.glassesPhotoFeedback)}</p>` : ''}`;
+    actions = completed
+      ? [{ action: 'phone-evidence-attach', label: locale === 'ko' ? '사진 첨부 확인' : 'Attach photo', primary: true },
+          { action: 'native-evidence-retake', label: locale === 'ko' ? '다시 촬영' : 'Retake' }]
+      : terminal
+        ? [{ action: 'prev', label: t('common.back'), primary: true }]
+        : [{ action: 'phone-evidence-check', label: locale === 'ko' ? '다시 확인' : 'Check again', primary: true }, { action: 'phone-evidence-cancel', label: t('common.cancel') }];
   } else if (state.glassesStep === GLASSES_STEP.HAZARD_CONFIRMATION) {
     const corrective = normalizeCorrectiveAction(response?.correctiveAction, state.glassesProvisionalDecision);
     const complete = state.glassesProvisionalDecision === HAZARD_STATUS.CONTROLLED || Boolean(corrective.immediateResponseCategory && corrective.responsibleParty && corrective.workStatus && corrective.duePeriod);
@@ -2473,13 +3070,18 @@ function renderGlasses() {
   } else if (state.glassesStep === GLASSES_STEP.SHARING_RECORD) {
     const sharing = normalizeSharing(state.session.sharing); const sharingErrors = getSharingScreenErrors(sharing); const ready = isSharingScreenComplete(sharing);
     const options = (values,selected,prefix)=>`<option value=""></option>${values.map(v=>`<option value="${v}" ${selected===v?'selected':''}>${t(`${prefix}.${v}`)}</option>`).join('')}`;
-    body = `<p class="glasses-kicker">${t('sharing.title')}</p><h1>${t('glasses.sharingRecord')}</h1><div class="glasses-compact-form">
+    body = `<p class="glasses-kicker">${t('sharing.title')}</p><h1>${t('glasses.sharingRecord')}</h1>${isMetaDisplayRuntime ? '<p>각 항목을 선택해 값을 변경하세요.</p>' : `<div class="glasses-compact-form">
       <label><input type="checkbox" data-sharing-field="shared" ${sharing.status===SHARING_STATUS.SHARED?'checked':''}/> ${t('glasses.resultsShared')}</label>
       <label>${t('sharing.method')}<select data-sharing-field="method">${options(Object.values(SHARING_METHOD),sharing.method,'glasses.share')}</select></label>
-      <label>${t('glasses.proofType')}<select data-sharing-field="proofType">${options(Object.values(SHARING_PROOF_TYPE),sharing.proofType,'glasses.proof')}</select></label></div>
+      <label>${t('glasses.proofType')}<select data-sharing-field="proofType">${options(Object.values(SHARING_PROOF_TYPE),sharing.proofType,'glasses.proof')}</select></label></div>`}
       ${sharingErrors.length ? `<p class="glasses-validation" role="status">${t('glasses.sharingMissing')}: ${sharingErrors.map(key=>t(`glasses.sharingError.${key}`)).join(', ')}</p>` : ''}
       ${state.glassesSharingFeedback ? `<p class="glasses-validation" role="alert">${escapeHtml(state.glassesSharingFeedback)}</p>` : ''}`;
-    actions = [{ action: 'record-continue', label: t('common.continue'), primary: true, disabled: !ready }];
+    actions = isMetaDisplayRuntime ? [
+      { action: 'sharing-toggle', label: `${t('glasses.resultsShared')}: ${sharing.status === SHARING_STATUS.SHARED ? '✓' : '—'}` },
+      { action: 'sharing-cycle-method', label: `${t('sharing.method')}: ${sharing.method ? t(`glasses.share.${sharing.method}`) : '—'}` },
+      { action: 'sharing-cycle-proof', label: `${t('glasses.proofType')}: ${sharing.proofType ? t(`glasses.proof.${sharing.proofType}`) : '—'}` },
+      { action: 'record-continue', label: t('common.continue'), primary: true, disabled: !ready }
+    ] : [{ action: 'record-continue', label: t('common.continue'), primary: true, disabled: !ready }];
   } else if (state.glassesStep === GLASSES_STEP.REPORT_REVIEW) {
     const sharing = normalizeSharing(state.session.sharing); const blockers = getFinalizationBlockers(buildSessionLog());
     const attendance = normalizeAttendanceSummary(state.session.attendanceSummary);
@@ -2506,19 +3108,20 @@ function renderGlasses() {
 
   app.innerHTML = `
     <section class="glasses-screen is-${escapeHtml(state.glassesStep)}">
-      <header class="glasses-topline">
+      ${isMetaDisplayRuntime ? '' : `<header class="glasses-topline">
         ${v2Logo()}
         <nav aria-label="${t('glasses.secondaryNavigation')}">
           ${![GLASSES_STEP.START, GLASSES_STEP.SUBMITTING_REPORT, GLASSES_STEP.COMPLETE].includes(state.glassesStep) ? `<button class="focusable glasses-exit" data-glasses-action="prev">${t('common.back')}</button>` : ''}
           <button class="focusable glasses-exit" data-glasses-action="exit">${t('glasses.quit')}</button>
         </nav>
-      </header>
+      </header>`}
       <main class="glasses-card" tabindex="-1">
         ${body}
       </main>
       ${renderGlassesActions(actions)}
-      <footer class="glasses-shortcuts"><span class="glasses-sync is-${syncPresentation.tone}">${t(syncPresentation.key)} · ${t(state.deviceConnectionState === 'offline' ? 'glasses.networkOffline' : 'glasses.networkOnline')}</span>
-        <button class="focusable glasses-help-button" data-glasses-action="toggle-help" aria-expanded="${state.glassesHelpOpen}">${t(isMetaDisplayRuntime ? 'glasses.deviceHelp' : 'glasses.previewHelp')}</button></footer>
+      ${isMetaDisplayRuntime
+        ? `<footer class="glasses-meta-status">${t(syncPresentation.key)} · ${t(state.deviceConnectionState === 'offline' ? 'glasses.networkOffline' : 'glasses.networkOnline')}</footer>`
+        : `<footer class="glasses-shortcuts"><span class="glasses-sync is-${syncPresentation.tone}">${t(syncPresentation.key)} · ${t(state.deviceConnectionState === 'offline' ? 'glasses.networkOffline' : 'glasses.networkOnline')}</span><button class="focusable glasses-help-button" data-glasses-action="toggle-help" aria-expanded="${state.glassesHelpOpen}">${t('glasses.previewHelp')}</button></footer>`}
       <p class="sr-only" role="status" aria-live="polite" aria-atomic="true">${escapeHtml(state.glassesAnnouncement)}</p>
       ${state.glassesHelpOpen ? `<aside class="glasses-help-overlay" role="dialog" aria-modal="true" aria-labelledby="glasses-help-title">
         <h2 id="glasses-help-title">${t(isMetaDisplayRuntime ? 'glasses.deviceTooling' : 'glasses.previewTooling')}</h2><p>${t(isMetaDisplayRuntime ? 'glasses.metaCapabilityNotice' : 'glasses.previewDisclaimer')}</p>
@@ -2541,7 +3144,6 @@ function renderGlasses() {
   app.querySelectorAll('[data-attendance-digit]').forEach((field)=>field.addEventListener('change',()=>{state.glassesAttendanceDigits[field.dataset.attendanceDigit]=Number(field.value);saveLocalDraft();render();}));
   app.querySelectorAll('[data-sharing-field]').forEach((field)=>field.addEventListener('change',()=>{const key=field.dataset.sharingField;if(key==='shared'){state.session.sharing={...normalizeSharing(state.session.sharing),status:field.checked?SHARING_STATUS.SHARED:SHARING_STATUS.NOT_RECORDED,recipients:field.checked?'All expected workers':''};}else updateSharing(key,field.value);saveLocalDraft();render();}));
   bindGlassesButtons();
-  requestAnimationFrame(() => app.querySelector('[data-primary-action]')?.focus());
 }
 
 function renderCorrectiveActionEditor(response) {
@@ -2902,6 +3504,19 @@ function bindButtons() {
       if (action === 'save-session' || action === 'save-draft') saveCurrentSession('draft');
       if (action === 'finalize') saveCurrentSession('finalize');
       if (action === 'saved-sessions') openSavedSessions();
+      if (action === 'pair-glasses') openPairGlasses();
+      if (action === 'refresh-evidence-requests') loadEvidenceRequests();
+      if (action === 'refresh-native-devices') loadNativeDevices();
+      if (action === 'revoke-native-device') revokeNativeDevice(button.dataset.device);
+      if (action === 'select-evidence-camera' || action === 'replace-evidence-camera') app.querySelector(`[data-evidence-camera="${CSS.escape(button.dataset.request)}"]`)?.click();
+      if (action === 'select-evidence-gallery') app.querySelector(`[data-evidence-gallery="${CSS.escape(button.dataset.request)}"]`)?.click();
+      if (action === 'confirm-evidence-upload') fulfillEvidenceRequest();
+      if (action === 'clear-evidence-selection') { clearEvidenceSelection(); render(); }
+      if (action === 'cancel-evidence-request') cancelSupervisorEvidenceRequest(button.dataset.request);
+      if (action === 'refresh-pairing') refreshSupervisorPairing();
+      if (action === 'cancel-pairing') endSupervisorPairing(false);
+      if (action === 'revoke-pairing') endSupervisorPairing(true);
+      if (action === 'close-pairing') { state.phase = 'start'; state.supervisorPairing = null; render(); }
       if (action === 'back-from-saved') closeSavedSessions();
       if (action === 'refresh-saved') loadSavedSessions().then(render);
       if (action === 'open-report') openSessionReport(button.dataset.session);
@@ -2917,6 +3532,7 @@ function bindButtons() {
 function render() {
   if (isDeviceDiagnosticsMode) { renderDeviceDiagnostics(); return; }
   if (isInvalidGlassesRuntime) { renderInvalidDeviceRuntime(); return; }
+  if (isMetaDisplayRuntime && state.phase === 'glasses-pairing') { renderGlassesPairing(); return; }
   if (state.phase === 'auth-check') renderAuthChecking();
   if (state.phase === 'auth') renderAuth();
   if (state.phase === 'loading') renderLoading();
@@ -2938,6 +3554,7 @@ function render() {
   if (state.phase === 'checklist') renderChecklist();
   if (state.phase === 'summary') renderSummary();
   if (state.phase === 'saved-sessions') renderSavedSessions();
+  if (state.phase === 'pair-glasses') renderPairGlasses();
   enhanceNormalAccessibility();
 }
 
@@ -2960,6 +3577,75 @@ function deviceFocusableElements() {
     .filter((element) => element.getClientRects().length > 0);
 }
 
+function moveLogicalGlassesFocus(direction = 1) {
+  const elements = [...app.querySelectorAll('[data-focus-id]:not([disabled])')]
+    .filter((element) => element.getClientRects().length > 0);
+  if (!elements.length) return false;
+  const currentIndex = elements.findIndex((element) => element.dataset.focusId === state.glassesFocusId);
+  const next = elements[currentIndex < 0 ? 0 : (currentIndex + direction + elements.length) % elements.length];
+  state.glassesFocusId = next.dataset.focusId;
+  if (state.phase === 'glasses-pairing') state.glassesPairing.focusId = state.glassesFocusId;
+  state.glassesFocusView = state.phase === 'glasses-pairing' ? `pairing:${state.glassesPairing.stage}` : state.glassesStep;
+  if (state.phase === 'glasses-pairing') renderGlassesPairing(); else renderGlasses();
+  return true;
+}
+
+function activateLogicalGlassesFocus() {
+  const focused = app.querySelector(`[data-focus-id="${CSS.escape(state.glassesFocusId)}"]`);
+  if (!focused || focused.disabled) return false;
+  focused.click();
+  return true;
+}
+
+function handlePairingDeviceAction(action, event) {
+  const pairing = state.glassesPairing;
+  if (event.repeat) return true;
+  if (pairing.stage === 'digits') {
+    if (action === DEVICE_ACTION.BACK) {
+      if (pairing.digitIndex > 0) pairing.digitIndex -= 1;
+      else pairing.stage = 'intro';
+      pairing.focusId = '';
+      renderGlassesPairing();
+      return true;
+    }
+    if (action === DEVICE_ACTION.ACTIVATE) {
+      if (pairing.digitIndex < pairing.digits.length - 1) pairing.digitIndex += 1;
+      else pairing.stage = 'confirm';
+      pairing.focusId = '';
+      renderGlassesPairing();
+      return true;
+    }
+    if (event.key === 'ArrowUp' || event.key === 'ArrowDown') {
+      const delta = event.key === 'ArrowUp' ? 1 : -1;
+      pairing.digits[pairing.digitIndex] = (pairing.digits[pairing.digitIndex] + delta + 10) % 10;
+      renderGlassesPairing();
+      return true;
+    }
+    if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+      const delta = event.key === 'ArrowRight' ? 1 : -1;
+      pairing.digitIndex = Math.max(0, Math.min(pairing.digits.length - 1, pairing.digitIndex + delta));
+      pairing.focusId = '';
+      renderGlassesPairing();
+      return true;
+    }
+    return false;
+  }
+  if (action === DEVICE_ACTION.BACK) {
+    if (pairing.stage === 'confirm') {
+      pairing.stage = 'digits';
+      pairing.digitIndex = pairing.digits.length - 1;
+    } else pairing.stage = 'intro';
+    pairing.focusId = '';
+    renderGlassesPairing();
+    return true;
+  }
+  if (action === DEVICE_ACTION.FOCUS_NEXT || action === DEVICE_ACTION.FOCUS_PREVIOUS) {
+    return moveLogicalGlassesFocus(action === DEVICE_ACTION.FOCUS_NEXT ? 1 : -1);
+  }
+  if (action === DEVICE_ACTION.ACTIVATE) return activateLogicalGlassesFocus();
+  return false;
+}
+
 function moveDeviceFocus(direction = 1) {
   const elements = deviceFocusableElements();
   if (!elements.length) return false;
@@ -2979,8 +3665,37 @@ function activateDeviceFocus() {
   return moveDeviceFocus(1);
 }
 
+function handleMetaAttendanceDeviceAction(action, event) {
+  if (!isMetaDisplayRuntime || state.glassesStep !== GLASSES_STEP.ATTENDANCE) return false;
+  const keys = ['expectedTens', 'expectedOnes', 'presentTens', 'presentOnes'];
+  const currentIndex = keys.findIndex((key) => state.glassesFocusId === `attendance-digit-${key}`);
+  if (currentIndex < 0) return false;
+  if (event.key === 'ArrowUp' || event.key === 'ArrowDown') {
+    const key = keys[currentIndex];
+    const delta = event.key === 'ArrowUp' ? 1 : -1;
+    state.glassesAttendanceDigits[key] = (state.glassesAttendanceDigits[key] + delta + 10) % 10;
+    saveLocalDraft();
+    render();
+    return true;
+  }
+  if (event.key === 'ArrowLeft' || event.key === 'ArrowRight' || action === DEVICE_ACTION.ACTIVATE) {
+    const nextIndex = action === DEVICE_ACTION.ACTIVATE
+      ? currentIndex + 1
+      : currentIndex + (event.key === 'ArrowRight' ? 1 : -1);
+    state.glassesFocusId = nextIndex >= keys.length
+      ? 'attendance-continue'
+      : `attendance-digit-${keys[Math.max(0, nextIndex)]}`;
+    state.glassesFocusView = state.glassesStep;
+    render();
+    return true;
+  }
+  return false;
+}
+
 function handleDeviceAction(action, event) {
-  if (!isGlassesMode || !state.currentUser || !state.hazards.length) return false;
+  if (!isGlassesMode) return false;
+  if (isMetaDisplayRuntime && state.phase === 'glasses-pairing') return handlePairingDeviceAction(action, event);
+  if (!state.currentUser || !state.hazards.length) return false;
   if (state.glassesHelpOpen && action !== DEVICE_ACTION.BACK && action !== DEVICE_ACTION.ACTIVATE && action !== DEVICE_ACTION.TOGGLE_HELP) return false;
 
   if (action === DEVICE_ACTION.TOGGLE_HELP) {
@@ -2993,11 +3708,13 @@ function handleDeviceAction(action, event) {
     render();
     return true;
   }
+  if (handleMetaAttendanceDeviceAction(action, event)) return true;
   if (action === DEVICE_ACTION.FOCUS_NEXT || action === DEVICE_ACTION.FOCUS_PREVIOUS) {
+    if (isMetaDisplayRuntime) return moveLogicalGlassesFocus(action === DEVICE_ACTION.FOCUS_NEXT ? 1 : -1);
     if (event.target?.matches?.('select')) return false;
     return moveDeviceFocus(action === DEVICE_ACTION.FOCUS_NEXT ? 1 : -1);
   }
-  if (action === DEVICE_ACTION.ACTIVATE) return activateDeviceFocus();
+  if (action === DEVICE_ACTION.ACTIVATE) return isMetaDisplayRuntime ? activateLogicalGlassesFocus() : activateDeviceFocus();
   if (event.target?.matches?.('input, textarea, select, button')) return false;
   if (action === DEVICE_ACTION.ADVANCE) {
     if (state.glassesStep === GLASSES_STEP.HAZARD_DECISION) return false;

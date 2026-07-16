@@ -45,6 +45,8 @@ test.describe('600×600 structured glasses preview', () => {
     await expect(page.getByRole('button', { name: '통제되지 않음' })).toBeVisible();
     await page.locator('[data-glasses-action="controlled"]').click();
     await expect(page.locator('.is-photo_evidence')).toBeVisible();
+    await expect(page.getByRole('button', { name: '사진 촬영' })).toBeEnabled();
+    await expect(page.getByRole('button', { name: '사진 업로드' })).toBeDisabled();
     await page.locator('[data-glasses-action="mock-photo"]').click();
     await expect(page.locator('.is-photo_evidence')).toContainText('Browser preview mock');
     await captureGlassesScreenshot(page, 'glasses-evidence-polished');
@@ -59,27 +61,187 @@ test.describe('600×600 structured glasses preview', () => {
 
   test('uses documented D-pad events and exposes no fake capture in the Meta Display adapter', async ({ page }) => {
     await page.setViewportSize({ width: 600, height: 600 });
+    let exchangeRequests = 0;
+    const createdProviders: string[] = [];
+    await page.route('**/api/glasses/pair', async (route) => {
+      exchangeRequests += 1;
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ scope: {
+        type: 'site', siteId: 'site-browser-test', sessionId: null, siteName: 'Pilot Site', siteArea: 'Area A', taskName: null,
+        expiresAt: new Date(Date.now() + 900_000).toISOString()
+      } }) });
+    });
+    await page.route('**/api/glasses/native-device-availability', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: '{"available":true}' }));
+    const handoff = { id: 'request-meta-1', sessionId: 'session-meta-1', hazardId: 'hazard-meta-1', status: 'pending', provider: 'native_dat_camera',
+      expiresAt: new Date(Date.now() + 600_000).toISOString(), hazard: { title: 'Phone evidence hazard', location: 'Area A' },
+      tbm: { siteName: 'Pilot Site', taskName: 'Task', siteArea: 'Area A' } };
+    await page.route('**/api/glasses/evidence-requests/request-meta-1/attach', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ...handoff, status: 'completed', attachedAt: new Date().toISOString(), evidence: { uploadId: 'upload-meta-1', mimeType: 'image/png', size: 68, source: 'browser_file_picker', url: '/api/uploads/upload-meta-1' } }) }));
+    await page.route('**/api/glasses/evidence-requests/request-meta-1/ready', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ...handoff, provider: 'native_dat_camera', nativeReadyAt: new Date().toISOString() }) }));
+    await page.route('**/api/glasses/evidence-requests/request-meta-1', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ...handoff, status: 'completed', evidence: { uploadId: 'upload-meta-1', mimeType: 'image/png', size: 68, source: 'browser_file_picker', url: '/api/uploads/upload-meta-1' } }) }));
+    await page.route('**/api/glasses/evidence-requests', (route) => {
+      createdProviders.push(JSON.parse(route.request().postData() ?? '{}').provider);
+      return route.fulfill({ status: 201, contentType: 'application/json', body: JSON.stringify(handoff) });
+    });
     await page.goto('/?mode=glasses&adapter=meta-display&stress');
     await expect(page.locator('.glasses-screen')).toBeVisible();
-    await expect(page.locator('.is-start')).toContainText('Meta Display Web App');
+    await expect(page.locator('input[type="email"], input[type="password"]')).toHaveCount(0);
+    await expect(page.locator('.pairing-screen select')).toHaveCount(0);
+    await expect(page.locator('.pairing-screen .glasses-topline')).toHaveCount(0);
+    await expect(page.locator('[data-focus-id][aria-current="true"]')).toHaveCount(1);
     await expect(page.locator('meta[name="viewport"]')).toHaveAttribute('content', 'width=600,height=600,initial-scale=1');
+    expect((await page.locator('.pairing-screen button').allTextContents()).join(' ')).not.toMatch(/Focused|FOCUSED|선택됨/);
+    const focusContrast = await page.locator('[data-focus-id]').evaluateAll((elements) => elements.map((element) => {
+      const style = getComputedStyle(element);
+      return { current: element.getAttribute('aria-current'), background: style.backgroundColor, borderWidth: style.borderWidth,
+        outlineWidth: style.outlineWidth, fontWeight: style.fontWeight };
+    }));
+    const focusedStyle = focusContrast.find((style) => style.current === 'true')!;
+    const unfocusedStyle = focusContrast.find((style) => style.current !== 'true')!;
+    expect(focusedStyle.background).not.toBe(unfocusedStyle.background);
+    expect(focusedStyle.background).toBe('rgb(217, 45, 39)');
+    expect(Number.parseFloat(focusedStyle.borderWidth)).toBeGreaterThanOrEqual(4);
+    expect(Number.parseFloat(focusedStyle.outlineWidth)).toBeGreaterThanOrEqual(4);
+    expect(Number.parseInt(focusedStyle.fontWeight, 10)).toBeGreaterThanOrEqual(900);
+
+    await page.keyboard.press('ArrowDown');
+    await page.keyboard.press('Enter');
+    await expect(page.getByRole('heading', { name: '언어 선택' })).toBeVisible();
+    await page.keyboard.press('ArrowDown');
+    await page.keyboard.press('Enter');
+    await expect(page.locator('html')).toHaveAttribute('lang', 'en');
+    await page.keyboard.press('ArrowDown');
+    await page.keyboard.press('Enter');
+    await expect(page.getByRole('heading', { name: 'Choose language' })).toBeVisible();
+    await page.keyboard.press('ArrowUp');
+    await page.keyboard.press('Enter');
+    await expect(page.locator('html')).toHaveAttribute('lang', 'ko');
+
+    await page.keyboard.press('Enter');
+    await expect(page.locator('[data-pairing-digit]')).toHaveCount(6);
+    await expect(page.locator('.pairing-screen input, .pairing-screen select')).toHaveCount(0);
+    await expect(page.locator('[data-pairing-digit="0"]')).toHaveAttribute('aria-current', 'true');
+    await page.keyboard.press('ArrowUp');
+    await expect(page.locator('.pairing-code-preview')).toHaveText('100 000');
+
+    await page.keyboard.press('Escape');
+    await page.keyboard.press('ArrowDown');
+    await page.keyboard.press('Enter');
+    await page.keyboard.press('ArrowDown');
+    await page.keyboard.press('Enter');
+    await expect(page.locator('html')).toHaveAttribute('lang', 'en');
+    await page.keyboard.press('ArrowDown');
+    await page.keyboard.press('Enter');
+    await page.keyboard.press('ArrowUp');
+    await page.keyboard.press('Enter');
+    await expect(page.locator('html')).toHaveAttribute('lang', 'ko');
+    await page.keyboard.press('Enter');
+    await expect(page.locator('.pairing-code-preview')).toHaveText('100 000');
+
+    await page.keyboard.press('ArrowRight');
+    await expect(page.locator('[data-pairing-digit="1"]')).toHaveAttribute('aria-current', 'true');
+    await page.keyboard.press('ArrowDown');
+    await expect(page.locator('.pairing-code-preview')).toHaveText('190 000');
+    await page.keyboard.press('ArrowUp');
+    await expect(page.locator('.pairing-code-preview')).toHaveText('100 000');
+    await page.keyboard.press('ArrowDown');
+    await expect(page.locator('.pairing-code-preview')).toHaveText('190 000');
+    await page.evaluate(() => window.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', repeat: true })));
+    await expect(page.locator('[data-pairing-digit="1"]')).toHaveAttribute('aria-current', 'true');
+    await page.keyboard.press('ArrowRight');
+    await expect(page.locator('[data-pairing-digit="2"]')).toHaveAttribute('aria-current', 'true');
+    for (let index = 0; index < 4; index += 1) await page.keyboard.press('Enter');
+    await expect(page.locator('.pairing-screen')).toContainText('190 000');
+    expect(exchangeRequests).toBe(0);
+    await expect(page.locator('[data-focus-id][aria-current="true"]')).toHaveCount(1);
+    await page.keyboard.press('Escape');
+    await expect(page.locator('[data-pairing-digit="5"]')).toHaveAttribute('aria-current', 'true');
+    await page.keyboard.press('Enter');
+    await page.keyboard.press('Enter');
+    expect(exchangeRequests).toBe(1);
+    await expect(page.locator('.is-start')).toContainText('Meta Display Web App');
+    await expect(page.locator('.is-start .glasses-topline, .is-start .glasses-sync')).toHaveCount(0);
+    await expect(page.locator('.is-start')).toContainText('Pilot Site');
+    const startLayout = await page.locator('.is-start').evaluate((screen) => {
+      const button = screen.querySelector('[data-glasses-action="start"]')!.getBoundingClientRect();
+      const actions = screen.querySelector('.glasses-actions')!.getBoundingClientRect();
+      return { buttonWidth: button.width, actionsWidth: actions.width, buttonHeight: button.height };
+    });
+    expect(startLayout.buttonWidth).toBeGreaterThanOrEqual(startLayout.actionsWidth - 16);
+    expect(startLayout.buttonHeight).toBeGreaterThanOrEqual(80);
 
     await page.keyboard.press('Enter');
     await expect(page.locator('.is-context_confirmation')).toBeVisible();
-    await page.getByRole('button', { name: '확인', exact: true }).click();
-    await page.locator('[data-attendance-digit="presentOnes"]').selectOption('4');
-    await page.getByRole('button', { name: '계속', exact: true }).click();
+    await page.keyboard.press('Enter');
+    await expect(page.locator('.is-attendance select, .is-attendance input')).toHaveCount(0);
+    await expect(page.locator('.is-attendance .attendance-digit')).toHaveCount(4);
+    await expect(page.locator('.is-attendance [data-glasses-action^="attendance-cycle-"]')).toHaveCount(4);
+    await expect(page.locator('[data-focus-id="attendance-digit-expectedTens"]')).toHaveAttribute('aria-current', 'true');
+    await page.keyboard.press('ArrowDown');
+    await expect(page.locator('[data-glasses-action="attendance-cycle-expectedTens"] strong')).toHaveText('9');
+    await expect(page.locator('[data-glasses-action="attendance-cycle-expectedOnes"] strong')).toHaveText('4');
+    await page.keyboard.press('ArrowUp');
+    await expect(page.locator('[data-glasses-action="attendance-cycle-expectedTens"] strong')).toHaveText('0');
+    await page.keyboard.press('ArrowRight');
+    await expect(page.locator('[data-focus-id="attendance-digit-expectedOnes"]')).toHaveAttribute('aria-current', 'true');
+    for (let index = 0; index < 4; index += 1) await page.keyboard.press('Enter');
     await expect(page.locator('.is-hazard_decision')).toBeVisible();
 
     for (const key of ['1', '2', 'm', 'M', 'p', 'P']) await page.keyboard.press(key);
     await expect(page.locator('.is-hazard_decision')).toBeVisible();
     await expect(page.locator('[data-glasses-action="mock-photo"]')).toHaveCount(0);
-    await expect(page.locator('[data-glasses-action="controlled"]')).toBeFocused();
+    await expect(page.locator('[data-glasses-action="controlled"]')).toHaveAttribute('aria-current', 'true');
     await page.keyboard.press('Enter');
     await expect(page.locator('.is-photo_evidence')).toBeVisible();
     await expect(page.locator('[data-glasses-action="mock-photo"]')).toHaveCount(0);
+    await expect(page.locator('.is-photo_evidence input[type="file"]')).toHaveCount(0);
+    await expect(page.getByRole('button', { name: '사진 촬영' })).toBeEnabled();
+    await expect(page.getByRole('button', { name: '사진 없이 계속' })).toBeEnabled();
     await expect(page.locator('.is-photo_evidence')).toContainText('Meta Display Web Apps');
     await expect(page.locator('.is-photo_evidence')).toContainText('사진 없음');
+    await expect(page.locator('[data-glasses-action="native-evidence-start"]')).toHaveAttribute('aria-current', 'true');
+    await page.keyboard.press('Enter');
+    await expect(page.locator('.is-native_capture_prepare')).toContainText('확인을 누르기 전에는 촬영되지 않습니다');
+    expect(createdProviders).toEqual(['native_dat_camera']);
+    await page.keyboard.press('Enter');
+    await expect(page.locator('.is-evidence_handoff')).toContainText('카메라 대기 중');
+    await expect(page.locator('.is-evidence_handoff input[type="file"]')).toHaveCount(0);
+    await page.keyboard.press('Enter');
+    await expect(page.locator('.is-evidence_handoff')).toContainText('사진 1장 수신됨');
+    await expect(page.locator('[data-glasses-action="phone-evidence-attach"]')).toHaveAttribute('aria-current', 'true');
+    await page.keyboard.press('Enter');
+    await expect(page.locator('.is-hazard_confirmation')).toBeVisible();
+  });
+
+  test('keeps native capture unavailable without a registered device and never calls a browser camera API', async ({ page }) => {
+    await page.addInitScript(() => {
+      (window as typeof window & { __cameraCalls?: number }).__cameraCalls = 0;
+      const mediaDevices = navigator.mediaDevices ?? {} as MediaDevices;
+      Object.defineProperty(navigator, 'mediaDevices', { configurable: true, value: {
+        ...mediaDevices,
+        getUserMedia: () => {
+          (window as typeof window & { __cameraCalls?: number }).__cameraCalls! += 1;
+          throw new Error('Meta Display must not call getUserMedia');
+        }
+      } });
+    });
+    await page.route('**/api/glasses/pair', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ scope: {
+      type: 'site', siteId: 'site-no-native', sessionId: null, siteName: 'Pilot Site', siteArea: 'Area A', taskName: null,
+      expiresAt: new Date(Date.now() + 900_000).toISOString()
+    } }) }));
+    await page.route('**/api/glasses/native-device-availability', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: '{"available":false}' }));
+    await page.setViewportSize({ width: 600, height: 600 });
+    await page.goto('/?mode=glasses&adapter=meta-display');
+    await page.locator('[data-glasses-action="pairing-enter"]').click();
+    for (let index = 0; index < 6; index += 1) await page.keyboard.press('Enter');
+    await page.locator('[data-glasses-action="pairing-submit"]').click();
+    await page.locator('[data-glasses-action="start"]').click();
+    await page.locator('[data-glasses-action="context-confirm"]').click();
+    for (let index = 0; index < 4; index += 1) await page.locator('[data-glasses-action="attendance-cycle-presentOnes"]').click();
+    await page.locator('[data-glasses-action="attendance-continue"]').click();
+    await page.locator('[data-glasses-action="controlled"]').click();
+    await expect(page.locator('[data-glasses-action="native-evidence-start"]')).toBeDisabled();
+    await expect(page.locator('.is-photo_evidence')).toContainText('등록된 Android DAT 카메라 기기가 없습니다');
+    await expect(page.locator('.is-photo_evidence input[type="file"]')).toHaveCount(0);
+    expect(await page.evaluate(() => (window as typeof window & { __cameraCalls?: number }).__cameraCalls)).toBe(0);
   });
 
   test('enables local-only diagnostics explicitly and records every documented D-pad key', async ({ page }) => {

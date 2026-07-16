@@ -23,13 +23,15 @@ const children = [
       REGISTRATION_KEY: 'browser-registration-key',
       SESSION_SECRET: 'browser-test-session-secret-with-adequate-length',
       AI_MODE: 'mock',
-      NODE_ENV: 'test'
+      NODE_ENV: 'test',
+      DEV_TUNNEL_MODE: 'false',
+      DEV_TUNNEL_ORIGIN: ''
     }
   }),
   spawn(process.execPath, ['node_modules/vite/bin/vite.js', '--host', '127.0.0.1', '--port', '4173', '--strictPort'], {
     cwd: root,
     stdio: 'inherit',
-    env: { ...process.env, VITE_API_TARGET: 'http://127.0.0.1:3101' }
+    env: { ...process.env, VITE_API_TARGET: 'http://127.0.0.1:3101', DEV_TUNNEL_MODE: 'false', DEV_TUNNEL_ORIGIN: '' }
   })
 ];
 

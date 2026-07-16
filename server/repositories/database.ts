@@ -197,7 +197,7 @@ export function openDatabase({ databasePath, migrationsDir, now = () => new Date
     return db.prepare('SELECT * FROM users ORDER BY created_at, id').all().map(mapUser);
   }
 
-  function createEvidenceUploads(records, actorUserId) {
+  function createEvidenceUploads(records, actorUserId, sourceClassification = 'browser_file_picker') {
     return transaction(() => {
       const serverTime = now();
       const statement = db.prepare(`
@@ -217,7 +217,7 @@ export function openDatabase({ databasePath, migrationsDir, now = () => new Date
           record.hash,
           serverTime,
           record.uploadedAt ?? null,
-          'browser_file_picker'
+          sourceClassification
         );
         appendAuditEvent({
           entityType: 'evidence_upload',
@@ -263,6 +263,7 @@ export function openDatabase({ databasePath, migrationsDir, now = () => new Date
         AND NOT EXISTS (SELECT 1 FROM hazard_evidence h WHERE h.upload_id = e.id)
         AND NOT EXISTS (SELECT 1 FROM near_miss_evidence n WHERE n.upload_id = e.id)
         AND NOT EXISTS (SELECT 1 FROM ai_analyses a WHERE a.upload_id = e.id)
+        AND NOT EXISTS (SELECT 1 FROM evidence_requests r WHERE r.upload_id = e.id AND r.status = 'completed')
       ORDER BY e.uploaded_at, e.id
     `).all(cutoff).map(mapUpload);
   }
@@ -274,8 +275,9 @@ export function openDatabase({ databasePath, migrationsDir, now = () => new Date
       const deleted = db.prepare(`DELETE FROM evidence_uploads WHERE id = ?
         AND NOT EXISTS (SELECT 1 FROM hazard_evidence WHERE upload_id = ?)
         AND NOT EXISTS (SELECT 1 FROM near_miss_evidence WHERE upload_id = ?)
-        AND NOT EXISTS (SELECT 1 FROM ai_analyses WHERE upload_id = ?)`)
-        .run(uploadId, uploadId, uploadId, uploadId).changes === 1;
+        AND NOT EXISTS (SELECT 1 FROM ai_analyses WHERE upload_id = ?)
+        AND NOT EXISTS (SELECT 1 FROM evidence_requests WHERE upload_id = ? AND status = 'completed')`)
+        .run(uploadId, uploadId, uploadId, uploadId, uploadId).changes === 1;
       if (deleted) {
         appendAuditEvent({
           entityType: 'evidence_upload', entityId: uploadId, action: 'evidence.abandoned_deleted',
@@ -291,6 +293,9 @@ export function openDatabase({ databasePath, migrationsDir, now = () => new Date
       const user = findUserById(userId);
       if (!user) return false;
       const deletedAt = now();
+      db.prepare('UPDATE native_devices SET revoked_at = ? WHERE owner_id = ? AND revoked_at IS NULL').run(deletedAt, userId);
+      db.prepare("UPDATE native_capture_claims SET status = 'released', updated_at = ? WHERE owner_id = ? AND status IN ('claimed','capturing','captured','uploaded')")
+        .run(deletedAt, userId);
       appendAuditEvent({ entityType: 'user', entityId: userId, action: 'user.deactivated', actorUserId: userId,
         metadata: { safetyRecordsRetained: true, policy: 'pending_pilot_owner_approval' } });
       return db.prepare(`UPDATE users SET name = 'Deleted pilot user',
@@ -1022,6 +1027,509 @@ export function openDatabase({ databasePath, migrationsDir, now = () => new Date
     return getClientOperation(ownerId, idempotencyKey);
   }
 
+  function pairingStatus(row, currentTime = now()) {
+    if (row.cancelled_at) return 'cancelled';
+    if (row.redeemed_at) {
+      const glasses = row.restricted_session_id
+        ? db.prepare('SELECT revoked_at, expires_at FROM glasses_sessions WHERE id = ?').get(row.restricted_session_id)
+        : null;
+      if (glasses?.revoked_at) return 'revoked';
+      if (!glasses || glasses.expires_at <= currentTime) return 'expired';
+      return 'paired';
+    }
+    if (row.expires_at <= currentTime || row.failed_attempts >= row.max_attempts) return 'expired';
+    return 'pending';
+  }
+
+  function mapPairing(row) {
+    if (!row) return null;
+    return {
+      id: row.id,
+      supervisorUserId: row.supervisor_user_id,
+      scopeType: row.scope_type,
+      scopeSiteId: row.scope_site_id,
+      scopeSessionId: row.scope_session_id,
+      siteName: row.site_name,
+      siteArea: row.site_area,
+      taskName: row.task_name ?? null,
+      createdAt: row.created_at,
+      expiresAt: row.expires_at,
+      redeemedAt: row.redeemed_at,
+      cancelledAt: row.cancelled_at,
+      failedAttempts: row.failed_attempts,
+      maxAttempts: row.max_attempts,
+      restrictedSessionId: row.restricted_session_id,
+      status: pairingStatus(row)
+    };
+  }
+
+  const pairingSelect = `
+    SELECT p.*, site.site_name, site.site_area, session.task_name
+    FROM glasses_pairings p
+    JOIN sites site ON site.id = p.scope_site_id AND site.owner_id = p.supervisor_user_id
+    LEFT JOIN tbm_sessions session ON session.id = p.scope_session_id AND session.owner_id = p.supervisor_user_id
+  `;
+
+  function listPairingScopes(ownerId) {
+    const sites = db.prepare(`
+      SELECT id, site_name, site_area FROM sites WHERE owner_id = ? ORDER BY site_name, site_area
+    `).all(ownerId).map((row) => ({ type: 'site', id: row.id, siteName: row.site_name, siteArea: row.site_area }));
+    const sessions = db.prepare(`
+      SELECT s.id, s.site_id, s.task_name, s.status, s.saved_at, site.site_name, site.site_area
+      FROM tbm_sessions s JOIN sites site ON site.id = s.site_id AND site.owner_id = s.owner_id
+      WHERE s.owner_id = ? AND s.status != 'completed' ORDER BY s.saved_at DESC
+    `).all(ownerId).map((row) => ({
+      type: 'tbm_session', id: row.id, siteId: row.site_id, siteName: row.site_name,
+      siteArea: row.site_area, taskName: row.task_name, status: row.status, savedAt: row.saved_at
+    }));
+    return { sites, sessions };
+  }
+
+  function createGlassesPairing(record) {
+    return transaction(() => {
+      const scope = record.scopeType === 'tbm_session'
+        ? db.prepare('SELECT id, site_id FROM tbm_sessions WHERE id = ? AND owner_id = ?').get(record.scopeId, record.supervisorUserId)
+        : db.prepare('SELECT id, id AS site_id FROM sites WHERE id = ? AND owner_id = ?').get(record.scopeId, record.supervisorUserId);
+      if (!scope) return null;
+      db.prepare(`
+        INSERT INTO glasses_pairings(
+          id, code_digest, supervisor_user_id, scope_type, scope_site_id, scope_session_id,
+          created_at, expires_at, max_attempts
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        record.id, record.codeDigest, record.supervisorUserId, record.scopeType, scope.site_id,
+        record.scopeType === 'tbm_session' ? scope.id : null, record.createdAt, record.expiresAt, record.maxAttempts
+      );
+      appendAuditEvent({
+        entityType: 'glasses_pairing', entityId: record.id, action: 'glasses_pairing.created',
+        actorUserId: record.supervisorUserId,
+        metadata: { scopeType: record.scopeType, scopeSiteId: scope.site_id, scopeSessionId: record.scopeType === 'tbm_session' ? scope.id : null, expiresAt: record.expiresAt }
+      });
+      return mapPairing(db.prepare(`${pairingSelect} WHERE p.id = ?`).get(record.id));
+    });
+  }
+
+  function getGlassesPairingForOwner(id, ownerId) {
+    return mapPairing(db.prepare(`${pairingSelect} WHERE p.id = ? AND p.supervisor_user_id = ?`).get(id, ownerId));
+  }
+
+  function cancelGlassesPairing(id, ownerId) {
+    return transaction(() => {
+      const row = db.prepare('SELECT * FROM glasses_pairings WHERE id = ? AND supervisor_user_id = ?').get(id, ownerId);
+      if (!row || pairingStatus(row) !== 'pending') return false;
+      db.prepare('UPDATE glasses_pairings SET cancelled_at = ? WHERE id = ?').run(now(), id);
+      appendAuditEvent({ entityType: 'glasses_pairing', entityId: id, action: 'glasses_pairing.cancelled', actorUserId: ownerId });
+      return true;
+    });
+  }
+
+  function redeemGlassesPairing({ codeDigest, restrictedSessionId, sessionExpiresAt }) {
+    return transaction(() => {
+      const row = db.prepare('SELECT * FROM glasses_pairings WHERE code_digest = ?').get(codeDigest);
+      const currentTime = now();
+      if (!row || pairingStatus(row, currentTime) !== 'pending') {
+        if (row && !row.redeemed_at) {
+          db.prepare('UPDATE glasses_pairings SET failed_attempts = failed_attempts + 1 WHERE id = ?').run(row.id);
+          appendAuditEvent({
+            entityType: 'glasses_pairing', entityId: row.id, action: 'glasses_pairing.exchange_failed',
+            actorUserId: row.supervisor_user_id, metadata: { reason: 'not_redeemable' }
+          });
+        }
+        return null;
+      }
+      const changed = db.prepare(`
+        UPDATE glasses_pairings SET redeemed_at = ?, restricted_session_id = ?
+        WHERE id = ? AND redeemed_at IS NULL AND cancelled_at IS NULL AND expires_at > ? AND failed_attempts < max_attempts
+      `).run(currentTime, restrictedSessionId, row.id, currentTime);
+      if (changed.changes !== 1) return null;
+      db.prepare(`
+        INSERT INTO glasses_sessions(
+          id, pairing_id, supervisor_user_id, scope_type, scope_site_id, scope_session_id,
+          created_at, expires_at, last_seen_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        restrictedSessionId, row.id, row.supervisor_user_id, row.scope_type, row.scope_site_id,
+        row.scope_session_id, currentTime, sessionExpiresAt, currentTime
+      );
+      appendAuditEvent({
+        entityType: 'glasses_pairing', entityId: row.id, action: 'glasses_pairing.redeemed',
+        actorUserId: row.supervisor_user_id,
+        metadata: { restrictedSessionId, scopeType: row.scope_type, scopeSiteId: row.scope_site_id, scopeSessionId: row.scope_session_id }
+      });
+      return getGlassesSession(restrictedSessionId);
+    });
+  }
+
+  function recordUnknownPairingFailure(clientKey = 'unknown') {
+    appendAuditEvent({
+      entityType: 'glasses_pairing_exchange', entityId: deterministicId(clientKey, now()),
+      action: 'glasses_pairing.exchange_failed', metadata: { reason: 'invalid_or_unknown' }
+    });
+  }
+
+  function getGlassesSession(id) {
+    const row = db.prepare(`
+      SELECT gs.*, site.site_name, site.site_area, session.task_name
+      FROM glasses_sessions gs
+      JOIN sites site ON site.id = gs.scope_site_id AND site.owner_id = gs.supervisor_user_id
+      LEFT JOIN tbm_sessions session ON session.id = gs.scope_session_id AND session.owner_id = gs.supervisor_user_id
+      WHERE gs.id = ?
+    `).get(id);
+    if (!row || row.revoked_at || row.expires_at <= now()) return null;
+    return {
+      id: row.id, pairingId: row.pairing_id, supervisorUserId: row.supervisor_user_id,
+      scopeType: row.scope_type, scopeSiteId: row.scope_site_id, scopeSessionId: row.scope_session_id,
+      siteName: row.site_name, siteArea: row.site_area, taskName: row.task_name ?? null,
+      createdAt: row.created_at, expiresAt: row.expires_at
+    };
+  }
+
+  function revokeGlassesSessionForPairing(pairingId, ownerId) {
+    return transaction(() => {
+      const pairing = db.prepare('SELECT restricted_session_id FROM glasses_pairings WHERE id = ? AND supervisor_user_id = ?').get(pairingId, ownerId);
+      if (!pairing?.restricted_session_id) return false;
+      const result = db.prepare('UPDATE glasses_sessions SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL').run(now(), pairing.restricted_session_id);
+      if (result.changes !== 1) return false;
+      appendAuditEvent({ entityType: 'glasses_session', entityId: pairing.restricted_session_id, action: 'glasses_session.revoked', actorUserId: ownerId, metadata: { pairingId } });
+      return true;
+    });
+  }
+
+  function cleanupExpiredGlassesPairings() {
+    return transaction(() => {
+      const currentTime = now();
+      const rows = db.prepare(`
+        SELECT * FROM glasses_pairings
+        WHERE expires_at <= ? AND redeemed_at IS NULL
+      `).all(currentTime);
+      for (const row of rows) {
+        if (!row.cancelled_at) {
+          appendAuditEvent({ entityType: 'glasses_pairing', entityId: row.id, action: 'glasses_pairing.expired', actorUserId: row.supervisor_user_id });
+        }
+        db.prepare('DELETE FROM glasses_pairings WHERE id = ? AND redeemed_at IS NULL').run(row.id);
+      }
+      return rows.length;
+    });
+  }
+
+  const evidenceRequestSelect = `
+    SELECT r.*, h.title AS hazard_title, h.location AS hazard_location,
+      s.task_name, site.site_name, site.site_area,
+      e.mime_type AS upload_mime_type, e.size_bytes AS upload_size_bytes,
+      e.uploaded_at AS upload_uploaded_at, e.source_classification AS upload_source
+    FROM evidence_requests r
+    JOIN hazards h ON h.id = r.hazard_id AND h.owner_id = r.owner_id AND h.session_id = r.session_id
+    JOIN tbm_sessions s ON s.id = r.session_id AND s.owner_id = r.owner_id
+    JOIN sites site ON site.id = s.site_id AND site.owner_id = r.owner_id
+    LEFT JOIN evidence_uploads e ON e.id = r.upload_id AND e.owner_id = r.owner_id
+  `;
+
+  function mapEvidenceRequest(row) {
+    if (!row) return null;
+    return {
+      id: row.id, ownerId: row.owner_id, restrictedSessionId: row.restricted_session_id,
+      sessionId: row.session_id, hazardId: row.hazard_id, status: row.status,
+      createdAt: row.created_at, expiresAt: row.expires_at, completedAt: row.completed_at,
+      cancelledAt: row.cancelled_at, attachedAt: row.attached_at, uploadId: row.upload_id,
+      sourceCategory: row.source_category, provider: row.provider,
+      nativeReadyAt: row.native_ready_at, supersededAt: row.superseded_at,
+      supersededByRequestId: row.superseded_by_request_id,
+      hazardTitle: row.hazard_title, hazardLocation: row.hazard_location,
+      taskName: row.task_name, siteName: row.site_name, siteArea: row.site_area,
+      upload: row.upload_id ? { id: row.upload_id, mimeType: row.upload_mime_type, size: row.upload_size_bytes,
+        uploadedAt: row.upload_uploaded_at, source: row.upload_source } : null
+    };
+  }
+
+  function cleanupExpiredEvidenceRequests() {
+    return transaction(() => {
+      const currentTime = now();
+      const rows = db.prepare("SELECT * FROM evidence_requests WHERE status = 'pending' AND expires_at <= ?").all(currentTime);
+      for (const row of rows) {
+        db.prepare("UPDATE evidence_requests SET status = 'expired' WHERE id = ? AND status = 'pending'").run(row.id);
+        db.prepare("UPDATE native_capture_claims SET status = 'released', updated_at = ? WHERE request_id = ? AND status IN ('claimed','capturing','captured','uploaded')")
+          .run(currentTime, row.id);
+        appendAuditEvent({ entityType: 'evidence_request', entityId: row.id, action: 'evidence_request.expired',
+          actorUserId: row.owner_id, metadata: { sessionId: row.session_id, hazardId: row.hazard_id } });
+      }
+      return rows.length;
+    });
+  }
+
+  function createEvidenceRequest(record) {
+    cleanupExpiredEvidenceRequests();
+    return transaction(() => {
+      const scoped = db.prepare(`SELECT h.id FROM hazards h
+        JOIN tbm_sessions s ON s.id = h.session_id AND s.owner_id = h.owner_id
+        JOIN glasses_sessions gs ON gs.id = ? AND gs.supervisor_user_id = h.owner_id
+        WHERE h.id = ? AND h.session_id = ? AND h.owner_id = ? AND gs.revoked_at IS NULL AND gs.expires_at > ?
+          AND ((gs.scope_type = 'tbm_session' AND gs.scope_session_id = h.session_id)
+            OR (gs.scope_type = 'site' AND gs.scope_site_id = s.site_id))`)
+        .get(record.restrictedSessionId, record.hazardId, record.sessionId, record.ownerId, now());
+      if (!scoped) return null;
+      const existing = db.prepare(`${evidenceRequestSelect} WHERE r.restricted_session_id = ? AND r.session_id = ? AND r.hazard_id = ? AND r.provider = ? AND r.status = 'pending' AND r.expires_at > ? ORDER BY r.created_at DESC LIMIT 1`)
+        .get(record.restrictedSessionId, record.sessionId, record.hazardId, record.provider ?? null, now());
+      if (existing) return { request: mapEvidenceRequest(existing), created: false };
+      db.prepare(`INSERT INTO evidence_requests(id, owner_id, restricted_session_id, session_id, hazard_id, status, created_at, expires_at, provider)
+        VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)`)
+        .run(record.id, record.ownerId, record.restrictedSessionId, record.sessionId, record.hazardId, now(), record.expiresAt, record.provider ?? null);
+      appendAuditEvent({ entityType: 'evidence_request', entityId: record.id, action: 'evidence_request.created',
+        actorUserId: record.ownerId, metadata: { sessionId: record.sessionId, hazardId: record.hazardId, expiresAt: record.expiresAt } });
+      return { request: mapEvidenceRequest(db.prepare(`${evidenceRequestSelect} WHERE r.id = ?`).get(record.id)), created: true };
+    });
+  }
+
+  function getEvidenceRequestForGlasses(id, restrictedSessionId) {
+    cleanupExpiredEvidenceRequests();
+    return mapEvidenceRequest(db.prepare(`${evidenceRequestSelect} WHERE r.id = ? AND r.restricted_session_id = ?`).get(id, restrictedSessionId));
+  }
+
+  function listEvidenceRequestsForOwner(ownerId) {
+    cleanupExpiredEvidenceRequests();
+    return db.prepare(`${evidenceRequestSelect} WHERE r.owner_id = ? ORDER BY r.created_at DESC`).all(ownerId).map(mapEvidenceRequest);
+  }
+
+  function cancelEvidenceRequest(id, { ownerId = null, restrictedSessionId = null } = {}) {
+    cleanupExpiredEvidenceRequests();
+    return transaction(() => {
+      const row = db.prepare(`SELECT * FROM evidence_requests WHERE id = ? AND ${restrictedSessionId ? 'restricted_session_id = ?' : 'owner_id = ?'}`)
+        .get(id, restrictedSessionId ?? ownerId);
+      if (!row) return null;
+      if (row.status === 'cancelled') return { status: 'cancelled', idempotent: true };
+      if (row.status !== 'pending') return { status: row.status, conflict: true };
+      const cancelledAt = now();
+      db.prepare("UPDATE evidence_requests SET status = 'cancelled', cancelled_at = ? WHERE id = ? AND status = 'pending'").run(cancelledAt, id);
+      db.prepare("UPDATE native_capture_claims SET status = 'released', updated_at = ? WHERE request_id = ? AND status IN ('claimed','capturing','captured','uploaded')")
+        .run(cancelledAt, id);
+      appendAuditEvent({ entityType: 'evidence_request', entityId: id, action: 'evidence_request.cancelled',
+        actorUserId: row.owner_id, metadata: { sessionId: row.session_id, hazardId: row.hazard_id } });
+      return { status: 'cancelled', cancelledAt };
+    });
+  }
+
+  function completeEvidenceRequest({ id, ownerId, uploadId, provider, sourceCategory }) {
+    cleanupExpiredEvidenceRequests();
+    return transaction(() => {
+      const row = db.prepare('SELECT * FROM evidence_requests WHERE id = ? AND owner_id = ?').get(id, ownerId);
+      if (!row) return null;
+      if (row.status === 'completed') return row.upload_id === uploadId && row.provider === provider
+        ? { request: mapEvidenceRequest(db.prepare(`${evidenceRequestSelect} WHERE r.id = ?`).get(id)), idempotent: true }
+        : { conflict: true, status: row.status };
+      if (row.status !== 'pending') return { conflict: true, status: row.status };
+      const valid = db.prepare(`SELECT e.id FROM evidence_uploads e JOIN hazards h ON h.id = ? AND h.session_id = ? AND h.owner_id = ?
+        WHERE e.id = ? AND e.owner_id = ?`).get(row.hazard_id, row.session_id, ownerId, uploadId, ownerId);
+      if (!valid) return { inaccessible: true };
+      const completedAt = now();
+      db.prepare(`UPDATE evidence_requests SET status = 'completed', completed_at = ?, upload_id = ?, provider = ?, source_category = ? WHERE id = ? AND status = 'pending'`)
+        .run(completedAt, uploadId, provider, sourceCategory, id);
+      appendAuditEvent({ entityType: 'evidence_request', entityId: id, action: 'evidence_request.upload_completed', actorUserId: ownerId,
+        metadata: { sessionId: row.session_id, hazardId: row.hazard_id, uploadId, provider } });
+      return { request: mapEvidenceRequest(db.prepare(`${evidenceRequestSelect} WHERE r.id = ?`).get(id)), idempotent: false };
+    });
+  }
+
+  function attachEvidenceRequest(id, restrictedSessionId) {
+    cleanupExpiredEvidenceRequests();
+    return transaction(() => {
+      const row = db.prepare('SELECT * FROM evidence_requests WHERE id = ? AND restricted_session_id = ?').get(id, restrictedSessionId);
+      if (!row) return null;
+      if (row.status !== 'completed' || row.superseded_at) return { conflict: true, status: row.superseded_at ? 'superseded' : row.status };
+      if (!row.attached_at) {
+        const position = db.prepare('SELECT COALESCE(MAX(position) + 1, 0) AS position FROM hazard_evidence WHERE hazard_id = ?').get(row.hazard_id).position;
+        db.prepare('INSERT OR IGNORE INTO hazard_evidence(hazard_id, upload_id, owner_id, position) VALUES (?, ?, ?, ?)').run(row.hazard_id, row.upload_id, row.owner_id, position);
+        db.prepare('UPDATE evidence_requests SET attached_at = ? WHERE id = ? AND attached_at IS NULL').run(now(), id);
+        appendAuditEvent({ entityType: 'evidence_request', entityId: id, action: 'evidence_request.evidence_attached', actorUserId: row.owner_id,
+          metadata: { sessionId: row.session_id, hazardId: row.hazard_id, uploadId: row.upload_id } });
+      }
+      return { request: mapEvidenceRequest(db.prepare(`${evidenceRequestSelect} WHERE r.id = ?`).get(id)), idempotent: Boolean(row.attached_at) };
+    });
+  }
+
+  function createNativeDeviceRegistration(record) {
+    return transaction(() => {
+      db.prepare(`INSERT INTO native_device_registrations(id, owner_id, device_name, code_digest, created_at, expires_at, max_attempts)
+        VALUES (?, ?, ?, ?, ?, ?, ?)`)
+        .run(record.id, record.ownerId, record.deviceName, record.codeDigest, now(), record.expiresAt, record.maxAttempts);
+      appendAuditEvent({ entityType: 'native_device_registration', entityId: record.id, action: 'native_device.registration_created',
+        actorUserId: record.ownerId, metadata: { expiresAt: record.expiresAt } });
+      return { id: record.id, deviceName: record.deviceName, expiresAt: record.expiresAt, status: 'pending' };
+    });
+  }
+
+  function redeemNativeDeviceRegistration({ codeDigest, deviceId, credentialDigest }) {
+    return transaction(() => {
+      const currentTime = now();
+      const row = db.prepare('SELECT * FROM native_device_registrations WHERE code_digest = ?').get(codeDigest);
+      if (!row || row.redeemed_at || row.expires_at <= currentTime || row.failed_attempts >= row.max_attempts) return null;
+      const changed = db.prepare(`UPDATE native_device_registrations SET redeemed_at = ?
+        WHERE id = ? AND redeemed_at IS NULL AND expires_at > ? AND failed_attempts < max_attempts`).run(currentTime, row.id, currentTime);
+      if (changed.changes !== 1) return null;
+      db.prepare(`INSERT INTO native_devices(id, owner_id, name, credential_digest, created_at, last_seen_at)
+        VALUES (?, ?, ?, ?, ?, ?)`).run(deviceId, row.owner_id, row.device_name, credentialDigest, currentTime, currentTime);
+      appendAuditEvent({ entityType: 'native_device', entityId: deviceId, action: 'native_device.registered',
+        actorUserId: row.owner_id, metadata: { registrationId: row.id } });
+      return { id: deviceId, ownerId: row.owner_id, name: row.device_name, createdAt: currentTime, lastSeenAt: currentTime };
+    });
+  }
+
+  function recordNativeRegistrationFailure(identifier, codeDigest = null) {
+    if (codeDigest) db.prepare(`UPDATE native_device_registrations SET failed_attempts = failed_attempts + 1
+      WHERE code_digest = ? AND redeemed_at IS NULL AND expires_at > ? AND failed_attempts < max_attempts`).run(codeDigest, now());
+    appendAuditEvent({ entityType: 'native_device_registration', entityId: deterministicId(identifier, now()),
+      action: 'native_device.registration_failed', metadata: { reason: 'invalid_or_expired' } });
+  }
+
+  function listNativeDevicesForOwner(ownerId) {
+    return db.prepare('SELECT id, name, created_at, last_seen_at, revoked_at FROM native_devices WHERE owner_id = ? ORDER BY created_at DESC')
+      .all(ownerId).map((row) => ({ id: row.id, name: row.name, createdAt: row.created_at, lastSeenAt: row.last_seen_at, revokedAt: row.revoked_at }));
+  }
+
+  function revokeNativeDevice(id, ownerId) {
+    return transaction(() => {
+      const revokedAt = now();
+      const changed = db.prepare('UPDATE native_devices SET revoked_at = ? WHERE id = ? AND owner_id = ? AND revoked_at IS NULL').run(revokedAt, id, ownerId);
+      if (changed.changes !== 1) return false;
+      db.prepare("UPDATE native_capture_claims SET status = 'released', updated_at = ? WHERE device_id = ? AND status IN ('claimed','capturing','captured','uploaded')").run(revokedAt, id);
+      appendAuditEvent({ entityType: 'native_device', entityId: id, action: 'native_device.revoked', actorUserId: ownerId });
+      return true;
+    });
+  }
+
+  function authenticateNativeDevice(id, credentialDigest) {
+    return transaction(() => {
+      const row = db.prepare('SELECT * FROM native_devices WHERE id = ? AND credential_digest = ? AND revoked_at IS NULL').get(id, credentialDigest);
+      if (!row) return null;
+      const seenAt = now();
+      db.prepare('UPDATE native_devices SET last_seen_at = ? WHERE id = ?').run(seenAt, id);
+      appendAuditEvent({ entityType: 'native_device', entityId: id, action: 'native_device.used', actorUserId: row.owner_id });
+      return { id: row.id, ownerId: row.owner_id, name: row.name, createdAt: row.created_at, lastSeenAt: seenAt };
+    });
+  }
+
+  function hasActiveNativeDevice(ownerId, seenAfter = null) {
+    return Boolean(db.prepare(`SELECT 1 FROM native_devices WHERE owner_id = ? AND revoked_at IS NULL
+      AND (? IS NULL OR last_seen_at >= ?) LIMIT 1`).get(ownerId, seenAfter, seenAfter));
+  }
+
+  function markNativeEvidenceRequestReady(id, restrictedSessionId, seenAfter = null) {
+    cleanupExpiredEvidenceRequests();
+    return transaction(() => {
+      const row = db.prepare(`SELECT * FROM evidence_requests WHERE id = ? AND restricted_session_id = ?
+        AND provider = 'native_dat_camera' AND status = 'pending' AND superseded_at IS NULL`).get(id, restrictedSessionId);
+      if (!row) return null;
+      if (!hasActiveNativeDevice(row.owner_id, seenAfter)) return { unavailable: true };
+      const readyAt = row.native_ready_at ?? now();
+      db.prepare('UPDATE evidence_requests SET native_ready_at = ? WHERE id = ? AND native_ready_at IS NULL').run(readyAt, id);
+      appendAuditEvent({ entityType: 'evidence_request', entityId: id, action: 'evidence_request.native_capture_confirmed',
+        actorUserId: row.owner_id, metadata: { sessionId: row.session_id, hazardId: row.hazard_id } });
+      return mapEvidenceRequest(db.prepare(`${evidenceRequestSelect} WHERE r.id = ?`).get(id));
+    });
+  }
+
+  function nextNativeCaptureRequest(device) {
+    cleanupExpiredEvidenceRequests();
+    const currentTime = now();
+    return mapEvidenceRequest(db.prepare(`${evidenceRequestSelect}
+      WHERE r.owner_id = ? AND r.provider = 'native_dat_camera' AND r.status = 'pending'
+        AND r.native_ready_at IS NOT NULL AND r.superseded_at IS NULL
+        AND NOT EXISTS (SELECT 1 FROM native_capture_claims c WHERE c.request_id = r.id
+          AND c.status IN ('claimed','capturing','captured','uploaded') AND c.lease_expires_at > ?)
+      ORDER BY r.native_ready_at, r.created_at LIMIT 1`).get(device.ownerId, currentTime));
+  }
+
+  function claimNativeCaptureRequest({ requestId, device, leaseExpiresAt }) {
+    cleanupExpiredEvidenceRequests();
+    return transaction(() => {
+      const currentTime = now();
+      const requestRow = db.prepare(`SELECT * FROM evidence_requests WHERE id = ? AND owner_id = ?
+        AND provider = 'native_dat_camera' AND status = 'pending' AND native_ready_at IS NOT NULL
+        AND superseded_at IS NULL AND expires_at > ?`).get(requestId, device.ownerId, currentTime);
+      if (!requestRow) return null;
+      const existing = db.prepare('SELECT * FROM native_capture_claims WHERE request_id = ?').get(requestId);
+      if (existing && existing.status !== 'released' && existing.status !== 'failed' && existing.lease_expires_at > currentTime) {
+        return existing.device_id === device.id ? { claimed: true, idempotent: true } : { conflict: true };
+      }
+      db.prepare(`INSERT INTO native_capture_claims(request_id, owner_id, device_id, status, claimed_at, lease_expires_at, updated_at)
+        VALUES (?, ?, ?, 'claimed', ?, ?, ?)
+        ON CONFLICT(request_id) DO UPDATE SET owner_id=excluded.owner_id, device_id=excluded.device_id, status='claimed',
+          claimed_at=excluded.claimed_at, lease_expires_at=excluded.lease_expires_at, updated_at=excluded.updated_at,
+          failure_code=NULL, upload_id=NULL`)
+        .run(requestId, device.ownerId, device.id, currentTime, leaseExpiresAt, currentTime);
+      appendAuditEvent({ entityType: 'evidence_request', entityId: requestId, action: 'evidence_request.native_claimed',
+        actorUserId: device.ownerId, metadata: { deviceId: device.id, leaseExpiresAt } });
+      return { claimed: true, idempotent: false };
+    });
+  }
+
+  function getNativeClaim(requestId, device) {
+    const row = db.prepare(`SELECT c.*, r.status AS request_status, r.expires_at, r.superseded_at
+      FROM native_capture_claims c JOIN evidence_requests r ON r.id = c.request_id AND r.owner_id = c.owner_id
+      WHERE c.request_id = ? AND c.device_id = ? AND c.owner_id = ?`).get(requestId, device.id, device.ownerId);
+    if (!row || row.request_status !== 'pending' || row.superseded_at || row.expires_at <= now() || row.lease_expires_at <= now()) return null;
+    return row;
+  }
+
+  function updateNativeClaim(requestId, device, status, failureCode = null, leaseExpiresAt = null) {
+    return transaction(() => {
+      const row = getNativeClaim(requestId, device);
+      if (!row) return null;
+      const allowed = { claimed: ['capturing','failed','released'], capturing: ['captured','failed','released'], captured: ['uploaded','failed','released'], uploaded: ['failed','released'] };
+      if (!allowed[row.status]?.includes(status)) return { conflict: true, status: row.status };
+      db.prepare('UPDATE native_capture_claims SET status = ?, failure_code = ?, updated_at = ?, lease_expires_at = COALESCE(?, lease_expires_at) WHERE request_id = ?')
+        .run(status, failureCode, now(), leaseExpiresAt, requestId);
+      return { status };
+    });
+  }
+
+  function setNativeClaimUpload(requestId, device, uploadId) {
+    return transaction(() => {
+      const row = getNativeClaim(requestId, device);
+      if (!row || !['captured','uploaded'].includes(row.status)) return null;
+      if (row.upload_id) return row.upload_id === uploadId ? { idempotent: true } : { conflict: true };
+      const upload = db.prepare('SELECT id FROM evidence_uploads WHERE id = ? AND owner_id = ?').get(uploadId, device.ownerId);
+      if (!upload) return null;
+      db.prepare("UPDATE native_capture_claims SET status = 'uploaded', upload_id = ?, updated_at = ? WHERE request_id = ?").run(uploadId, now(), requestId);
+      return { idempotent: false };
+    });
+  }
+
+  function completeNativeCapture(requestId, device, uploadId) {
+    return transaction(() => {
+      const row = db.prepare('SELECT * FROM evidence_requests WHERE id = ? AND owner_id = ?').get(requestId, device.ownerId);
+      if (!row) return null;
+      const storedClaim = db.prepare('SELECT * FROM native_capture_claims WHERE request_id = ? AND device_id = ? AND owner_id = ?').get(requestId, device.id, device.ownerId);
+      if (!storedClaim) return null;
+      if (row.status === 'completed') return storedClaim?.upload_id === uploadId && row.upload_id === uploadId
+        ? { request: mapEvidenceRequest(db.prepare(`${evidenceRequestSelect} WHERE r.id = ?`).get(requestId)), idempotent: true }
+        : { conflict: true };
+      const claim = getNativeClaim(requestId, device);
+      if (!claim || claim.status !== 'uploaded' || claim.upload_id !== uploadId) return null;
+      if (row.status !== 'pending' || row.superseded_at) return { conflict: true };
+      const completedAt = now();
+      db.prepare(`UPDATE evidence_requests SET status='completed', completed_at=?, upload_id=?, provider='native_dat_camera', source_category='future_native_glasses_camera'
+        WHERE id=? AND status='pending'`).run(completedAt, uploadId, requestId);
+      appendAuditEvent({ entityType: 'evidence_request', entityId: requestId, action: 'evidence_request.upload_completed', actorUserId: device.ownerId,
+        metadata: { sessionId: row.session_id, hazardId: row.hazard_id, uploadId, provider: 'native_dat_camera', deviceId: device.id } });
+      return { request: mapEvidenceRequest(db.prepare(`${evidenceRequestSelect} WHERE r.id = ?`).get(requestId)), idempotent: false };
+    });
+  }
+
+  function supersedeNativeEvidenceRequest(id, restrictedSessionId, replacement) {
+    return transaction(() => {
+      const row = db.prepare(`SELECT * FROM evidence_requests WHERE id=? AND restricted_session_id=? AND provider='native_dat_camera'
+        AND status='completed' AND attached_at IS NULL AND superseded_at IS NULL`).get(id, restrictedSessionId);
+      if (!row || !hasActiveNativeDevice(row.owner_id)) return null;
+      const currentTime = now();
+      db.prepare(`INSERT INTO evidence_requests(id, owner_id, restricted_session_id, session_id, hazard_id, status, created_at, expires_at, provider)
+        VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, 'native_dat_camera')`)
+        .run(replacement.id, row.owner_id, restrictedSessionId, row.session_id, row.hazard_id, currentTime, replacement.expiresAt);
+      db.prepare('UPDATE evidence_requests SET superseded_at=?, superseded_by_request_id=? WHERE id=?').run(currentTime, replacement.id, id);
+      appendAuditEvent({ entityType: 'evidence_request', entityId: id, action: 'evidence_request.superseded', actorUserId: row.owner_id,
+        metadata: { replacementRequestId: replacement.id, sessionId: row.session_id, hazardId: row.hazard_id } });
+      return mapEvidenceRequest(db.prepare(`${evidenceRequestSelect} WHERE r.id=?`).get(replacement.id));
+    });
+  }
+
   return {
     raw: db,
     close: () => db.close(),
@@ -1048,6 +1556,37 @@ export function openDatabase({ databasePath, migrationsDir, now = () => new Date
     getSessionForOwner,
     getClientOperation,
     recordClientOperation,
+    listPairingScopes,
+    createGlassesPairing,
+    getGlassesPairingForOwner,
+    cancelGlassesPairing,
+    redeemGlassesPairing,
+    recordUnknownPairingFailure,
+    getGlassesSession,
+    revokeGlassesSessionForPairing,
+    cleanupExpiredGlassesPairings,
+    createEvidenceRequest,
+    getEvidenceRequestForGlasses,
+    listEvidenceRequestsForOwner,
+    cancelEvidenceRequest,
+    completeEvidenceRequest,
+    attachEvidenceRequest,
+    cleanupExpiredEvidenceRequests,
+    createNativeDeviceRegistration,
+    redeemNativeDeviceRegistration,
+    recordNativeRegistrationFailure,
+    listNativeDevicesForOwner,
+    revokeNativeDevice,
+    authenticateNativeDevice,
+    hasActiveNativeDevice,
+    markNativeEvidenceRequestReady,
+    nextNativeCaptureRequest,
+    claimNativeCaptureRequest,
+    getNativeClaim,
+    updateNativeClaim,
+    setNativeClaimUpload,
+    completeNativeCapture,
+    supersedeNativeEvidenceRequest,
     hasLegacyImport,
     recordLegacyImport
   };

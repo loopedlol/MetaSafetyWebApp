@@ -53,6 +53,16 @@ function createSessionCookie(userId: string, options: CookieOptions): string {
   return `${payload}.${signValue(payload, options.sessionSecret)}`;
 }
 
+function createGlassesSessionCookie(glassesSessionId: string, options: CookieOptions): string {
+  const issuedAt = options.now();
+  const payload = Buffer.from(JSON.stringify({
+    glassesSessionId,
+    issuedAt,
+    expiresAt: issuedAt + options.sessionTtlMs
+  })).toString('base64url');
+  return `${payload}.${signValue(payload, options.sessionSecret)}`;
+}
+
 export function getSessionUserId(request: Request, sessionSecret: string, now: () => number): string | null {
   const cookie = parseCookies(request.headers.cookie).safety_lens_session;
   if (!cookie) return null;
@@ -78,6 +88,38 @@ export function setAuthCookie(response: Response, userId: string, options: Cooki
     secure: options.secureCookies,
     maxAge: options.sessionTtlMs
   });
+}
+
+export function getGlassesSessionId(request: Request, sessionSecret: string, now: () => number): string | null {
+  const cookie = parseCookies(request.headers.cookie).safety_lens_glasses;
+  if (!cookie) return null;
+  const [payload, signature] = cookie.split('.');
+  if (!payload || !signature || !verifySignature(payload, signature, sessionSecret)) return null;
+  try {
+    const session = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as Record<string, unknown>;
+    const currentTime = now();
+    const issuedAt = Number(session.issuedAt);
+    const expiresAt = Number(session.expiresAt);
+    const validTimes = Number.isFinite(issuedAt) && Number.isFinite(expiresAt) &&
+      issuedAt <= currentTime + 60_000 && expiresAt > currentTime && expiresAt > issuedAt;
+    return typeof session.glassesSessionId === 'string' && validTimes ? session.glassesSessionId : null;
+  } catch {
+    return null;
+  }
+}
+
+export function setGlassesAuthCookie(response: Response, glassesSessionId: string, options: CookieOptions): void {
+  response.cookie('safety_lens_glasses', createGlassesSessionCookie(glassesSessionId, options), {
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: options.secureCookies,
+    maxAge: options.sessionTtlMs,
+    path: '/'
+  });
+}
+
+export function clearGlassesAuthCookie(response: Response, secureCookies: boolean): void {
+  response.clearCookie('safety_lens_glasses', { httpOnly: true, sameSite: 'lax', secure: secureCookies, path: '/' });
 }
 
 export function clearAuthCookie(response: Response, secureCookies: boolean): void {

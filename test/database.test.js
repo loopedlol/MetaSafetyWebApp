@@ -59,11 +59,12 @@ describe('SQLite schema and ownership', () => {
     assert.equal(database.raw.prepare('PRAGMA foreign_keys').get().foreign_keys, 1);
     assert.deepEqual(
       database.raw.prepare('SELECT version FROM schema_migrations ORDER BY version').all().map((row) => row.version),
-      ['001_initial.sql', '002_offline_sync.sql', '003_ai_analyses.sql', '004_glasses_structured_records.sql', '005_pilot_retention.sql']
+      ['001_initial.sql', '002_offline_sync.sql', '003_ai_analyses.sql', '004_glasses_structured_records.sql', '005_pilot_retention.sql', '006_glasses_pairing.sql', '007_evidence_requests.sql', '008_native_dat_devices.sql']
     );
     assert.equal(database.raw.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'ai_analyses'").get().count, 1);
     assert.ok(database.raw.prepare("PRAGMA table_info(tbm_sessions)").all().some((column) => column.name === 'attendance_expected_count'));
     assert.ok(database.raw.prepare("PRAGMA table_info(evidence_uploads)").all().some((column) => column.name === 'source_classification'));
+    assert.ok(database.raw.prepare("PRAGMA table_info(evidence_requests)").all().some((column) => column.name === 'restricted_session_id'));
   });
 
   test('enforces owner relationships through composite foreign keys', () => {

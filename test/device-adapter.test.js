@@ -7,9 +7,10 @@ import {
   resolveDeviceRuntime
 } from '../src/device/device-adapter.ts';
 
-function keyEvent(key) {
-  const event = new Event('keydown', { cancelable: true });
+function keyEvent(key, { repeat = false, type = 'keydown' } = {}) {
+  const event = new Event(type, { cancelable: true });
   Object.defineProperty(event, 'key', { value: key });
+  Object.defineProperty(event, 'repeat', { value: repeat });
   return event;
 }
 
@@ -62,6 +63,20 @@ describe('device adapter contract', () => {
       displayOutput: 'supported', gestureInput: 'supported', cameraPhoto: 'unsupported', voiceInput: 'unsupported',
       connectivity: 'supported', localOfflineStorage: 'supported'
     });
+  });
+
+  test('emits one action for one Meta keydown and ignores repeats and keyup', () => {
+    const target = new EventTarget();
+    const actions = [];
+    const adapter = createDeviceAdapter(DEVICE_RUNTIME.META_DISPLAY_WEB, {
+      inputTarget: target, connectionTarget: target, isOnline: () => true
+    });
+    const disconnect = adapter.connect({ onAction: (action) => actions.push(action) });
+    target.dispatchEvent(keyEvent('ArrowRight'));
+    target.dispatchEvent(keyEvent('ArrowRight', { repeat: true }));
+    target.dispatchEvent(keyEvent('ArrowRight', { type: 'keyup' }));
+    disconnect();
+    assert.deepEqual(actions, [DEVICE_ACTION.FOCUS_NEXT]);
   });
 
   test('reports network changes and removes listeners on disconnect', () => {

@@ -1,5 +1,13 @@
 # Internal Pilot Operations
 
+## Restricted glasses access
+
+Pair glasses only from an authenticated supervisor dashboard and assign the narrowest available active TBM scope. Codes expire after `GLASSES_PAIRING_TTL_MS`, are one-time use, and are never recoverable from storage. Restricted sessions expire after `GLASSES_SESSION_TTL_MS` and can be revoked from the same pairing screen.
+
+For lost glasses or suspected cookie compromise: revoke immediately, stop work that depends on the device, confirm subsequent glasses API requests return to pairing, preserve the sanitized audit chain, and assess whether `SESSION_SECRET` rotation is required. Rotation invalidates both supervisor and glasses cookies. There is no remote wipe or device-management guarantee.
+
+Before each physical test verify: focus is unmistakable in bright conditions; arrow order is consistent; Korean/English can be selected without a native dropdown; two code groups can be entered without a keyboard; refresh preserves an unexpired restricted session; expiry and revocation return to pairing; voice remains unavailable; native photo capture occurs only through the registered Android DAT companion after explicit confirmation and attachment; and hazard decisions still require the separate human confirmation screen. Use the full checklist in [native DAT capture](native-dat-capture.md).
+
 ## Retention and deletion
 
 - Expired sessions: signed cookie expiry is enforced server-side; presented expired/invalid cookies are cleared. There is no authentication-session table.
@@ -35,11 +43,17 @@ The database and evidence directory form one sensitive backup set. Store it only
 - [ ] CSP/security headers are present; normal and glasses workflows show no CSP errors.
 - [ ] Cookies are `Secure`, `HttpOnly`, `SameSite=Lax`; expired/tampered cookies fail.
 - [ ] Cross-user session, report, upload, and AI access fails safely.
+- [ ] Cross-user evidence-request list/complete and cross-session glasses create/read/cancel/attach fail safely.
+- [ ] Camera and gallery selection remain local until confirmation; glasses require a separate attachment confirmation.
 - [ ] Oversized JSON/arrays/nesting, invalid images, excessive files, and long auth fields fail.
 - [ ] Logs contain correlation metadata but no bodies, cookies, photos, credentials, or unnecessary identity.
 - [ ] 500 responses contain only the generic message and request ID, without paths/stacks.
 - [ ] `/healthz` works; `/readyz` becomes 503 during shutdown/database failure.
 - [ ] SIGTERM drains requests and closes SQLite within the configured timeout.
 - [ ] Cleanup removes only old, unreferenced uploads.
+- [ ] Pending evidence requests expire and completed-but-unattached request uploads survive abandoned-upload cleanup.
 - [ ] Backup/restore and cross-owner checks pass on an isolated restored copy.
 - [ ] Record/backup retention policy has an owner and approval date before real pilot data.
+## Evidence-request operations
+
+Pending requests expire after ten minutes using server time. Cleanup marks them expired and retains minimal state/audit history. Completed-request uploads are protected from abandoned-upload cleanup until attachment. Back up and restore the complete SQLite database and private evidence directory as one consistency set; then run migrations and `npm run audit:verify`. Safety-record deletion remains subject to the explicit pilot policy placeholder.

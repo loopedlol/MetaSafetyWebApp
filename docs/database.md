@@ -1,10 +1,16 @@
 # Safety Lens SQLite Persistence
 
+## Restricted glasses pairing
+
+Migration `006_glasses_pairing.sql` adds `glasses_pairings` and `glasses_sessions`. Pairing rows store an HMAC-SHA-256 code digest, owner-controlled site/TBM scope, server timestamps, attempt count, one-time redemption state, and the restricted-session linkage. Plaintext codes and cookie values are not stored. Redemption uses a SQLite `BEGIN IMMEDIATE` transaction and a conditional update, so at most one caller can create the linked restricted session. Expired requests are marked in the append-only audit chain by retention cleanup; sessions remain server-revocable.
+
 ## Structured glasses records
 
 Migration `004_glasses_structured_records.sql` adds nullable, backward-compatible fields for the glasses workflow. Count-only attendance is stored on the TBM session as expected/present counts, capture source, and device-observed time; it does not create named attendance or acknowledgment rows. Reports show it separately from named attendance.
 
 Corrective actions retain the existing open/verified and work-status semantics while optionally storing stable immediate-response, responsible-party, and due-period identifiers. Sharing events may store a structured proof type. Evidence provenance is server normalized: legacy evidence defaults to `unknown_legacy_source`, HTTP uploads are `browser_file_picker`, and browser mock SVG evidence is `browser_preview_mock`. Only a trusted native integration may assign `sdk_raw_camera`; provenance does not prove an unstaged or unmodified scene.
+
+Migration `008_native_dat_devices.sql` stores short-lived one-time registration digests, supervisor-owned native devices with credential digests/revocation/last-seen timestamps, and one atomic leased claim per native evidence request. Plaintext registration codes and device credentials are never stored. `evidence_requests.native_ready_at` is the explicit glasses capture gate; supersession fields support retake only before attachment. Native capture image bytes remain in the same private evidence directory and owned `evidence_uploads` rows as browser uploads.
 
 ## Legacy Field Map
 
@@ -58,3 +64,8 @@ The chain is tamper-evident rather than tamper-proof. Someone with full database
 The importer creates its own timestamped JSON backup before reading source records and records source IDs in `legacy_imports`. Reruns skip completed imports.
 
 To roll back, stop the backend and restore a complete SQLite copy, including matching `-wal` and `-shm` files when they existed. To rebuild, migrate a new database path and import from a timestamped JSON backup. Applied migration files must never be edited; recovery fixes use a new numbered migration.
+## Evidence requests
+
+Migration `007_evidence_requests.sql` adds a reference-only state machine linking an owner, restricted glasses session, exact TBM/hazard, expiry, provider, and resulting private upload. It stores no bytes. Server-time expiry, completion ownership checks, and attachment to `hazard_evidence` are idempotent.
+
+Audit actions are `evidence_request.created`, `evidence_request.cancelled`, `evidence_request.upload_completed`, `evidence_request.evidence_attached`, and `evidence_request.expired`. Metadata excludes bytes, cookies, pairing codes, client filenames, and filesystem paths.

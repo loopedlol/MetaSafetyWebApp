@@ -128,6 +128,7 @@ export function createDeviceAdapter(runtime: DeviceRuntime, dependencies: Adapte
     connect({ onAction, onConnectionChange }) {
       const onKeyDown = (event: Event) => {
         const keyboardEvent = event as KeyboardEvent;
+        if (runtime === DEVICE_RUNTIME.META_DISPLAY_WEB && keyboardEvent.repeat) return;
         const action = actionForKey(runtime, keyboardEvent.key);
         if (!action) return;
         if (onAction(action, keyboardEvent) !== false) keyboardEvent.preventDefault();

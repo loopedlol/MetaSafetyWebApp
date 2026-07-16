@@ -6,7 +6,7 @@
 import express from 'express';
 import bcrypt from 'bcryptjs';
 import multer from 'multer';
-import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, randomBytes, randomInt, randomUUID, timingSafeEqual } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, unlinkSync } from 'node:fs';
 import { readFile, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -18,12 +18,16 @@ import { ALLOWED_IMAGE_TYPES, detectImageMimeType as detectUploadedImageMimeType
 import { createAnalysisProvider, normalizeProviderResult } from './services/ai-provider.ts';
 import { validatePayloadBounds, validateSessionPayload } from './validation/session.ts';
 import { createTranslator, normalizeLocale } from '../src/i18n/index.ts';
+import { EVIDENCE_SOURCE_CATEGORY, isBrowserFulfillmentProvider } from '../src/domain/evidence-acquisition.ts';
 import {
   clearAuthCookie,
+  clearGlassesAuthCookie,
+  getGlassesSessionId,
   getSessionUserId,
   normalizeEmail,
   requireSecureSessionSecret,
   setAuthCookie,
+  setGlassesAuthCookie,
   toPublicUser
 } from './middleware/authorization.ts';
 import {
@@ -52,6 +56,7 @@ const DEFAULT_DATABASE_PATH = path.join(DEFAULT_DATA_DIR, 'safety-lens.sqlite');
 const MIGRATIONS_DIR = path.join(PROJECT_ROOT, 'db', 'migrations');
 const DEFAULT_SESSION_TTL_MS = 1000 * 60 * 60 * 12;
 const DEFAULT_AUTH_RATE_LIMIT = { windowMs: 15 * 60 * 1000, max: 5 };
+const DEFAULT_GLASSES_EXCHANGE_RATE_LIMIT = { windowMs: 60 * 1000, max: 10 };
 const SYNC_OPERATION_TYPES = new Set([
   'session_upsert',
   'attendance_acknowledgment',
@@ -670,6 +675,21 @@ function toPublicAiAnalysis(analysis) {
   return publicAnalysis;
 }
 
+function toPublicEvidenceRequest(item) {
+  if (!item) return null;
+  return {
+    id: item.id, sessionId: item.sessionId, hazardId: item.hazardId, status: item.status,
+    createdAt: item.createdAt, expiresAt: item.expiresAt, completedAt: item.completedAt,
+    cancelledAt: item.cancelledAt, attachedAt: item.attachedAt,
+    sourceCategory: item.provider === 'native_dat_camera' ? 'native_glasses_camera' : item.sourceCategory, provider: item.provider,
+    nativeReadyAt: item.nativeReadyAt, supersededAt: item.supersededAt,
+    hazard: { title: item.hazardTitle, location: item.hazardLocation || '' },
+    tbm: { taskName: item.taskName, siteName: item.siteName, siteArea: item.siteArea || '' },
+    evidence: item.upload ? { uploadId: item.upload.id, mimeType: item.upload.mimeType, size: item.upload.size,
+      uploadedAt: item.upload.uploadedAt, source: item.upload.source, url: `/api/uploads/${encodeURIComponent(item.upload.id)}` } : null
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Auth routes
 // ---------------------------------------------------------------------------
@@ -682,13 +702,22 @@ export function createApp({
   sessionSecret: configuredSessionSecret = process.env.SESSION_SECRET,
   nodeEnv = process.env.NODE_ENV ?? 'development',
   sessionTtlMs = DEFAULT_SESSION_TTL_MS,
+  glassesPairingTtlMs = 5 * 60 * 1000,
+  glassesSessionTtlMs = 60 * 60 * 1000,
+  glassesPairingMaxAttempts = 5,
+  evidenceRequestTtlMs = 10 * 60 * 1000,
+  nativeRegistrationTtlMs = 5 * 60 * 1000,
+  nativeClaimLeaseMs = 2 * 60 * 1000,
+  nativeAvailabilityWindowMs = 30 * 1000,
   secureCookies = false,
   authRateLimit = DEFAULT_AUTH_RATE_LIMIT,
+  glassesExchangeRateLimit = DEFAULT_GLASSES_EXCHANGE_RATE_LIMIT,
   now = () => Date.now(),
   aiMode = process.env.AI_MODE ?? 'mock',
   analysisProvider: configuredAnalysisProvider = null,
   staticDir = path.join(PROJECT_ROOT, 'dist'),
   trustProxy = false,
+  devTunnelOrigin = null,
   logger = console
 } = {}) {
   const sessionSecret = requireSecureSessionSecret(configuredSessionSecret, nodeEnv);
@@ -709,6 +738,7 @@ export function createApp({
     database.close();
   };
   const authAttempts = new Map();
+  const pairingCodeAttempts = new Map();
 
   mkdirSync(uploadsDir, { recursive: true, mode: 0o700 });
 
@@ -724,19 +754,19 @@ export function createApp({
     }
   });
 
-  function authRateLimiter(scope) {
+  function authRateLimiter(scope, limit = authRateLimit) {
     return (request, response, next) => {
       const currentTime = now();
       const key = `${scope}:${request.ip}`;
       const existing = authAttempts.get(key);
-      const entry = !existing || currentTime - existing.startedAt >= authRateLimit.windowMs
+      const entry = !existing || currentTime - existing.startedAt >= limit.windowMs
         ? { startedAt: currentTime, count: 0 }
         : existing;
       entry.count += 1;
       authAttempts.set(key, entry);
 
-      if (entry.count > authRateLimit.max) {
-        const retryAfterSeconds = Math.max(1, Math.ceil((entry.startedAt + authRateLimit.windowMs - currentTime) / 1000));
+      if (entry.count > limit.max) {
+        const retryAfterSeconds = Math.max(1, Math.ceil((entry.startedAt + limit.windowMs - currentTime) / 1000));
         response.set('Retry-After', String(retryAfterSeconds));
         response.status(429).json({ error: 'Too many authentication attempts. Try again later.' });
         return;
@@ -802,9 +832,91 @@ export function createApp({
     }
   }
 
+  function requireSupervisor(request, response, next) {
+    if (request.user?.role !== 'supervisor') {
+      response.status(403).json({ error: 'Supervisor authorization is required.' });
+      return;
+    }
+    next();
+  }
+
+  async function getRestrictedGlassesSession(request) {
+    const sessionId = getGlassesSessionId(request, sessionSecret, now);
+    return sessionId ? database.getGlassesSession(sessionId) : null;
+  }
+
+  async function requireGlassesAuth(request, response, next) {
+    try {
+      const glassesSession = await getRestrictedGlassesSession(request);
+      if (!glassesSession) {
+        if (request.headers.cookie?.includes('safety_lens_glasses=')) clearGlassesAuthCookie(response, useSecureCookies || request.secure);
+        response.status(401).json({ error: '안경 연결이 만료되었거나 해제되었습니다. 다시 페어링하세요.' });
+        return;
+      }
+      request.glassesSession = glassesSession;
+      request.user = database.findUserById(glassesSession.supervisorUserId);
+      if (!request.user) {
+        clearGlassesAuthCookie(response, useSecureCookies || request.secure);
+        response.status(401).json({ error: '안경 연결이 만료되었거나 해제되었습니다. 다시 페어링하세요.' });
+        return;
+      }
+      next();
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  function nativeCredentialDigest(deviceId, secret) {
+    return createHmac('sha256', sessionSecret).update(`native-device:${deviceId}:${secret}`).digest('hex');
+  }
+
+  function requireNativeDevice(request, response, next) {
+    try {
+      const authorization = String(request.get('Authorization') ?? '');
+      const match = /^Device ([0-9a-f-]{36})\.([A-Za-z0-9_-]{40,})$/.exec(authorization);
+      const device = match ? database.authenticateNativeDevice(match[1], nativeCredentialDigest(match[1], match[2])) : null;
+      if (!device) { response.status(401).json({ error: 'Native device authentication failed.' }); return; }
+      request.nativeDevice = device;
+      request.user = database.findUserById(device.ownerId);
+      if (!request.user) { response.status(401).json({ error: 'Native device authentication failed.' }); return; }
+      next();
+    } catch (error) { next(error); }
+  }
+
+  async function requireSessionAuth(request, response, next) {
+    try {
+      const glassesSession = await getRestrictedGlassesSession(request);
+      const glassesOwner = glassesSession ? database.findUserById(glassesSession.supervisorUserId) : null;
+      if (glassesSession && glassesOwner) {
+        request.user = glassesOwner;
+        request.glassesSession = glassesSession;
+        request.authKind = 'glasses';
+        next();
+        return;
+      }
+      const user = await getAuthenticatedUser(request);
+      if (user) {
+        request.user = user;
+        request.authKind = 'supervisor';
+        next();
+        return;
+      }
+      response.status(401).json({ error: 'Please log in or pair the glasses to continue.' });
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  function isWithinGlassesScope(glassesSession, session) {
+    if (!glassesSession) return true;
+    if (glassesSession.scopeType === 'tbm_session') return session.sessionId === glassesSession.scopeSessionId;
+    return session.site?.siteName === glassesSession.siteName && session.site?.siteArea === glassesSession.siteArea;
+  }
+
   function getIdempotencyKey(request) {
     const key = String(request.get('Idempotency-Key') ?? '').trim();
-    return key && key.length <= 128 ? key : null;
+    if (!key || key.length > 128) return null;
+    return request.authKind === 'glasses' ? `glasses:${request.glassesSession.id}:${key}` : key;
   }
 
   function replayClientOperation(request, response) {
@@ -830,14 +942,16 @@ export function createApp({
       }
       if (database.deleteAbandonedUpload(record.id)) deleted += 1;
     }
-    return { examined: abandoned.length, deleted };
+    const expiredPairings = database.cleanupExpiredGlassesPairings();
+    const expiredEvidenceRequests = database.cleanupExpiredEvidenceRequests();
+    return { examined: abandoned.length, deleted, expiredPairings, expiredEvidenceRequests };
   };
 
   app.disable('x-powered-by');
   if (trustProxy) app.set('trust proxy', trustProxy);
   app.use(requestContext(logger, now));
   app.use(securityHeaders(nodeEnv));
-  app.use(rejectCrossSiteMutation);
+  app.use(rejectCrossSiteMutation({ approvedOrigins: devTunnelOrigin ? [devTunnelOrigin] : [] }));
   app.use(express.json({ limit: '1mb', strict: true }));
   app.use('/api', (request, response, next) => {
     const idempotencyKey = request.get('Idempotency-Key');
@@ -852,7 +966,7 @@ export function createApp({
     }
     next();
   });
-  for (const parameter of ['sessionId', 'uploadId', 'analysisId']) {
+  for (const parameter of ['sessionId', 'uploadId', 'analysisId', 'pairingId', 'requestId', 'deviceId']) {
     app.param(parameter, (request, response, next, value) => {
       if (String(value).length > 200) {
         response.status(400).json({ error: `${parameter} exceeds 200 characters.` });
@@ -999,12 +1113,360 @@ export function createApp({
     }
   });
 
+  // Pairing codes are returned only by the creation response. The database and
+  // audit trail receive only an HMAC digest and non-secret scope metadata.
+  app.get('/api/glasses-pairings/scopes', requireAuth, (request, response) => {
+    response.json(database.listPairingScopes(request.user.id));
+  });
+
+  app.post('/api/glasses-pairings', requireAuth, (request, response, next) => {
+    try {
+      const scopeType = String(request.body?.scopeType ?? '');
+      const scopeId = String(request.body?.scopeId ?? '');
+      if (!['site', 'tbm_session'].includes(scopeType) || !scopeId || scopeId.length > 200) {
+        response.status(400).json({ error: 'A valid site or TBM scope is required.' });
+        return;
+      }
+      const createdAt = new Date(now()).toISOString();
+      const expiresAt = new Date(now() + glassesPairingTtlMs).toISOString();
+      let created = null;
+      let code = '';
+      for (let attempt = 0; attempt < 5 && !created; attempt += 1) {
+        code = String(randomInt(0, 1_000_000)).padStart(6, '0');
+        const codeDigest = createHmac('sha256', sessionSecret).update(`glasses-pairing:${code}`).digest('hex');
+        try {
+          created = database.createGlassesPairing({
+            id: randomUUID(), codeDigest, supervisorUserId: request.user.id, scopeType, scopeId,
+            createdAt, expiresAt, maxAttempts: glassesPairingMaxAttempts
+          });
+        } catch (error) {
+          if (!String(error.code ?? '').includes('CONSTRAINT')) throw error;
+        }
+      }
+      if (!created) {
+        response.status(404).json({ error: 'The selected site or TBM was not found.' });
+        return;
+      }
+      response.status(201).json({
+        pairing: created,
+        code,
+        groupedCode: `${code.slice(0, 3)} ${code.slice(3)}`
+      });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get('/api/glasses-pairings/:pairingId', requireAuth, (request, response) => {
+    const pairing = database.getGlassesPairingForOwner(request.params.pairingId, request.user.id);
+    if (!pairing) {
+      response.status(404).json({ error: 'Resource not found.' });
+      return;
+    }
+    response.json({ pairing });
+  });
+
+  app.delete('/api/glasses-pairings/:pairingId', requireAuth, (request, response) => {
+    if (!database.cancelGlassesPairing(request.params.pairingId, request.user.id)) {
+      response.status(409).json({ error: 'The pairing request can no longer be cancelled.' });
+      return;
+    }
+    response.status(204).end();
+  });
+
+  app.post('/api/glasses-pairings/:pairingId/revoke', requireAuth, (request, response) => {
+    if (!database.revokeGlassesSessionForPairing(request.params.pairingId, request.user.id)) {
+      response.status(409).json({ error: 'The glasses session is not active.' });
+      return;
+    }
+    response.status(204).end();
+  });
+
+  app.post('/api/glasses/pair', authRateLimiter('glasses-pair', glassesExchangeRateLimit), (request, response, next) => {
+    try {
+      const code = String(request.body?.code ?? '').replace(/\s/g, '');
+      const genericError = { error: '코드를 확인할 수 없습니다. 새 코드를 받아 다시 시도하세요.' };
+      if (!/^\d{6}$/.test(code)) {
+        database.recordUnknownPairingFailure(request.ip);
+        response.status(401).json(genericError);
+        return;
+      }
+      const codeDigest = createHmac('sha256', sessionSecret).update(`glasses-pairing:${code}`).digest('hex');
+      const previous = pairingCodeAttempts.get(codeDigest);
+      const codeAttempt = !previous || now() - previous.startedAt >= glassesPairingTtlMs
+        ? { startedAt: now(), count: 1 }
+        : { ...previous, count: previous.count + 1 };
+      pairingCodeAttempts.set(codeDigest, codeAttempt);
+      if (codeAttempt.count > glassesPairingMaxAttempts) {
+        response.status(429).json(genericError);
+        return;
+      }
+      const glassesSessionId = randomUUID();
+      const glassesSession = database.redeemGlassesPairing({
+        codeDigest,
+        restrictedSessionId: glassesSessionId,
+        sessionExpiresAt: new Date(now() + glassesSessionTtlMs).toISOString()
+      });
+      if (!glassesSession) {
+        database.recordUnknownPairingFailure(request.ip);
+        response.status(401).json(genericError);
+        return;
+      }
+      pairingCodeAttempts.delete(codeDigest);
+      setGlassesAuthCookie(response, glassesSessionId, {
+        sessionSecret, sessionTtlMs: glassesSessionTtlMs,
+        secureCookies: useSecureCookies || request.secure, now
+      });
+      response.json({ scope: {
+        type: glassesSession.scopeType,
+        siteId: glassesSession.scopeSiteId,
+        sessionId: glassesSession.scopeSessionId,
+        siteName: glassesSession.siteName,
+        siteArea: glassesSession.siteArea,
+        taskName: glassesSession.taskName,
+        expiresAt: glassesSession.expiresAt
+      } });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get('/api/glasses/session', requireGlassesAuth, (request, response) => {
+    const item = request.glassesSession;
+    response.json({ scope: {
+      type: item.scopeType, siteId: item.scopeSiteId, sessionId: item.scopeSessionId,
+      siteName: item.siteName, siteArea: item.siteArea, taskName: item.taskName, expiresAt: item.expiresAt
+    } });
+  });
+
+  app.post('/api/glasses/logout', (request, response) => {
+    clearGlassesAuthCookie(response, useSecureCookies || request.secure);
+    response.status(204).end();
+  });
+
+  app.post('/api/native-devices/registrations', requireAuth, requireSupervisor, (request, response, next) => {
+    try {
+      const deviceName = String(request.body?.name ?? '').trim();
+      if (!deviceName || deviceName.length > 100) { response.status(400).json({ error: 'Device name must be 1–100 characters.' }); return; }
+      const code = String(randomInt(0, 100_000_000)).padStart(8, '0');
+      const codeDigest = createHmac('sha256', sessionSecret).update(`native-registration:${code}`).digest('hex');
+      const registration = database.createNativeDeviceRegistration({ id: randomUUID(), ownerId: request.user.id, deviceName,
+        codeDigest, expiresAt: new Date(now() + nativeRegistrationTtlMs).toISOString(), maxAttempts: 5 });
+      response.status(201).json({ registration, code, groupedCode: `${code.slice(0, 4)} ${code.slice(4)}` });
+    } catch (error) { next(error); }
+  });
+
+  app.post('/api/native-devices/register', authRateLimiter('native-register'), (request, response, next) => {
+    try {
+      const code = String(request.body?.code ?? '').replace(/\s/g, '');
+      if (!/^\d{8}$/.test(code)) { database.recordNativeRegistrationFailure(request.ip); response.status(401).json({ error: 'Registration code is invalid or expired.' }); return; }
+      const deviceId = randomUUID();
+      const secret = randomBytes(32).toString('base64url');
+      const codeDigest = createHmac('sha256', sessionSecret).update(`native-registration:${code}`).digest('hex');
+      const device = database.redeemNativeDeviceRegistration({ codeDigest, deviceId, credentialDigest: nativeCredentialDigest(deviceId, secret) });
+      if (!device) { database.recordNativeRegistrationFailure(request.ip, codeDigest); response.status(401).json({ error: 'Registration code is invalid or expired.' }); return; }
+      response.json({ device: { id: device.id, name: device.name, createdAt: device.createdAt }, credential: `${deviceId}.${secret}` });
+    } catch (error) { next(error); }
+  });
+
+  app.get('/api/native-devices', requireAuth, requireSupervisor, (request, response) => response.json({ devices: database.listNativeDevicesForOwner(request.user.id) }));
+  app.delete('/api/native-devices/:deviceId', requireAuth, requireSupervisor, (request, response) => {
+    if (!database.revokeNativeDevice(request.params.deviceId, request.user.id)) { response.status(404).json({ error: 'Resource not found.' }); return; }
+    response.status(204).end();
+  });
+  app.get('/api/native/device', requireNativeDevice, (request, response) => response.json({ device: {
+    id: request.nativeDevice.id, name: request.nativeDevice.name, lastSeenAt: request.nativeDevice.lastSeenAt
+  } }));
+
+  app.get('/api/glasses/native-device-availability', requireGlassesAuth, (request, response) => {
+    response.json({ available: database.hasActiveNativeDevice(request.user.id, new Date(now() - nativeAvailabilityWindowMs).toISOString()) });
+  });
+
+  app.post('/api/glasses/evidence-requests', requireGlassesAuth, (request, response, next) => {
+    try {
+      const sessionId = String(request.body?.sessionId ?? '');
+      const hazardId = String(request.body?.hazardId ?? '');
+      if (!sessionId || !hazardId || sessionId.length > 200 || hazardId.length > 200) {
+        response.status(400).json({ error: 'A valid sessionId and hazardId are required.' }); return;
+      }
+      const provider = String(request.body?.provider ?? 'phone_browser_camera');
+      if (!['phone_browser_camera', 'phone_browser_gallery', 'native_dat_camera'].includes(provider)) {
+        response.status(400).json({ error: 'Unsupported evidence provider.' }); return;
+      }
+      if (provider === 'native_dat_camera' && !database.hasActiveNativeDevice(request.user.id, new Date(now() - nativeAvailabilityWindowMs).toISOString())) {
+        response.status(409).json({ error: 'No registered native camera device is available.' }); return;
+      }
+      const result = database.createEvidenceRequest({ id: randomUUID(), ownerId: request.user.id,
+        restrictedSessionId: request.glassesSession.id, sessionId, hazardId,
+        expiresAt: new Date(now() + evidenceRequestTtlMs).toISOString(), provider });
+      if (!result) { response.status(404).json({ error: 'Resource not found.' }); return; }
+      response.status(result.created ? 201 : 200).json(toPublicEvidenceRequest(result.request));
+    } catch (error) { next(error); }
+  });
+
+  app.post('/api/glasses/evidence-requests/:requestId/ready', requireGlassesAuth, (request, response, next) => {
+    try {
+      const item = database.markNativeEvidenceRequestReady(request.params.requestId, request.glassesSession.id,
+        new Date(now() - nativeAvailabilityWindowMs).toISOString());
+      if (!item) { response.status(404).json({ error: 'Resource not found.' }); return; }
+      if (item.unavailable) { response.status(409).json({ error: 'No registered native camera device is available.' }); return; }
+      response.json(toPublicEvidenceRequest(item));
+    } catch (error) { next(error); }
+  });
+
+  app.post('/api/glasses/evidence-requests/:requestId/retake', requireGlassesAuth, (request, response, next) => {
+    try {
+      const item = database.supersedeNativeEvidenceRequest(request.params.requestId, request.glassesSession.id, {
+        id: randomUUID(), expiresAt: new Date(now() + evidenceRequestTtlMs).toISOString()
+      });
+      if (!item) { response.status(409).json({ error: 'Attached or unavailable evidence cannot be retaken.' }); return; }
+      response.status(201).json(toPublicEvidenceRequest(item));
+    } catch (error) { next(error); }
+  });
+
+  app.get('/api/glasses/evidence-requests/:requestId', requireGlassesAuth, (request, response, next) => {
+    try {
+      const item = database.getEvidenceRequestForGlasses(request.params.requestId, request.glassesSession.id);
+      if (!item) { response.status(404).json({ error: 'Resource not found.' }); return; }
+      response.json(toPublicEvidenceRequest(item));
+    } catch (error) { next(error); }
+  });
+
+  app.delete('/api/glasses/evidence-requests/:requestId', requireGlassesAuth, (request, response, next) => {
+    try {
+      const result = database.cancelEvidenceRequest(request.params.requestId, { restrictedSessionId: request.glassesSession.id });
+      if (!result) { response.status(404).json({ error: 'Resource not found.' }); return; }
+      if (result.conflict) { response.status(409).json({ error: 'The request can no longer be cancelled.', status: result.status }); return; }
+      response.status(204).end();
+    } catch (error) { next(error); }
+  });
+
+  app.post('/api/glasses/evidence-requests/:requestId/attach', requireGlassesAuth, (request, response, next) => {
+    try {
+      const result = database.attachEvidenceRequest(request.params.requestId, request.glassesSession.id);
+      if (!result) { response.status(404).json({ error: 'Resource not found.' }); return; }
+      if (result.conflict) { response.status(409).json({ error: 'Completed evidence is required.', status: result.status }); return; }
+      response.json(toPublicEvidenceRequest(result.request));
+    } catch (error) { next(error); }
+  });
+
+  app.get('/api/evidence-requests', requireAuth, (request, response, next) => {
+    try {
+      const requestedStatus = String(request.query.status ?? '');
+      const items = database.listEvidenceRequestsForOwner(request.user.id)
+        .filter((item) => !requestedStatus || item.status === requestedStatus)
+        .map(toPublicEvidenceRequest);
+      response.json({ requests: items });
+    } catch (error) { next(error); }
+  });
+
+  app.delete('/api/evidence-requests/:requestId', requireAuth, (request, response, next) => {
+    try {
+      const result = database.cancelEvidenceRequest(request.params.requestId, { ownerId: request.user.id });
+      if (!result) { response.status(404).json({ error: 'Resource not found.' }); return; }
+      if (result.conflict) { response.status(409).json({ error: 'The request can no longer be cancelled.', status: result.status }); return; }
+      response.status(204).end();
+    } catch (error) { next(error); }
+  });
+
+  app.post('/api/evidence-requests/:requestId/complete', requireAuth, (request, response, next) => {
+    try {
+      const uploadId = String(request.body?.uploadId ?? '');
+      const provider = String(request.body?.provider ?? '');
+      if (!uploadId || uploadId.length > 200 || !isBrowserFulfillmentProvider(provider)) {
+        response.status(400).json({ error: 'A valid owned uploadId and implemented provider are required.' }); return;
+      }
+      const result = database.completeEvidenceRequest({ id: request.params.requestId, ownerId: request.user.id,
+        uploadId, provider, sourceCategory: EVIDENCE_SOURCE_CATEGORY[provider] });
+      if (!result) { response.status(404).json({ error: 'Resource not found.' }); return; }
+      if (result.inaccessible) { response.status(404).json({ error: 'Resource not found.' }); return; }
+      if (result.conflict) { response.status(409).json({ error: 'The request cannot be completed.', status: result.status }); return; }
+      response.json(toPublicEvidenceRequest(result.request));
+    } catch (error) { next(error); }
+  });
+
+  app.get('/api/native/capture-requests/next', requireNativeDevice, (request, response, next) => {
+    try {
+      const item = database.nextNativeCaptureRequest(request.nativeDevice);
+      response.json({ request: item ? toPublicEvidenceRequest(item) : null });
+    } catch (error) { next(error); }
+  });
+
+  app.post('/api/native/capture-requests/:requestId/claim', requireNativeDevice, (request, response, next) => {
+    try {
+      const result = database.claimNativeCaptureRequest({ requestId: request.params.requestId, device: request.nativeDevice,
+        leaseExpiresAt: new Date(now() + nativeClaimLeaseMs).toISOString() });
+      if (!result) { response.status(404).json({ error: 'Resource not found.' }); return; }
+      if (result.conflict) { response.status(409).json({ error: 'Capture request is already claimed.' }); return; }
+      response.json({ claimed: true, leaseExpiresAt: new Date(now() + nativeClaimLeaseMs).toISOString() });
+    } catch (error) { next(error); }
+  });
+
+  app.patch('/api/native/capture-requests/:requestId/status', requireNativeDevice, (request, response, next) => {
+    try {
+      const status = String(request.body?.status ?? '');
+      const failureCode = String(request.body?.failureCode ?? '').slice(0, 80) || null;
+      if (!['capturing','captured','failed','released'].includes(status)) { response.status(400).json({ error: 'Unsupported capture status.' }); return; }
+      const result = database.updateNativeClaim(request.params.requestId, request.nativeDevice, status, failureCode,
+        new Date(now() + nativeClaimLeaseMs).toISOString());
+      if (!result) { response.status(404).json({ error: 'Resource not found.' }); return; }
+      if (result.conflict) { response.status(409).json({ error: 'Invalid capture state transition.', status: result.status }); return; }
+      response.json(result);
+    } catch (error) { next(error); }
+  });
+
+  app.post('/api/native/capture-requests/:requestId/upload', requireNativeDevice, (request, response, next) => {
+    const claim = database.getNativeClaim(request.params.requestId, request.nativeDevice);
+    if (!claim || !['captured','uploaded'].includes(claim.status)) { response.status(404).json({ error: 'Resource not found.' }); return; }
+    upload.single('photo')(request, response, async (error) => {
+      if (error) { response.status(400).json({ error: error.code === 'LIMIT_FILE_SIZE' ? 'Image files must be 5MB or smaller.' : 'Only JPEG, PNG, and WebP image uploads are allowed.' }); return; }
+      try {
+        const file = request.file;
+        const detectedMimeType = file ? detectUploadedImageMimeType(file.buffer) : null;
+        if (!file || !detectedMimeType || detectedMimeType !== file.mimetype) {
+          response.status(400).json({ error: 'Uploaded content is not a valid JPEG, PNG, or WebP image.' }); return;
+        }
+        if (claim.status === 'uploaded' && claim.upload_id) {
+          response.json({ uploadId: claim.upload_id, idempotent: true });
+          return;
+        }
+        const record = { id: randomUUID(), ownerId: request.nativeDevice.ownerId, filename: randomUUID(),
+          originalName: 'native-dat-capture', mimeType: detectedMimeType, size: file.size,
+          hash: `sha256:${createHash('sha256').update(file.buffer).digest('hex')}`, uploadedAt: new Date(now()).toISOString() };
+        const filePath = path.join(uploadsDir, record.filename);
+        await writeFile(filePath, file.buffer, { flag: 'wx', mode: 0o600 });
+        try {
+          database.createEvidenceUploads([record], request.nativeDevice.ownerId, 'sdk_raw_camera');
+          const linked = database.setNativeClaimUpload(request.params.requestId, request.nativeDevice, record.id);
+          if (!linked || linked.conflict) throw new Error('Native claim upload linkage failed.');
+          response.status(201).json({ uploadId: record.id, mimeType: detectedMimeType, size: file.size });
+        } catch (storageError) {
+          database.deleteAbandonedUpload(record.id);
+          await unlink(filePath).catch(() => {});
+          throw storageError;
+        }
+      } catch (uploadError) { next(uploadError); }
+    });
+  });
+
+  app.post('/api/native/capture-requests/:requestId/complete', requireNativeDevice, (request, response, next) => {
+    try {
+      const uploadId = String(request.body?.uploadId ?? '');
+      if (!uploadId || uploadId.length > 200) { response.status(400).json({ error: 'A valid uploadId is required.' }); return; }
+      const result = database.completeNativeCapture(request.params.requestId, request.nativeDevice, uploadId);
+      if (!result) { response.status(404).json({ error: 'Resource not found.' }); return; }
+      if (result.conflict) { response.status(409).json({ error: 'The capture request cannot be completed.' }); return; }
+      response.json(toPublicEvidenceRequest(result.request));
+    } catch (error) { next(error); }
+  });
+
   // ---------------------------------------------------------------------------
   // Session / upload / AI / report routes
   // ---------------------------------------------------------------------------
   // All current and future routes under these namespaces are authenticated by
   // default. Route authors cannot accidentally omit authorization per handler.
-  app.use(['/api/sessions', '/api/uploads', '/api/ai'], requireAuth);
+  app.use('/api/sessions', requireSessionAuth);
+  app.use(['/api/uploads', '/api/ai'], requireAuth);
 
   app.delete('/api/account', requireAuth, async (request, response, next) => {
     try {
@@ -1037,6 +1499,18 @@ export function createApp({
       if (validationError) {
         response.status(400).json({ error: validationError });
         return;
+      }
+
+      if (request.authKind === 'glasses') {
+        const scope = request.glassesSession;
+        const submittedSite = request.body?.site ?? {};
+        const allowed = scope.scopeType === 'tbm_session'
+          ? request.body.sessionId === scope.scopeSessionId
+          : submittedSite.siteName === scope.siteName && submittedSite.siteArea === scope.siteArea;
+        if (!allowed) {
+          response.status(404).json({ error: 'Resource not found.' });
+          return;
+        }
       }
 
       const existingOwnerId = database.getSessionOwner(request.body.sessionId);
@@ -1348,7 +1822,10 @@ export function createApp({
 
   app.get('/api/sessions', async (request, response, next) => {
     try {
-      response.json(database.listSessionsForOwner(request.user.id).map(normalizeSession));
+      const sessions = database.listSessionsForOwner(request.user.id).map(normalizeSession);
+      response.json(request.authKind === 'glasses'
+        ? sessions.filter((session) => isWithinGlassesScope(request.glassesSession, session))
+        : sessions);
     } catch (error) {
       next(error);
     }
@@ -1361,7 +1838,7 @@ export function createApp({
       const reportLocale = normalizeLocale(request.query.lang);
       const reportT = createTranslator(reportLocale);
 
-      if (!session) {
+      if (!session || (request.authKind === 'glasses' && !isWithinGlassesScope(request.glassesSession, session))) {
         response.status(404).type('html').send(`<!doctype html>
   <html lang="${reportLocale}">
     <head>
@@ -1395,7 +1872,7 @@ export function createApp({
       const storedSession = database.getSessionForOwner(request.params.sessionId, request.user.id);
       const session = storedSession ? normalizeSession(storedSession) : null;
 
-      if (!session) {
+      if (!session || (request.authKind === 'glasses' && !isWithinGlassesScope(request.glassesSession, session))) {
         response.status(404).json({ error: 'Resource not found.' });
         return;
       }
@@ -1441,7 +1918,9 @@ export function startServer(options = {}) {
   const app = createApp({
     databasePath: config.databasePath, uploadsDir: config.uploadsDir, registrationKey: config.registrationKey,
     sessionSecret: config.sessionSecret, nodeEnv: config.nodeEnv, sessionTtlMs: config.sessionTtlMs,
-    aiMode: config.aiMode, trustProxy: config.trustProxy, logger, ...appOverrides
+    glassesPairingTtlMs: config.glassesPairingTtlMs, glassesSessionTtlMs: config.glassesSessionTtlMs,
+    glassesPairingMaxAttempts: config.glassesPairingMaxAttempts,
+    aiMode: config.aiMode, trustProxy: config.trustProxy, devTunnelOrigin: config.devTunnelOrigin, logger, ...appOverrides
   });
   const httpServer = app.listen(port, host, () => {
     logger.info(JSON.stringify({ level: 'info', event: 'server_listening', host, port }));
@@ -1450,7 +1929,7 @@ export function startServer(options = {}) {
   const cleanup = () => app.locals.runRetentionCleanup({
     cutoff: new Date(Date.now() - abandonedUploadTtlHours * 60 * 60 * 1000).toISOString()
   }).then((result) => {
-    if (result.deleted) logger.info(JSON.stringify({ level: 'info', event: 'retention_cleanup', ...result }));
+    if (result.deleted || result.expiredPairings) logger.info(JSON.stringify({ level: 'info', event: 'retention_cleanup', ...result }));
   }).catch((error) => logger.error(JSON.stringify({ level: 'error', event: 'retention_cleanup_failed', errorType: error.name })));
   void cleanup();
   const cleanupTimer = setInterval(cleanup, retentionCleanupIntervalMinutes * 60 * 1000);

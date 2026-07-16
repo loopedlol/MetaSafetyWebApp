@@ -268,4 +268,30 @@ test.describe('normal browser verification', () => {
     });
     expect(duration).toBeLessThanOrEqual(0.001);
   });
+
+  test('keeps phone evidence selection local until explicit private-upload confirmation', async ({ page }) => {
+    const pending = { id: 'request-browser-1', sessionId: 'session-1', hazardId: 'hazard-1', status: 'pending',
+      createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 600_000).toISOString(),
+      hazard: { title: 'Open edge', location: 'Level 3' }, tbm: { siteName: 'Pilot Site', taskName: 'Cable work', siteArea: 'A' } };
+    let uploads = 0;
+    await page.route('**/api/evidence-requests?status=pending', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ requests: [pending] }) }));
+    await page.route('**/api/uploads', async (route) => {
+      if (route.request().method() !== 'POST') return route.continue();
+      uploads += 1;
+      await route.fulfill({ status: 201, contentType: 'application/json', body: JSON.stringify([{ id: 'upload-1', uploadId: 'upload-1' }]) });
+    });
+    await page.route('**/api/evidence-requests/request-browser-1/complete', (route) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ ...pending, status: 'completed' }) }));
+    await openNormal(page);
+    const camera = page.locator('[data-evidence-camera="request-browser-1"]');
+    const gallery = page.locator('[data-evidence-gallery="request-browser-1"]');
+    await expect(camera).toHaveAttribute('accept', 'image/jpeg,image/png,image/webp');
+    await expect(camera).toHaveAttribute('capture', 'environment');
+    await expect(gallery).not.toHaveAttribute('capture', /.+/);
+    await camera.setInputFiles({ name: 'capture.png', mimeType: 'image/png', buffer: Buffer.from('89504e470d0a1a0a', 'hex') });
+    expect(uploads).toBe(0);
+    await expect(page.getByAltText('Local evidence preview')).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Confirm private upload' })).toBeVisible();
+    await page.getByRole('button', { name: 'Confirm private upload' }).click();
+    await expect.poll(() => uploads).toBe(1);
+  });
 });
