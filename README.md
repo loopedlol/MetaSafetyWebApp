@@ -2,6 +2,7 @@
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/portfolio/hero-dark.svg">
   <img src="docs/assets/portfolio/hero-light.svg" alt="Safety Lens — a small display, a complete evidence trail." width="1200">
 </picture>
+
 [Colin's portfolio](https://github.com/loopedlol) · [Interfaces](#interfaces) · [System](#system) · [Run locally](#start) · [Documentation](#docs)
 
 **Safety Lens** explores how a browser dashboard and a compact glasses interface can support the same toolbox-meeting (TBM) workflow: attendance, hazards, evidence, review, and a printable record.
