@@ -1,324 +1,99 @@
-# Meta Safety Web App
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/portfolio/hero-dark.svg">
+  <img src="docs/assets/portfolio/hero-light.svg" alt="Safety Lens — a small display, a complete evidence trail." width="1200">
+</picture>
+[Colin's portfolio](https://github.com/loopedlol) · [Interfaces](#interfaces) · [System](#system) · [Run locally](#start) · [Documentation](#docs)
 
-This is a project I built while exploring how **smart glasses and a normal web dashboard could work together for workplace safety tasks**.
+**Safety Lens** explores how a browser dashboard and a compact glasses interface can support the same toolbox-meeting (TBM) workflow: attendance, hazards, evidence, review, and a printable record.
 
-The main idea was to take a process that normally involves checklists, notes, photos, and reports and see whether some of it could be made easier to access through a small wearable display.
+<kbd>TypeScript</kbd> <kbd>Vite + Express</kbd> <kbd>SQLite</kbd> <kbd>IndexedDB</kbd> <kbd>Prototype</kbd>
 
-The question I kept coming back to was:
+The interesting constraint is deciding which actions belong on a small wearable display, which need a fuller interface, and which must remain an explicit human decision.
 
-> **What parts of a workplace-safety workflow actually make sense on smart glasses, and what should still stay on a normal computer or phone?**
+> **Prototype boundary:** this student/internship project is not a certified workplace-safety system. Built-in AI is a deterministic mock and does not interpret image pixels. Real glasses-camera capture depends on a separately configured companion and physical-device validation.
 
-The project became more complicated than I first expected because a glasses web app has very different limits from a normal browser. That ended up being one of the most useful parts of the project for me.
+<a id="interfaces"></a>
+## 01 / Two views of one workflow
 
-> **Important:** This is an experimental student/internship prototype. It is not a certified safety system and should not replace trained workplace-safety judgment.
+**Browser dashboard** — detailed inputs, corrective actions, pairing, evidence management, saved sessions, and reports.
 
-## What the project does
+<img src="docs/assets/portfolio/dashboard.png" alt="Actual Safety Lens browser interface, captured locally with a fictional Portfolio demo account." width="1200">
 
-The application has two main interfaces that share the same safety-session data.
+**Glasses preview** — a focused 600 × 600 review flow with a small action set.
 
-### Normal browser dashboard
+<img src="docs/assets/portfolio/glasses-preview.png" alt="Actual 600 by 600 Safety Lens glasses preview showing a hazard decision in the browser; this is not a photograph of hardware." width="600">
 
-The normal browser interface is the more complete side of the project. It can be used to:
+Screenshots show the unchanged app running locally with demo data. The glasses image is a **browser preview**, not proof of a physical device session. [Capture details](docs/VISUALS.md).
 
-- register and sign in;
-- start a TBM (toolbox meeting) safety session;
-- record worker attendance;
-- review a list of possible hazards;
-- mark hazards as controlled or requiring action;
-- enter corrective-action details;
-- record a new hazard or near miss;
-- attach photo evidence;
-- save drafts and return to them later;
-- generate a printable safety report;
-- review previously saved sessions.
+<a id="system"></a>
+## 02 / The boundaries are the design
 
-The interface is Korean by default because I designed the prototype around a Korean-style TBM workflow, but I also added an English interface.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/portfolio/system-dark.svg">
+  <img src="docs/assets/portfolio/system-light.svg" alt="Safety Lens: browser and glasses interfaces share workflow logic, local drafts synchronize with an authenticated API, and evidence still requires human attachment and review." width="1200">
+</picture>
 
-### Smart-glasses interface
-
-I also built a compact interface designed around a **600 × 600 display**.
-
-Instead of trying to squeeze the entire desktop application onto the glasses, I made the glasses workflow much more focused. It steps through attendance, hazards, evidence, review, and saving using a small number of controls.
-
-For testing in a normal browser, it can be opened with:
-
-```text
-http://localhost:5173/?mode=glasses
-```
-
-There is also a separate Meta Display Web App adapter:
-
-```text
-http://localhost:5173/?mode=glasses&adapter=meta-display
-```
-
-The Meta adapter is intentionally limited to capabilities the project actually supports. It uses documented keyboard-style D-pad events rather than pretending there is a custom gesture API.
-
-## How I originally imagined it
-
-At first, I imagined the flow being something like this:
-
-```text
-Worker sees a hazard
-        ↓
-Glasses take a photo
-        ↓
-AI analyzes it
-        ↓
-Hazard and suggested action appear
-        ↓
-Record is added to the safety report
-```
-
-That sounded simple, but building the prototype forced me to separate what I *wanted* the device to do from what its web environment could actually do.
-
-The glasses web app itself does not simply get unrestricted camera access. Because of that, I changed the design instead of faking the capability.
-
-The current project separates three things:
-
-```text
-Normal browser dashboard
-        ↕
-Shared session / server
-        ↕
-Glasses web interface
-        ↕
-Optional authenticated Android companion for real capture
-```
-
-The browser glasses preview still contains clearly labeled mock capture behavior so I can test the workflow without physical hardware.
-
-## What I learned
-
-### 1. Hardware limitations can completely change a software design
-
-One of the biggest lessons from this project was that designing for smart glasses is not the same as making a smaller phone app.
-
-The display is small, input is limited, and some capabilities I initially expected were not available directly to the web app. I had to redesign the workflow around what the device could reliably provide rather than build around assumptions.
-
-This made me think much more carefully about separating **device capabilities** from the rest of the application. The shared app now receives simple actions such as move, select, back, controlled, or action-required instead of depending directly on one specific device.
-
-### 2. A wearable interface should not try to do everything
-
-My first instinct was to put as much functionality as possible on the glasses. After working with the 600 × 600 interface, I realized that this usually makes the experience worse.
-
-The normal dashboard is better for tasks such as entering detailed corrective actions, reviewing records, managing pairing, and opening reports. The glasses are more useful for short actions that need to happen while somebody is moving through a worksite.
-
-That division became an important design decision rather than just a screen-size problem.
-
-### 3. Safety software needs more confirmation than a normal app
-
-For a normal consumer app, fewer clicks is often better. I found that this idea does not always carry over to a safety workflow.
-
-For example, the program separates:
-
-- worker attendance from worker acknowledgment;
-- identifying a hazard from confirming its status;
-- saving a draft from finalizing a record;
-- an AI suggestion from a human-approved safety record.
-
-It would have been easier to automatically fill in some of these steps, but doing that could make the record say something happened when it did not.
-
-### 4. I had to be careful not to make the AI look more capable than it is
-
-The current AI mode is a **deterministic mock** used to test the workflow. It does not inspect image pixels and it is not a real automated safety inspector.
-
-I kept it because it lets me test questions such as:
-
-- Where should an AI suggestion appear?
-- How should it be labeled?
-- Can a user accept, edit, or reject it?
-- What information should be stored afterward?
-
-That taught me that integrating AI is not only about calling a model. The interface around the model and the way uncertainty is communicated matter too.
-
-### 5. Offline behavior becomes difficult once the same record exists in several places
-
-I wanted the app to remain usable when the network was unreliable, which led me to add local drafts, IndexedDB storage, queued changes, and synchronization.
-
-The difficult part was not simply saving something offline. It was deciding what should happen when a local version and a server version both change.
-
-This made me understand why synchronization and state management are major parts of real applications even when the visible feature seems simple.
-
-### 6. Security became part of the architecture, not an extra feature
-
-Once the project started storing users, worksite records, and photo evidence, I had to think about who should be able to access each item.
-
-The backend therefore handles ownership checks, private uploads, restricted glasses sessions, expiring pairing codes, and audit events. The project also keeps uploaded evidence behind authenticated routes instead of exposing the files publicly.
-
-I did not start this project mainly to learn backend security, but it ended up becoming a large part of what I learned.
-
-## How the project is built
-
-The project is written mostly in TypeScript.
-
-| Part | Technology |
+| Boundary | Implemented behavior |
 | --- | --- |
-| Frontend | TypeScript + Vite |
-| Backend | Express |
-| Database | SQLite |
-| Offline storage | IndexedDB + service worker |
-| Browser testing | Playwright |
-| API testing | Node test runner + Supertest |
-| Languages | Korean + English |
+| Device capability | Browser and Meta Display adapters translate input into shared workflow actions. The Meta adapter does not claim direct web camera or voice capture. |
+| Local / server state | IndexedDB drafts and a synchronization queue support interrupted connectivity. Revision conflicts need human resolution. |
+| Evidence / decision | A captured or received photo must be explicitly attached. Mock AI suggestions require review before they affect records. |
+| Attendance / acknowledgment | These are recorded as different facts. Attendance alone cannot establish acknowledgment. |
+| Ownership | The Express backend controls access to sessions and private photo routes; SQLite stores records and a tamper-evident audit chain. |
 
-A simplified view of the architecture is:
+The app is Korean by default and also provides an English interface. Native capture is an integration boundary documented in [the companion capture guide](docs/native-dat-capture.md); the Android companion implementation is not included in this repository.
 
-```text
-                 ┌─────────────────────┐
-                 │   Normal Browser    │
-                 └──────────┬──────────┘
-                            │
-                 ┌──────────▼──────────┐
-                 │  Shared App Logic   │
-                 └──────────┬──────────┘
-                            │
-           ┌────────────────┼────────────────┐
-           │                │                │
-     IndexedDB         Express API      Glasses Adapter
-                            │                │
-                       SQLite DB       600×600 Display
-                            │
-                    Private Evidence
-```
+<a id="start"></a>
+## 03 / Run the prototype
 
-## Repository structure
-
-The main parts of the repository are:
-
-```text
-src/
-  api/          Browser API communication
-  device/       Browser/glasses device adapters
-  domain/       Safety workflow rules and validation
-  i18n/         Korean and English localization
-  state/        Application state
-  storage/      Offline storage and synchronization
-  views/        UI rendering helpers
-  workflows/    Main application workflow
-
-server/
-  Backend routes, authorization, services, and database access
-
-db/migrations/
-  SQLite schema migrations
-
-browser-tests/
-  Playwright tests for normal and glasses interfaces
-
-docs/
-  More detailed technical and pilot documentation
-```
-
-One part I would like to improve in the future is `src/workflows/application.ts`. It grew quite large as I added more features and is a good example of how a prototype can slowly become harder to maintain.
-
-## Running it locally
-
-This project currently requires **Node.js 24 or newer**.
-
-### 1. Clone the repository
+Requires **Node.js 24+**, as declared in `package.json`.
 
 ```bash
 git clone https://github.com/loopedlol/MetaSafetyWebApp.git
 cd MetaSafetyWebApp
-```
-
-### 2. Install dependencies
-
-```bash
-npm install
-```
-
-### 3. Create the local environment file
-
-```bash
+npm ci
 cp .env.example .env
-```
-
-The example already contains development placeholders. At minimum, the local project expects values such as a registration key and session secret.
-
-### 4. Start the frontend and backend
-
-```bash
 npm run dev:all
 ```
 
-Then open:
+Open [localhost:5173](http://localhost:5173). Register a local account using the registration key configured in your local environment. The example values are development placeholders; the production configuration validator requires non-default secrets. [Configuration reference](docs/configuration.md).
 
-```text
-http://localhost:5173
-```
+| Interface | Local URL |
+| --- | --- |
+| Browser | `http://localhost:5173/` |
+| Glasses preview | `http://localhost:5173/?mode=glasses` |
+| Meta Display adapter | `http://localhost:5173/?mode=glasses&adapter=meta-display` |
 
-The frontend normally runs on port `5173` and the backend on port `3001`.
+The default backend port is `3001`. Opening the Meta adapter in a desktop browser does not create a hardware connection.
 
-## Testing
-
-As the project became larger, I added automated tests because changing one workflow would sometimes affect another part of the app.
-
-Run the normal test suite:
+## 04 / Verification and limits
 
 ```bash
-npm test
-```
-
-Run browser tests:
-
-```bash
+npm run check
 npx playwright install chromium
 npm run test:browser
 ```
 
-Run the syntax checks, tests, type checking, and production build together:
+`check` runs syntax/type checks, the Node tests, and a production build. Playwright covers the normal and glasses browser workflows using isolated test data.
 
-```bash
-npm run check
-```
+Physical registration, permissions, camera capture, device revocation, and recovery still require the [physical-device checklist](docs/native-dat-capture.md#physical-device-checklist). Browser tests do not establish those properties on glasses. The current AI provider supports only mock mode; no real vision-analysis provider is configured.
 
-There are separate Playwright tests for both the normal interface and the glasses interface.
+The shared application workflow and server orchestration are large. Further decomposition, physical usability tests, and measured task-completion/error rates are useful future work. See [the original project reflection](docs/PROJECT_STORY.md) for the design lessons behind the system.
 
-## Current limitations
+<a id="docs"></a>
+## 05 / Go deeper
 
-This project is still a prototype, and there are several important limitations:
+| Read about | Reference |
+| --- | --- |
+| Code boundaries | [TypeScript architecture](docs/typescript-architecture.md) |
+| Environment and server settings | [Configuration](docs/configuration.md) |
+| Persistence, recovery, and audit semantics | [Database](docs/database.md) |
+| Companion-dependent capture | [Native DAT capture](docs/native-dat-capture.md) |
+| Operating constraints | [Pilot operations](docs/pilot-operations.md) |
+| Known security boundaries | [Pilot security review](docs/pilot-security-review.md) · [Security policy](SECURITY.md) |
+| Korean / English behavior | [Localization](docs/localization.md) |
+---
 
-- It is not a certified or production workplace-safety system.
-- The current built-in AI behavior is simulated and does not analyze image pixels.
-- The browser glasses preview contains mock evidence/capture behavior for testing.
-- The Meta Display web interface does not pretend to have camera or voice APIs that are not available to it.
-- Real capture in the prototype requires the separate authenticated companion-device flow.
-- Physical-device behavior still needs to be tested separately from Chromium browser tests.
-- The current application is larger and more complex than I originally planned, especially the main workflow file.
-- The database and deployment setup are appropriate for a prototype/internal test, not something I would treat as a finished commercial system.
+[← Portfolio](https://github.com/loopedlol) · [Related: sensing and control](https://github.com/loopedlol/CarVisionAI) · [Visual assets](docs/VISUALS.md)
 
-## What I would work on next
-
-If I continued developing the project, I would focus on:
-
-1. testing the glasses workflow more extensively on physical hardware;
-2. replacing the mock AI path with a carefully evaluated real vision pipeline;
-3. measuring whether AI suggestions actually help users instead of only making the interface more complicated;
-4. breaking the large application workflow into smaller modules;
-5. simplifying the glasses screens based on real usability testing;
-6. improving synchronization and conflict handling;
-7. testing the full Android-companion capture flow on more devices;
-8. creating clearer measurements for task completion time, mistakes, and user corrections.
-
-I think those experiments would be more useful than simply adding more features.
-
-## More detailed documentation
-
-I kept the lower-level documentation separate from this README so the main page can explain the project without becoming a full operations manual.
-
-- [`docs/configuration.md`](docs/configuration.md) — environment and server configuration
-- [`docs/database.md`](docs/database.md) — database, migrations, imports, recovery, and audit data
-- [`docs/native-dat-capture.md`](docs/native-dat-capture.md) — Android DAT companion capture design
-- [`docs/pilot-operations.md`](docs/pilot-operations.md) — pilot operation and retention notes
-- [`docs/pilot-security-review.md`](docs/pilot-security-review.md) — security review notes
-- [`docs/typescript-architecture.md`](docs/typescript-architecture.md) — code organization
-- [`docs/localization.md`](docs/localization.md) — Korean/English localization
-- [`SECURITY.md`](SECURITY.md) — responsible reporting and security information
-
-## Final reflection
-
-This started as an idea about using smart glasses to make workplace-safety information easier to access. The most useful part of building it was learning how many other problems appear once that idea becomes an actual system: limited hardware inputs, small-screen UI design, offline data, authentication, privacy, evidence storage, synchronization, and deciding when automation should *not* make a decision for the user.
-
-The project is not a finished safety product, but it gave me a much better understanding of how a hardware idea turns into a real software architecture—and how the constraints of the device can be just as important as the original idea.
+<sub>Colin / loopedlol · Field Notes · 2026</sub>
