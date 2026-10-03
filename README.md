@@ -1,22 +1,32 @@
 # Safety Lens
 
-I built this prototype to explore how smart glasses could help people record workplace hazards. It pairs a browser dashboard for detailed records with a simpler glasses interface for quick decisions.
+I built this prototype to explore how smart glasses could help people record workplace hazards. The browser dashboard handles detailed records, while the glasses interface keeps the actions short: review a hazard, mark its status, or request a photo.
 
-<a id="system"></a>
-## What I built
-
-The app lets a user record attendance, add hazards and photos, review suggested actions, and create a printable report. It also saves local drafts when the connection drops. The interface supports Korean and English.
-
-One thing I learned was that a glasses app shouldn't just be a smaller version of a dashboard. I kept detailed editing in the browser and gave the glasses fewer, simpler actions.
-
-**Current status:** this is a prototype, not a tool to rely on for workplace safety. Its AI suggestions are simulated; they do not analyze photos. Real glasses-camera capture needs a separate companion app and hardware testing. That companion app is not included here.
+The app supports Korean and English, attendance records, hazards and photo evidence, local drafts, and printable reports.
 
 <a id="interfaces"></a>
 [Dashboard screenshot](docs/assets/portfolio/dashboard.png) · [Glasses browser preview](docs/assets/portfolio/glasses-preview.png)
 
-These show the app with demo data. The glasses preview is not a photo of a physical device.
+These use demo data. The glasses preview shows the browser interface, not a physical device.
 
-**Built with:** TypeScript, Vite, Express, and SQLite.
+<a id="system"></a>
+## What changed while building it
+
+My first idea was to put most of the workflow on the glasses. Working with the small display and limited inputs pushed me to move detailed editing into the dashboard instead.
+
+The less visible parts became just as important. Offline changes need to survive a lost connection, and a local draft can't silently replace a record someone has also edited on the server. The app queues changes and asks for review when versions conflict.
+
+I also kept attendance separate from acknowledgment, and an AI suggestion separate from a confirmed record. Those steps represent different things, even if combining them would make the interface simpler.
+
+## Current limits
+
+The AI suggestions are fixed mock responses; they don't analyze photos. Real glasses-camera capture requires a separate Android companion app, which isn't included here, and physical-device testing. The repository implements the server and web workflow for requesting and receiving that capture.
+
+This remains a prototype, not a tool to rely on for workplace safety.
+
+[PLACEHOLDER — short screen recording showing a hazard added in the dashboard, reviewed in the glasses browser preview, and included in a report. Label the preview and any simulated inputs.]
+
+**Built with:** TypeScript, Vite, Express, SQLite, and IndexedDB for local drafts.
 
 <a id="start"></a>
 ## Run locally
