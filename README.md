@@ -1,13 +1,28 @@
-# Safety Lens
+<a id="safety-lens"></a>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/banner-dark.svg">
+  <img src="docs/assets/readme/banner-light.svg" alt="Safety Lens — A workplace-hazard recording prototype." width="100%">
+</picture>
 
 I built this prototype to explore how smart glasses could help people record workplace hazards. The browser dashboard handles detailed records, while the glasses interface keeps the actions short: review a hazard, mark its status, or request a photo.
 
 The app supports Korean and English, attendance records, hazards and photo evidence, local drafts, and printable reports.
 
 <a id="interfaces"></a>
-[Dashboard screenshot](docs/assets/portfolio/dashboard.png) · [Glasses browser preview](docs/assets/portfolio/glasses-preview.png)
+<details>
+<summary>See the dashboard and glasses preview</summary>
+
+**Browser dashboard**
+
+![Safety Lens browser dashboard with demo hazard data](docs/assets/portfolio/dashboard.png)
+
+**Glasses browser preview**
+
+<img src="docs/assets/portfolio/glasses-preview.png" alt="Safety Lens glasses browser preview with demo hazard data" width="480">
 
 These use demo data. The glasses preview shows the browser interface, not a physical device.
+
+</details>
 
 <a id="system"></a>
 ## What changed while building it
@@ -24,7 +39,7 @@ The AI suggestions are fixed mock responses; they don't analyze photos. Real gla
 
 This remains a prototype, not a tool to rely on for workplace safety.
 
-[PLACEHOLDER — short screen recording showing a hazard added in the dashboard, reviewed in the glasses browser preview, and included in a report. Label the preview and any simulated inputs.]
+> [PLACEHOLDER — short screen recording showing a hazard added in the dashboard, reviewed in the glasses browser preview, and included in a report. Label the preview and any simulated inputs.]
 
 **Built with:** TypeScript, Vite, Express, SQLite, and IndexedDB for local drafts.
 
